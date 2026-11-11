@@ -1,0 +1,8 @@
+services:
+  note-mate:
+    build: .
+    ports:
+      - "9300:9300"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
