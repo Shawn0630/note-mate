@@ -182,6 +182,7 @@ outline when present, an empty skeleton otherwise.
 | POST | `/api/import/ai/propose` | Multipart (`file` = PDF, `title?`) → structure-only proposal; 503 when the LLM is not configured, 400 on a bad PDF or unparseable model output |
 | POST | `/api/import/ai/apply` | Multipart (`file` = PDF, `proposal` = JSON string, `title`) → creates the project; 201 `{project}`, 409 on slug collision |
 | POST | `/api/execute` | `{language: python\|java\|javascript, code}` → `{stdout, stderr, exitCode, images:[{data, mime:"image/png"}]}` |
+| POST | `/api/execute` | `{language: python\|javascript, cells:[{source}]}` → `{results:[{stdout, stderr, exitCode, images, skipped}]}` — run-all in one shared session (see below) |
 
 Notes: note names must be `.md`/`.ipynb` file names with no path separators
 — traversal is rejected with 400. `chapterMap` maps a chapter number to the
@@ -198,6 +199,34 @@ Non-zero exits still return HTTP 200 with the `exitCode`.
 - **javascript**: `node solution.mjs`.
 
 Code is capped at ~200KB and empty code is rejected.
+
+### /api/execute — run-all (cells mode)
+
+`{language: python|javascript, cells: [{source}, …]}` (max 200 cells,
+2MB total) runs the cells in **one shared session** and returns one result
+per cell, in order. This is what the notebook's **▶ Run all** button and
+each cell's **▶ Run all above** use: earlier imports and definitions are
+visible to later cells, so real multi-cell labs run as written.
+
+- **python** (`src/pythonRunner.py`): one process, cells `exec`'d in
+  sequence in a shared namespace (`__name__ == '__main__'`). stdout/stderr
+  are captured per cell; a cell that raises stops the run and later cells
+  are marked `skipped: true`. `plt.show()` is patched (once pyplot is
+  imported) to save every open figure as a PNG, and any still-open figures
+  are harvested after each cell that wrote no PNG itself — so labs that
+  plot with `plt.show()` render images instead of nothing. New PNGs are
+  attributed to the cell that created them, deduplicated by content hash.
+- **javascript** (`src/jsRunner.mjs`): cells are concatenated into a
+  single `.mjs` module with per-cell boundary markers on stdout/stderr,
+  run as one node process, and split back per cell. Top-level
+  `const`/`let` redeclaration across cells is a SyntaxError in the
+  concatenated module — use plain assignment or `var` for names shared
+  across cells. A syntax error is attributed to the offending cell.
+- **java has no run-all**: cells cannot be concatenated into one program,
+  so Java notebooks keep per-cell ▶ Run only.
+- The single-cell path is unchanged and does **not** get the `plt.show()`
+  hook: a lone cell that only calls `plt.show()` still renders no image —
+  use ▶ Run all above for plot cells that depend on earlier cells.
 
 ## The seed project
 

@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { slugify, resolveProjectPath, parseNotebook } from './util.js';
 import { extractPdfText } from './pdftext.js';
 import { proposeProjectData, LLM_NOT_CONFIGURED } from './llm.js';
@@ -21,6 +22,9 @@ export const PORT = Number(process.env.PORT || 9300);
 const MAX_CODE_BYTES = 200 * 1024; // ~200KB cap on /api/execute code
 const EXEC_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
+// Run-all (cells) mode: one shared session, so the caps are per batch.
+const MAX_RUN_ALL_CELLS = 200;
+const MAX_RUN_ALL_TOTAL_BYTES = 2 * 1024 * 1024;
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -615,6 +619,11 @@ app.post('/api/projects/:slug/chapter-map', async (req, res, next) => {
 
 // ---------------------------------------------------------------------------
 // Code execution — runs in a fresh temp dir, 30s timeout, dir deleted after.
+// Single-cell mode runs one snippet in isolation. Cells mode (POST
+// /api/execute with {language, cells: [{source}]}) runs cells 0..N in ONE
+// shared session via src/pythonRunner.py / src/jsRunner.mjs, returning
+// per-cell {stdout, stderr, exitCode, images, skipped}; a cell that raises
+// stops the run and later cells are skipped. Java has no cells mode.
 // v1 limitation: no network sandboxing. See README.md.
 // ---------------------------------------------------------------------------
 
@@ -641,10 +650,78 @@ async function runCommand(cmd, args, cwd, env = {}) {
 
 app.post('/api/execute', async (req, res, next) => {
   try {
-    const { language, code } = req.body ?? {};
+    const { language, code, cells } = req.body ?? {};
     if (!LANGUAGES.has(language)) {
       return res.status(400).json({ error: 'language must be python, java, or javascript' });
     }
+
+    // ---- run-all / run-above mode: cells 0..N in ONE shared session ----
+    // python → src/pythonRunner.py (one process, shared namespace, per-cell
+    // stdout/stderr/images; plt.show() saves figures as PNGs).
+    // javascript → src/jsRunner.mjs (one node process, cells concatenated
+    // into a single module, outputs split back per cell on markers).
+    // java has no run-all: cells cannot be concatenated into one program.
+    if (cells !== undefined) {
+      if (language === 'java') {
+        return res.status(400).json({
+          error: 'run-all is not supported for java: cells cannot share one session — run each cell on its own',
+        });
+      }
+      if (!Array.isArray(cells) || cells.length === 0) {
+        return res.status(400).json({ error: 'cells must be a non-empty array of {source}' });
+      }
+      if (cells.length > MAX_RUN_ALL_CELLS) {
+        return res.status(400).json({ error: `at most ${MAX_RUN_ALL_CELLS} cells per run` });
+      }
+      const sources = [];
+      let total = 0;
+      for (const c of cells) {
+        const src = typeof c === 'string' ? c : c?.source;
+        if (typeof src !== 'string' || !src.trim()) {
+          return res.status(400).json({ error: 'each cell needs a non-empty source string' });
+        }
+        total += Buffer.byteLength(src, 'utf8');
+        if (total > MAX_RUN_ALL_TOTAL_BYTES) {
+          return res.status(400).json({
+            error: `cells exceed the ${MAX_RUN_ALL_TOTAL_BYTES / 1024 / 1024}MB total limit`,
+          });
+        }
+        sources.push(src);
+      }
+
+      const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'note-mate-exec-'));
+      try {
+        await fsp.writeFile(
+          path.join(dir, 'cells.json'),
+          JSON.stringify(sources.map((source) => ({ source }))),
+          'utf8',
+        );
+        const runnerName = language === 'python' ? 'pythonRunner.py' : 'jsRunner.mjs';
+        const runnerPath = fileURLToPath(new URL(`./${runnerName}`, import.meta.url));
+        const cmd = language === 'python' ? 'python3' : 'node';
+        const run = await runCommand(cmd, [runnerPath, 'cells.json', 'results.json'], dir, { MPLBACKEND: 'Agg' });
+        let parsed;
+        try {
+          parsed = JSON.parse(await fsp.readFile(path.join(dir, 'results.json'), 'utf8'));
+        } catch {
+          const err = new Error(
+            `execution runner failed: ${(run.stderr || run.stdout || 'no output').slice(0, 500)}`,
+          );
+          err.status = 500;
+          throw err;
+        }
+        if (!parsed || !Array.isArray(parsed.results) || parsed.results.length !== sources.length) {
+          const err = new Error('execution runner returned malformed results');
+          err.status = 500;
+          throw err;
+        }
+        return res.json({ results: parsed.results });
+      } finally {
+        await fsp.rm(dir, { recursive: true, force: true });
+      }
+    }
+
+    // ---- single-cell mode (unchanged) ----
     if (typeof code !== 'string' || !code.trim()) {
       return res.status(400).json({ error: 'code must be a non-empty string' });
     }

@@ -17,6 +17,9 @@
    - POST   /api/projects/:slug/cover         {dataUrl}
    - POST   /api/projects/:slug/chapter-map   {mapping}
    - POST   /api/execute                      {language, code}
+   - POST   /api/execute                      {language, cells:[{source}]}
+                                              → {results:[{stdout, stderr, exitCode, images, skipped}]}
+                                              (run-all: one shared session; java unsupported)
 */
 import * as pdfjsLib from './vendor/pdfjs/pdf.mjs';
 
@@ -171,6 +174,7 @@ const state = {
   activeNoteKind: null, // 'md' | 'ipynb'
   activeNoteContent: '', // raw text content of active note
   activeNotebook: null,  // parsed nbformat object when active note is ipynb
+  execCounter: 0,     // per-notebook execution counter (execution_count)
   mdMode: 'preview',    // 'edit' | 'preview' for markdown notes
   follow: true,         // scroll-spy follow toggle
   editorFocused: false,
@@ -1165,9 +1169,21 @@ async function loadNote(name) {
     catch { state.activeNotebook = { cells: [], metadata: {}, nbformat: 4, nbformat_minor: 5 }; }
     if (!Array.isArray(state.activeNotebook.cells)) state.activeNotebook.cells = [];
     state.headings = headingsFromNotebook(state.activeNotebook);
+    resetExecCounter();
   } else {
     state.headings = headingsFromMarkdown(content);
   }
+}
+
+/* Continue execution_count from the highest count already stored in the
+   notebook (0 when none ran yet), so a reloaded notebook keeps counting. */
+function resetExecCounter() {
+  state.execCounter = 0;
+  (state.activeNotebook?.cells ?? []).forEach((c) => {
+    if (typeof c.execution_count === 'number') {
+      state.execCounter = Math.max(state.execCounter, c.execution_count);
+    }
+  });
 }
 
 function renderNotebookPane() {
@@ -1346,6 +1362,7 @@ async function loadLab(chapter, name) {
   catch { state.activeNotebook = { cells: [], metadata: {}, nbformat: 4, nbformat_minor: 5 }; }
   if (!Array.isArray(state.activeNotebook.cells)) state.activeNotebook.cells = [];
   state.headings = headingsFromNotebook(state.activeNotebook);
+  resetExecCounter();
 }
 
 /* Close a lab tab. Saves are explicit (same as notes), so closing never
@@ -1479,6 +1496,16 @@ async function runCode(language, code) {
   return apiJson('/api/execute', 'POST', { language, code });
 }
 
+/* Run cells 0..N in one shared session; returns {results: [...]} aligned
+   with the submitted cells. A cell that raises stops the run; later
+   results carry skipped: true. */
+async function runCells(language, sources) {
+  return apiJson('/api/execute', 'POST', {
+    language,
+    cells: sources.map((source) => ({ source })),
+  });
+}
+
 /* Render {stdout, stderr, exitCode, images} into HTML. */
 function renderExecuteResult(result) {
   let html = '';
@@ -1597,11 +1624,74 @@ function setNbCellSource(cell, text) {
   cell.source = text;
 }
 
+/* Code cells from the top through notebook index idx, in order. */
+function codeCellsUpTo(idx) {
+  const list = [];
+  (state.activeNotebook?.cells ?? []).forEach((c, i) => {
+    if (c.cell_type === 'code' && i <= idx) list.push({ nbIndex: i, cell: c });
+  });
+  return list;
+}
+
+/* Run a list of code cells [{nbIndex, cell}] in one shared session and
+   apply the per-cell results in place. Skipped cells (after an error)
+   keep their previous outputs. Saves the notebook once at the end. All
+   run buttons are disabled while a run-all is in flight so a concurrent
+   single-cell run cannot race the save. */
+async function runNotebookCells(list, statusEl) {
+  if (!list.length) return;
+  const lang = state.activeNotebook?.metadata?.language_info?.name
+    || state.activeNotebook?.metadata?.kernelspec?.language || 'python';
+  const btns = $$('#nb-cells .run-btn, #nb-run-all');
+  btns.forEach((b) => { b.disabled = true; });
+  if (statusEl) statusEl.textContent = 'Running…';
+  try {
+    const { results } = await runCells(lang, list.map(({ cell }) => nbCellSource(cell)));
+    let ran = 0;
+    let failed = null;
+    list.forEach(({ nbIndex, cell }, k) => {
+      const r = results[k];
+      if (!r || r.skipped) return;
+      ran += 1;
+      cell.outputs = outputsFromExecuteResult(r);
+      cell.execution_count = ++state.execCounter;
+      renderCellOutputs($(`[data-cell-output="${nbIndex}"]`, $('#nb-cells')), cell);
+      if (r.exitCode !== 0 && r.exitCode != null && failed == null) failed = nbIndex;
+    });
+    await saveNotebook();
+    if (statusEl) {
+      statusEl.textContent = failed != null
+        ? `Stopped at cell ${failed + 1} (error)`
+        : `Ran ${ran} cell${ran === 1 ? '' : 's'}`;
+    }
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Run failed: ${err.message}`;
+  } finally {
+    btns.forEach((b) => { b.disabled = false; });
+  }
+}
+
 function renderIpynbBody(body) {
   const nb = state.activeNotebook;
   const lang = nb?.metadata?.language_info?.name
     || nb?.metadata?.kernelspec?.language || 'python';
-  body.innerHTML = `<div class="nb-cells" id="nb-cells"></div>`;
+  // Run-all is unavailable for Java: cells cannot share one session.
+  const runAllRow = lang === 'java' ? '' : `
+    <div class="nb-runall-row">
+      <button type="button" class="run-btn" id="nb-run-all"
+        title="Run all code cells top to bottom in one shared session">▶ Run all</button>
+      <span class="save-status" id="nb-runall-status"></span>
+    </div>`;
+  body.innerHTML = `${runAllRow}<div class="nb-cells" id="nb-cells"></div>`;
+  const runAllBtn = $('#nb-run-all', body);
+  if (runAllBtn) {
+    runAllBtn.addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      btn.textContent = 'Running…';
+      await runNotebookCells(codeCellsUpTo(Infinity), $('#nb-runall-status', body));
+      btn.textContent = '▶ Run all';
+    });
+  }
   const wrap = $('#nb-cells', body);
 
   nb.cells.forEach((cell, idx) => {
@@ -1642,6 +1732,7 @@ function renderIpynbBody(body) {
         <textarea class="nb-code-source" spellcheck="false"></textarea>
         <div class="nb-cell-foot">
           <button type="button" class="run-btn" data-cell-run="${idx}">▶ Run</button>
+          ${lang === 'java' ? '' : `<button type="button" class="run-btn" data-cell-run-above="${idx}" title="Run this cell and every code cell above it in one shared session">▶ Run all above</button>`}
           <span class="save-status" data-cell-status="${idx}"></span>
         </div>
         <div class="nb-output" data-cell-output="${idx}"></div>`;
@@ -1661,6 +1752,7 @@ function renderIpynbBody(body) {
         try {
           const result = await runCode(lang, nbCellSource(cell));
           cell.outputs = outputsFromExecuteResult(result);
+          cell.execution_count = ++state.execCounter;
           renderCellOutputs($(`[data-cell-output="${idx}"]`, cellEl), cell);
           await saveNotebook(); // outputs persist in the notebook file
         } catch (err) {
@@ -1671,6 +1763,16 @@ function renderIpynbBody(body) {
         btn.disabled = false;
         btn.textContent = '▶ Run';
       });
+      const runAboveBtn = $(`[data-cell-run-above="${idx}"]`, cellEl);
+      if (runAboveBtn) {
+        runAboveBtn.addEventListener('click', async (e) => {
+          const btn = e.currentTarget;
+          const status = $(`[data-cell-status="${idx}"]`, cellEl);
+          btn.textContent = 'Running…';
+          await runNotebookCells(codeCellsUpTo(idx), status);
+          btn.textContent = '▶ Run all above';
+        });
+      }
       $(`[data-cell-del="${idx}"]`, cellEl).addEventListener('click', async () => {
         if (!window.confirm('Delete this cell?')) return;
         nb.cells.splice(idx, 1);
@@ -1756,6 +1858,12 @@ function renderCellOutputs(el, cell) {
       if (Array.isArray(o.traceback)) html += esc(o.traceback.join('\n'));
     }
   });
+  // A cell that ran successfully but produced nothing shows the same
+  // placeholder as the markdown-preview run path. Never-run cells keep
+  // execution_count null, so stored empty outputs stay blank.
+  if (!html && cell.execution_count != null) {
+    html = '<span style="color:#8a7a68">(no output)</span>';
+  }
   el.innerHTML = html;
 }
 
