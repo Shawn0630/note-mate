@@ -11,8 +11,15 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { slugify, resolveProjectPath, parseNotebook } from './util.js';
 import { extractPdfText } from './pdftext.js';
+import { extractPdfOutline } from './pdfOutline.js';
 import { proposeProjectData, LLM_NOT_CONFIGURED } from './llm.js';
 import { validateProposal } from './aiImport.js';
+import {
+  generateAiNote, resolveChapterRange, extractChapterSection,
+  MAX_AI_NOTE_PROMPT_CHARS, MAX_AI_NOTE_HISTORY_MESSAGES,
+  MAX_AI_NOTE_HISTORY_CHARS, MAX_AI_NOTE_NOTE_CHARS, MAX_CHAPTER_PAGES,
+} from './aiNote.js';
+import { cellsToMarkdown } from './cellExport.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -613,6 +620,206 @@ app.post('/api/projects/:slug/chapter-map', async (req, res, next) => {
     res.json(project);
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// On-demand AI notes — the user asks in plain language for markdown notes
+// based on the CURRENT chapter; the model returns a PROPOSAL and nothing is
+// written until the user presses Apply in the notebook pane (client-side,
+// through the notes PUT path). This is the opposite of AI import, which
+// generates STRUCTURE ONLY and never note content — see src/aiNote.js.
+// Context: the chapter's page range from the project's stored outline,
+// extracted server-side from the source PDF (never sent by the client).
+// ---------------------------------------------------------------------------
+
+app.post('/api/projects/:slug/ai-note', async (req, res, next) => {
+  try {
+    const { chapter, prompt, includeNote, history } = req.body ?? {};
+    if (typeof prompt !== 'string' || !prompt.trim()) {
+      return res.status(400).json({ error: 'prompt (string) is required' });
+    }
+    if (prompt.length > MAX_AI_NOTE_PROMPT_CHARS) {
+      return res.status(400).json({ error: `prompt exceeds the ${MAX_AI_NOTE_PROMPT_CHARS}-character limit` });
+    }
+    let cleanHistory = [];
+    if (history !== undefined) {
+      if (!Array.isArray(history)) {
+        return res.status(400).json({ error: 'history must be an array of {role, content}' });
+      }
+      if (history.length > MAX_AI_NOTE_HISTORY_MESSAGES) {
+        return res.status(400).json({ error: `history holds at most ${MAX_AI_NOTE_HISTORY_MESSAGES} messages` });
+      }
+      for (const m of history) {
+        if (!m || typeof m !== 'object' || !['user', 'assistant'].includes(m.role)
+          || typeof m.content !== 'string') {
+          return res.status(400).json({ error: 'history entries must be {role: "user"|"assistant", content: string}' });
+        }
+        cleanHistory.push({ role: m.role, content: m.content.slice(0, MAX_AI_NOTE_HISTORY_CHARS) });
+      }
+    }
+
+    const project = await readProject(req.params.slug);
+    const chapterTitle = typeof chapter === 'string' ? chapter.trim() : '';
+    let range = null;
+    let chapterText = '';
+    let noteSection = '';
+    if (chapterTitle) {
+      if (String(project.kind).toLowerCase() !== 'pdf' || project.sourceType !== 'file' || !project.file) {
+        return res.status(400).json({ error: 'chapter context needs a PDF project with a downloaded file' });
+      }
+      let buf;
+      try {
+        buf = await fsp.readFile(resolveProjectPath(DATA_DIR, req.params.slug, project.file));
+      } catch (err) {
+        return res.status(err.status || 400).json({ error: err.message });
+      }
+      // The chapter's page range comes from an outline — the stored one when
+      // the project has it (AI import), otherwise the PDF's own outline
+      // (seeded / file-uploaded projects store none; the reader reads the
+      // same outline client-side).
+      let outline = Array.isArray(project.outline) && project.outline.length ? project.outline : null;
+      if (!outline) outline = await extractPdfOutline(buf);
+      if (!outline.length) {
+        return res.status(400).json({ error: 'this project has no chapter outline — ask without a chapter' });
+      }
+      range = resolveChapterRange(outline, chapterTitle, null);
+      if (!range) {
+        return res.status(400).json({ error: `chapter not found in the outline: ${chapterTitle}` });
+      }
+      let extracted;
+      try {
+        extracted = await extractPdfText(buf, {
+          startPage: range.startPage,
+          endPage: range.endPage ?? Infinity,
+          maxPages: MAX_CHAPTER_PAGES,
+        });
+      } catch (err) {
+        return res.status(err.status || 400).json({ error: err.message });
+      }
+      chapterText = extracted.text || '';
+      range = {
+        title: range.title,
+        startPage: range.startPage,
+        endPage: extracted.pages.length
+          ? extracted.pages[extracted.pages.length - 1].page : range.startPage,
+      };
+      if (includeNote) {
+        try {
+          const notes = await fsp.readFile(
+            resolveProjectPath(DATA_DIR, req.params.slug, 'notes', 'notes.md'), 'utf8');
+          noteSection = extractChapterSection(notes, range.title).slice(0, MAX_AI_NOTE_NOTE_CHARS);
+        } catch {
+          noteSection = ''; // No notes.md yet — the AI works from the chapter alone.
+        }
+      }
+    }
+
+    let markdown;
+    try {
+      markdown = await generateAiNote({
+        bookTitle: project.title,
+        chapter: range,
+        chapterText,
+        noteSection,
+        prompt: prompt.trim(),
+        history: cleanHistory,
+      });
+    } catch (err) {
+      if (err.code === LLM_NOT_CONFIGURED) {
+        return res.status(503).json({ error: 'LLM not configured', hint: err.hint });
+      }
+      if (err.code === 'LLM_BAD_RESPONSE') {
+        return res.status(err.status || 502).json({ error: err.message });
+      }
+      if (err.status === 400) return res.status(400).json({ error: err.message });
+      throw err;
+    }
+    res.json({ markdown, chapter: range, contextChars: chapterText.length });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Export selected notebook cells to Markdown — DETERMINISTIC, no LLM.
+// The client sends the notebook JSON (exactly what the user sees, saved or
+// not) + the selected cell indexes. Plot PNGs are written as files under
+// notes/assets/ (content-hash deduped: re-exporting unchanged content
+// reuses the same file) and referenced with relative assets/... links.
+// The endpoint returns the markdown; the client previews it and either
+// inserts it into notes.md (notes PUT path) or downloads it as .md.
+// ---------------------------------------------------------------------------
+
+app.post('/api/projects/:slug/export-cells', async (req, res, next) => {
+  try {
+    await readProject(req.params.slug); // 404 before anything is written
+    const { notebook, name, cells } = req.body ?? {};
+    if (typeof notebook !== 'object' || notebook === null || Array.isArray(notebook)) {
+      return res.status(400).json({ error: 'notebook (object) is required' });
+    }
+    let nb;
+    try {
+      nb = parseNotebook(JSON.stringify(notebook));
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+    if (typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.ipynb$/.test(name)) {
+      return res.status(400).json({ error: 'name must be a .ipynb file name without path separators' });
+    }
+    if (!Array.isArray(cells) || cells.length === 0) {
+      return res.status(400).json({ error: 'select at least one cell to export' });
+    }
+    for (const i of cells) {
+      if (!Number.isInteger(i) || i < 0 || i >= nb.cells.length) {
+        return res.status(400).json({ error: `cell index out of range: ${i}` });
+      }
+    }
+    let rendered;
+    try {
+      rendered = cellsToMarkdown({ notebook: nb, name, indices: cells });
+    } catch (err) {
+      return res.status(err.status || 400).json({ error: err.message });
+    }
+    // Write plot PNGs (dedupe: same content-hash name already on disk wins).
+    const assetsDir = resolveProjectPath(DATA_DIR, req.params.slug, 'notes', 'assets');
+    await fsp.mkdir(assetsDir, { recursive: true });
+    const images = [];
+    for (const img of rendered.images) {
+      const file = path.join(assetsDir, img.fileName);
+      try {
+        await fsp.stat(file); // already there — same hash means same bytes
+      } catch {
+        await fsp.writeFile(file, Buffer.from(img.base64, 'base64'));
+      }
+      images.push({ cellIndex: img.cellIndex, fileName: img.fileName, path: `assets/${img.fileName}` });
+    }
+    res.json({ markdown: rendered.markdown, images, cells: cells.length });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// Serve a plot file written by the cell export (notes/assets/<file>).
+// PNG only; file names are content-hash suffixed by the export route, so a
+// name that exists is a file the export wrote. The markdown itself keeps
+// relative assets/... links (portable for download); the app's previews
+// rewrite those links to this route at render time.
+app.get('/api/projects/:slug/assets/:file', async (req, res, next) => {
+  try {
+    const file = req.params.file;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.png$/.test(file)) {
+      return res.status(400).json({ error: 'asset file must be a .png file name' });
+    }
+    await readProject(req.params.slug); // 404 before touching the disk
+    const abs = resolveProjectPath(DATA_DIR, req.params.slug, 'notes', 'assets', file);
+    res.type('image/png');
+    res.sendFile(abs);
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'asset not found' });
     next(err);
   }
 });

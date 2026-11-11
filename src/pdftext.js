@@ -9,13 +9,16 @@ export const MAX_PAGES = 40;
 /**
  * Extract text per page from a PDF buffer.
  * @param {Buffer|Uint8Array} buffer PDF bytes.
- * @param {{maxPages?: number}} [opts]
+ * @param {{maxPages?: number, startPage?: number, endPage?: number}} [opts]
+ *   `startPage`/`endPage` (1-based, inclusive) select a window of the
+ *   document — used for chapter context; `maxPages` caps how many pages
+ *   are read from the window (default 40). Defaults extract from page 1.
  * @returns {Promise<{pages: {page: number, text: string}[], text: string, numPages: number}>}
  *   `text` is the pages joined with a per-page marker (`\n--- page N ---\n`)
  *   so the LLM can cite page numbers that actually exist.
  * @throws {Error} with `status = 400` when the bytes are not a readable PDF.
  */
-export async function extractPdfText(buffer, { maxPages = MAX_PAGES } = {}) {
+export async function extractPdfText(buffer, { maxPages = MAX_PAGES, startPage = 1, endPage = Infinity } = {}) {
   let pdfjs;
   try {
     pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
@@ -36,8 +39,9 @@ export async function extractPdfText(buffer, { maxPages = MAX_PAGES } = {}) {
   try {
     const numPages = pdf.numPages;
     const pages = [];
-    const limit = Math.min(numPages, maxPages);
-    for (let n = 1; n <= limit; n++) {
+    const first = Math.max(1, Math.floor(startPage) || 1);
+    const last = Math.min(numPages, Math.floor(endPage) || numPages, first + Math.max(0, maxPages) - 1);
+    for (let n = first; n <= last; n++) {
       const page = await pdf.getPage(n);
       const tc = await page.getTextContent();
       const text = tc.items.map((it) => it.str ?? '').join(' ').replace(/\s+/g, ' ').trim();

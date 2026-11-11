@@ -30,6 +30,42 @@ export function makeTinyPdf(text = 'Hello Deep Learning') {
   return Buffer.concat(chunks);
 }
 
+/** Build a minimal valid N-page PDF; page i contains `Page i text`. */
+export function makeMultiPagePdf(n) {
+  const objs = {};
+  objs[1] = Buffer.from('<< /Type /Catalog /Pages 2 0 R >>');
+  const kids = [];
+  for (let i = 1; i <= n; i++) kids.push(`${3 + 2 * (i - 1)} 0 R`);
+  objs[2] = Buffer.from(`<< /Type /Pages /Kids [${kids.join(' ')}] /Count ${n} >>`);
+  const fontObj = 3 + 2 * n;
+  for (let i = 1; i <= n; i++) {
+    const pageObj = 3 + 2 * (i - 1);
+    const contentsObj = 4 + 2 * (i - 1);
+    objs[pageObj] = Buffer.from(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents ${contentsObj} 0 R /Resources << /Font << /F1 ${fontObj} 0 R >> >> >>`);
+    const stream = Buffer.from(`BT /F1 24 Tf 100 700 Td (Page ${i} text) Tj ET`);
+    objs[contentsObj] = Buffer.concat([
+      Buffer.from(`<< /Length ${stream.length} >>\nstream\n`),
+      stream,
+      Buffer.from('\nendstream'),
+    ]);
+  }
+  objs[fontObj] = Buffer.from('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
+
+  const total = 3 + 2 * n;
+  const chunks = [Buffer.from('%PDF-1.4\n')];
+  const offsets = [0];
+  for (let i = 1; i <= total; i++) {
+    offsets[i] = chunks.reduce((a, c) => a + c.length, 0);
+    chunks.push(Buffer.from(`${i} 0 obj\n`), objs[i], Buffer.from('\nendobj\n'));
+  }
+  const xrefAt = chunks.reduce((a, c) => a + c.length, 0);
+  let xref = `xref\n0 ${total + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i <= total; i++) xref += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+  xref += `trailer\n<< /Size ${total + 1} /Root 1 0 R >>\nstartxref\n${xrefAt}\n%%EOF\n`;
+  chunks.push(Buffer.from(xref));
+  return Buffer.concat(chunks);
+}
+
 test('extractPdfText: reads text from a tiny fixture PDF', async () => {
   assert.equal(MAX_PAGES, 40);
   const out = await extractPdfText(makeTinyPdf('Hello Deep Learning'));
@@ -45,4 +81,24 @@ test('extractPdfText: non-PDF bytes are a 400', async () => {
     extractPdfText(Buffer.from('this is not a pdf at all')),
     (err) => err.status === 400 && /readable PDF/.test(err.message),
   );
+});
+
+test('extractPdfText: page-range window (startPage/endPage/maxPages)', async () => {
+  const buf = makeMultiPagePdf(3);
+  let out = await extractPdfText(buf, { startPage: 2, endPage: 3 });
+  assert.equal(out.numPages, 3);
+  assert.deepEqual(out.pages.map((p) => p.page), [2, 3]);
+  assert.match(out.text, /Page 2 text/);
+  assert.match(out.text, /Page 3 text/);
+  assert.doesNotMatch(out.text, /Page 1 text/);
+
+  out = await extractPdfText(buf, { startPage: 2, maxPages: 1 });
+  assert.deepEqual(out.pages.map((p) => p.page), [2]);
+
+  out = await extractPdfText(buf);
+  assert.deepEqual(out.pages.map((p) => p.page), [1, 2, 3]);
+
+  out = await extractPdfText(buf, { startPage: 5 });
+  assert.deepEqual(out.pages, []);
+  assert.equal(out.numPages, 3);
 });

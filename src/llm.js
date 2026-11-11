@@ -1,16 +1,22 @@
-// LLM access for Note Mate's AI import — STRUCTURE ONLY.
+// LLM access for Note Mate.
 //
-// The LLM is used to derive *structure* from reading material: a chapter
-// outline, a note skeleton (per-chapter `##` headings with EMPTY bodies),
-// and the chapter→note mapping. It NEVER writes note content: no summaries,
-// no key points, no prose inside the user's notes. Markdown notes are the
-// user's own writing; the AI only builds the empty shelves.
+// Two uses, one client:
+// 1. AI import — STRUCTURE ONLY (proposeProjectData): derive an outline,
+//    a note skeleton (## headings with EMPTY bodies) and the chapter→note
+//    mapping from extracted text. It NEVER writes note content.
+// 2. On-demand AI notes (generateText): the user asks in plain language
+//    for markdown notes based on the current PDF chapter; the model returns
+//    markdown which is shown as a proposal and only written on Apply.
+//    Markdown notes are the user's own writing — this runs only when he
+//    explicitly asks, and only the Apply writes.
 //
 // Configuration lives in `server/.env` (never committed):
 //   LLM_API_KEY        Gemini API key
 //   LLM_MODEL          e.g. gemini-2.5-flash
-//   LLM_STUB_RESPONSE  tests/verification only: a JSON string returned
-//                      instead of calling the API (no key needed)
+//   LLM_STUB_RESPONSE  tests/verification only: a string returned
+//                      instead of calling the API (no key needed) — for
+//                      proposeProjectData it must be JSON; for generateText
+//                      it is returned verbatim as the markdown.
 // The key is never logged. `LLM_ENV_FILE` overrides the .env path (tests).
 import fs from 'node:fs';
 import path from 'node:path';
@@ -94,23 +100,40 @@ function buildPrompt({ kind, title, text }) {
   return `${STRUCTURE_ONLY_PROMPT}\n\nDocument kind: ${kind}\nDocument title: ${title}\n\nExtracted text (first pages only; page markers are authoritative):\n${text}`;
 }
 
-async function callGemini({ apiKey, model }, prompt) {
+async function callGemini({ apiKey, model }, prompt, { json = false } = {}) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const body = { contents: [{ parts: [{ text: prompt }] }] };
+  if (json) body.generationConfig = { responseMimeType: 'application/json' };
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { responseMimeType: 'application/json' },
-    }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new LlmError('LLM_BAD_RESPONSE', `Gemini API error: HTTP ${res.status}`, { status: 502, rawText: body.slice(0, 2000) });
+    const bodyText = await res.text().catch(() => '');
+    throw new LlmError('LLM_BAD_RESPONSE', `Gemini API error: HTTP ${res.status}`, { status: 502, rawText: bodyText.slice(0, 2000) });
   }
-  const json = await res.json();
-  const text = json?.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ?? '';
+  const jsonBody = await res.json();
+  const text = jsonBody?.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ?? '';
   return text;
+}
+
+/**
+ * Plain-text generation for on-demand AI notes. Returns the model's reply
+ * verbatim (the caller validates it as markdown). With a stub configured,
+ * the stub string is returned instead of calling the API.
+ * @throws {LlmError} LLM_NOT_CONFIGURED (status 503) when no stub and no
+ *   key+model; LLM_BAD_RESPONSE (status 502) on an API error.
+ */
+export async function generateText(prompt) {
+  const { apiKey, model, stub } = getLlmConfig();
+  if (stub) return stub;
+  if (apiKey && model) return callGemini({ apiKey, model }, prompt);
+  throw new LlmError(
+    LLM_NOT_CONFIGURED,
+    'LLM not configured',
+    { status: 503, hint: 'Add LLM_API_KEY and LLM_MODEL to server/.env' },
+  );
 }
 
 /** Strip ```json / ``` fences if the model wrapped its JSON in them. */
@@ -138,7 +161,7 @@ export async function proposeProjectData({ kind, title, text }) {
   if (stub) {
     rawText = stub;
   } else if (apiKey && model) {
-    rawText = await callGemini({ apiKey, model }, buildPrompt({ kind, title, text }));
+    rawText = await callGemini({ apiKey, model }, buildPrompt({ kind, title, text }), { json: true });
   } else {
     throw new LlmError(
       LLM_NOT_CONFIGURED,

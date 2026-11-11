@@ -16,6 +16,11 @@
    - PUT    /api/projects/:slug/notes/:name   {content}
    - POST   /api/projects/:slug/cover         {dataUrl}
    - POST   /api/projects/:slug/chapter-map   {mapping}
+   - POST   /api/projects/:slug/ai-note       {chapter?, prompt, includeNote?, history?}
+                                              → {markdown, chapter, contextChars}
+   - POST   /api/projects/:slug/export-cells  {notebook, name, cells:[indexes]}
+                                              → {markdown, images, cells}
+   - GET    /api/projects/:slug/assets/:file  exported plot PNG (notes/assets/)
    - POST   /api/execute                      {language, code}
    - POST   /api/execute                      {language, cells:[{source}]}
                                               → {results:[{stdout, stderr, exitCode, images, skipped}]}
@@ -208,6 +213,13 @@ const state = {
   labsOpenChapters: {}, // chapter -> true when its file group is expanded
   saveTimer: null,
   suppressFollowScroll: false,
+  // On-demand AI notes + cell export: one AI thread per notebook, kept in
+  // memory for the session (resets on reload — same v1 limit as Finance
+  // Mate's Refine panel). Export selection is per notebook too.
+  aiPanelOpen: false,
+  aiThreads: {},        // notebookKey -> {messages: [{role, content, markdown, applied}]}
+  exportSelection: new Set(), // notebook cell indexes selected for export
+  exportSelectionFor: null,   // notebook key the selection belongs to
 };
 
 function resetReaderState() {
@@ -239,6 +251,10 @@ function resetReaderState() {
   state.labsOpenChapters = {};
   state.coverGenerated = false;
   state.editorFocused = false;
+  state.aiPanelOpen = false;
+  state.aiThreads = {};
+  state.exportSelection = new Set();
+  state.exportSelectionFor = null;
   if (state.saveTimer) { clearTimeout(state.saveTimer); state.saveTimer = null; }
 }
 
@@ -1119,6 +1135,7 @@ function setActiveChapter(chapter, { scrollNotebook = false, scrollPdf = false, 
     const heading = resolvedChapterHeading(chapter);
     scrollNotebookToHeading(heading, force); // null -> leave the notebook alone
   }
+  updateAiContext(); // keep the Ask AI panel's context line live
 }
 
 /* Scroll the notebook pane to a heading.
@@ -1192,6 +1209,7 @@ function renderNotebookPane() {
   pane.innerHTML = `
     <div class="notebook-tabs" id="notebook-tabs"></div>
     <div class="notebook-toolbar" id="notebook-toolbar"></div>
+    <div class="ai-panel" id="ai-panel" hidden></div>
     <div class="labs-section" id="labs-section" hidden></div>
     <div class="notebook-body" id="notebook-body"></div>`;
 
@@ -1248,6 +1266,7 @@ function renderNotebookPane() {
   tabs.appendChild(addNb);
 
   renderNotebookToolbar();
+  renderAiPanel();
   renderLabsSection();
   renderNotebookBody();
 }
@@ -1398,6 +1417,7 @@ function renderNotebookToolbar() {
   if (state.activeNoteKind === 'md') {
     bar.innerHTML = `
       <button type="button" id="md-mode-toggle">${state.mdMode === 'edit' ? 'Preview' : 'Edit'}</button>
+      <button type="button" id="ai-toggle" class="${state.aiPanelOpen ? 'active' : ''}" title="Ask the AI to draft markdown notes from the current chapter — a proposal, never a silent write">✨ Ask AI</button>
       <label class="follow-toggle" title="Follow the reading pane: scroll the notebook to the current chapter">
         <input type="checkbox" id="follow-toggle" ${state.follow ? 'checked' : ''}> Follow
       </label>
@@ -1413,12 +1433,21 @@ function renderNotebookToolbar() {
     $('#md-save-btn', bar).addEventListener('click', () => saveActiveMdNote(true));
   } else {
     bar.innerHTML = `
+      <button type="button" id="ai-toggle" class="${state.aiPanelOpen ? 'active' : ''}" title="Ask the AI to draft markdown notes from the current chapter — a proposal, never a silent write">✨ Ask AI</button>
       <label class="follow-toggle" title="Follow the reading pane: scroll the notebook to the current chapter">
         <input type="checkbox" id="follow-toggle" ${state.follow ? 'checked' : ''}> Follow
       </label>
       <span class="spacer"></span>
       <span class="save-status" id="save-status"></span>`;
     $('#follow-toggle', bar).addEventListener('change', (e) => { state.follow = e.target.checked; });
+  }
+  const aiBtn = $('#ai-toggle', bar);
+  if (aiBtn) {
+    aiBtn.addEventListener('click', () => {
+      state.aiPanelOpen = !state.aiPanelOpen;
+      renderNotebookToolbar();
+      renderAiPanel();
+    });
   }
 }
 
@@ -1459,6 +1488,7 @@ function renderNotebookBody() {
    attach a Run button to python/java/javascript fenced code blocks. */
 function renderMdPreview(el, text) {
   el.innerHTML = window.marked ? window.marked.parse(text || '') : esc(text || '');
+  rewriteAssetSrcs(el); // exported plots (assets/...) resolve via the asset API
   $$('h2, h3', el).forEach((h) => { h.dataset.h = normalizeHeading(h.textContent); });
   $$('pre', el).forEach((pre) => {
     const code = $('code', pre);
@@ -1675,6 +1705,12 @@ function renderIpynbBody(body) {
   const nb = state.activeNotebook;
   const lang = nb?.metadata?.language_info?.name
     || nb?.metadata?.kernelspec?.language || 'python';
+  // The export selection belongs to one notebook; a different notebook
+  // starts with an empty selection.
+  if (state.exportSelectionFor !== notebookKey()) {
+    state.exportSelection = new Set();
+    state.exportSelectionFor = notebookKey();
+  }
   // Run-all is unavailable for Java: cells cannot share one session.
   const runAllRow = lang === 'java' ? '' : `
     <div class="nb-runall-row">
@@ -1682,7 +1718,13 @@ function renderIpynbBody(body) {
         title="Run all code cells top to bottom in one shared session">▶ Run all</button>
       <span class="save-status" id="nb-runall-status"></span>
     </div>`;
-  body.innerHTML = `${runAllRow}<div class="nb-cells" id="nb-cells"></div>`;
+  const exportRow = `
+    <div class="nb-export-row">
+      <button type="button" id="nb-export-md" disabled
+        title="Generate markdown from the selected code cells (code fences, outputs, plots as files)">Export to Markdown</button>
+      <span class="save-status" id="nb-export-count">Select cells to export</span>
+    </div>`;
+  body.innerHTML = `${runAllRow}${exportRow}<div class="nb-cells" id="nb-cells"></div>`;
   const runAllBtn = $('#nb-run-all', body);
   if (runAllBtn) {
     runAllBtn.addEventListener('click', async (e) => {
@@ -1692,6 +1734,7 @@ function renderIpynbBody(body) {
       btn.textContent = '▶ Run all';
     });
   }
+  $('#nb-export-md', body).addEventListener('click', exportSelectedCells);
   const wrap = $('#nb-cells', body);
 
   nb.cells.forEach((cell, idx) => {
@@ -1727,7 +1770,9 @@ function renderIpynbBody(body) {
     } else {
       // Code cell: editable source, Run button, outputs area.
       cellEl.innerHTML = `
-        <div class="nb-cell-head"><span>Code · ${esc(lang)}</span><span class="spacer"></span>
+        <div class="nb-cell-head"><label class="nb-export-check" title="Select for Markdown export">
+            <input type="checkbox" data-cell-select="${idx}" ${state.exportSelection.has(idx) ? 'checked' : ''}> Export</label>
+          <span>Code · ${esc(lang)}</span><span class="spacer"></span>
           <button type="button" data-cell-del="${idx}">Delete</button></div>
         <textarea class="nb-code-source" spellcheck="false"></textarea>
         <div class="nb-cell-foot">
@@ -1736,6 +1781,11 @@ function renderIpynbBody(body) {
           <span class="save-status" data-cell-status="${idx}"></span>
         </div>
         <div class="nb-output" data-cell-output="${idx}"></div>`;
+      $(`[data-cell-select="${idx}"]`, cellEl).addEventListener('change', (e) => {
+        if (e.currentTarget.checked) state.exportSelection.add(idx);
+        else state.exportSelection.delete(idx);
+        updateExportButton();
+      });
       const ta = $('.nb-code-source', cellEl);
       ta.value = nbCellSource(cell);
       ta.addEventListener('input', () => { setNbCellSource(cell, ta.value); });
@@ -1776,6 +1826,7 @@ function renderIpynbBody(body) {
       $(`[data-cell-del="${idx}"]`, cellEl).addEventListener('click', async () => {
         if (!window.confirm('Delete this cell?')) return;
         nb.cells.splice(idx, 1);
+        state.exportSelection = new Set(); // indexes shift — drop the selection
         await saveNotebook();
         renderNotebookBody();
       });
@@ -1790,10 +1841,12 @@ function renderIpynbBody(body) {
       <button type="button" data-add-code="${idx}">+ Code cell</button>`;
     $(`[data-add-md="${idx}"]`, addRow).addEventListener('click', () => {
       nb.cells.splice(idx + 1, 0, { cell_type: 'markdown', metadata: {}, source: '' });
+      state.exportSelection = new Set(); // indexes shift — drop the selection
       saveNotebook().then(() => renderNotebookBody());
     });
     $(`[data-add-code="${idx}"]`, addRow).addEventListener('click', () => {
       nb.cells.splice(idx + 1, 0, { cell_type: 'code', execution_count: null, metadata: {}, outputs: [], source: '' });
+      state.exportSelection = new Set(); // indexes shift — drop the selection
       saveNotebook().then(() => renderNotebookBody());
     });
     wrap.appendChild(addRow);
@@ -1813,6 +1866,7 @@ function renderIpynbBody(body) {
     saveNotebook().then(() => renderNotebookBody());
   });
   wrap.appendChild(bottomRow);
+  updateExportButton(); // restores the button state after a re-render
 }
 
 function outputsFromExecuteResult(result) {
@@ -1865,6 +1919,425 @@ function renderCellOutputs(el, cell) {
     html = '<span style="color:#8a7a68">(no output)</span>';
   }
   el.innerHTML = html;
+}
+
+/* ---------------- on-demand AI notes + cell export ---------------- */
+
+// A stable key for the current notebook (note or lab tab): one AI thread
+// and one export selection per notebook.
+function notebookKey() {
+  if (state.activeTabKind === 'lab' && state.activeLab) {
+    return `lab:${state.activeLab.chapter}/${state.activeLab.name}`;
+  }
+  return `note:${state.activeNoteName}`;
+}
+
+function notebookDisplayName() {
+  if (state.activeTabKind === 'lab' && state.activeLab) return labDisplayName(state.activeLab.name);
+  return String(state.activeNoteName || 'notebook').replace(/\.(ipynb|md)$/i, '');
+}
+
+/* The outline chapter the reader is on (null when none — e.g. a video
+   project, or a heading-only nav). The AI request uses the outline title
+   verbatim so the server can match it against the stored outline. */
+function activeOutlineChapter() {
+  if (!state.activeChapter) return null;
+  return (state.outline || []).find((ch) => normalizeHeading(ch.title) === state.activeChapter) || null;
+}
+
+/* Display title for the context line: the outline chapter, else the active
+   note heading, else null. */
+function activeChapterTitle() {
+  const ch = activeOutlineChapter();
+  if (ch) return ch.title;
+  const h = (state.headings || []).find((hh) => hh.norm === state.activeChapter);
+  return h ? h.text : null;
+}
+
+/* Keep the AI panel's context line live as the reader moves chapters.
+   Cheap: one text update, only when the panel is open. Called from
+   renderAiPanel and from setActiveChapter. */
+function updateAiContext() {
+  const el = $('#ai-context', view);
+  if (!el) return;
+  const ch = activeOutlineChapter();
+  const wrap = $('#ai-include-wrap', view);
+  if (ch) {
+    el.textContent = `Context: ${ch.title}${ch.page != null ? ` (p. ${ch.page})` : ''} — the AI reads this chapter's PDF text.`;
+    if (wrap) wrap.hidden = false;
+  } else {
+    const title = activeChapterTitle();
+    el.textContent = title
+      ? `Context: ${title} — no PDF chapter text for it; the AI works from your request (and your notes, if included) only.`
+      : 'Context: no chapter selected — the AI works from your request only.';
+    if (wrap) wrap.hidden = true;
+  }
+}
+
+/* Port of insertMarkdownUnderHeading in src/aiNote.js — the same rule on
+   both sides: insert at the end of the section under the ## heading
+   matching headingTitle; append a new ## section when it is missing; a
+   second insert of the exact same block is a no-op (inserted: false). */
+function insertMarkdownUnderHeading(notesText, headingTitle, markdown) {
+  const block = String(markdown || '').trim();
+  if (!block) return { text: String(notesText ?? ''), inserted: false };
+  const lines = String(notesText ?? '').split('\n');
+  const headings = headingsFromMarkdown(notesText);
+  const hit = matchHeading(headingTitle, headings);
+  if (!hit) {
+    const base = String(notesText ?? '');
+    const sep = base && !base.endsWith('\n') ? '\n' : '';
+    const gap = base && !base.endsWith('\n\n') ? '\n' : '';
+    return { text: `${base}${sep}${gap}## ${headingTitle}\n\n${block}\n`, inserted: true };
+  }
+  const start = hit.line + 1;
+  let end = lines.length;
+  for (let i = start; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i])) { end = i; break; }
+  }
+  const section = lines.slice(start, end).join('\n');
+  if (section.includes(block)) return { text: String(notesText ?? ''), inserted: false };
+  const before = lines.slice(0, end);
+  while (before.length && before[before.length - 1].trim() === '') before.pop();
+  const after = lines.slice(end);
+  return { text: [...before, '', block, '', ...after].join('\n'), inserted: true };
+}
+
+function downloadBlob(content, fileName, mime = 'text/markdown') {
+  const blob = new Blob([content], { type: `${mime};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/* Insert markdown under a ## heading in notes.md through the existing
+   notes PUT path. Creates notes.md (from the project title) when it does
+   not exist yet. Returns {inserted, headingTitle}. */
+async function insertIntoNotesMd(headingTitle, markdown) {
+  const slug = encodeURIComponent(state.project.slug);
+  let current = '';
+  let exists = true;
+  try {
+    const data = await apiGet(`/api/projects/${slug}/notes/notes.md`);
+    current = typeof data === 'string' ? data : (data.content ?? '');
+  } catch (err) {
+    if (/note not found/.test(err.message || '')) {
+      current = `# ${state.project.title}\n`;
+      exists = false;
+    } else throw err;
+  }
+  const { text, inserted } = insertMarkdownUnderHeading(current, headingTitle, markdown);
+  if (!inserted) return { inserted: false, headingTitle };
+  await apiJson(`/api/projects/${slug}/notes/notes.md`, 'PUT', { content: text });
+  if (!exists && !state.notes.some((n) => n.name === 'notes.md')) {
+    state.notes.push({ name: 'notes.md', kind: 'md' });
+    renderNotebookPane();
+  }
+  if (state.activeTabKind === 'note' && state.activeNoteName === 'notes.md') {
+    state.activeNoteContent = text;
+    state.headings = headingsFromMarkdown(text);
+    renderChapterPanel();
+    if (state.mdMode === 'preview') renderNotebookBody();
+    else { const ta = $('#md-editor', view); if (ta) ta.value = text; }
+  }
+  return { inserted: true, headingTitle };
+}
+
+/* ---------------- Ask AI panel ---------------- */
+
+const AI_QUICK_CHIPS = [
+  'Summarize this chapter in 5 bullets',
+  'Explain the key ideas in my own study-note style',
+  'List the key formulas and definitions here',
+];
+
+function aiThread() {
+  const key = notebookKey();
+  if (!state.aiThreads[key]) state.aiThreads[key] = { messages: [] };
+  return state.aiThreads[key];
+}
+
+function renderAiPanel() {
+  const panel = $('#ai-panel', view);
+  if (!panel) return;
+  if (!state.aiPanelOpen) { panel.hidden = true; panel.innerHTML = ''; panel.dataset.key = ''; return; }
+  panel.hidden = false;
+  if (panel.dataset.key !== notebookKey()) {
+    panel.dataset.key = notebookKey();
+    panel.innerHTML = `
+      <div class="ai-panel-head">
+        <strong>✨ Ask AI</strong>
+        <span class="ai-panel-sub">Drafts markdown notes from the current chapter — a proposal only. Nothing is written until you press Apply.</span>
+        <span class="spacer"></span>
+        <button type="button" id="ai-clear">Clear</button>
+      </div>
+      <p class="ai-context" id="ai-context"></p>
+      <label class="ai-include" id="ai-include-wrap">
+        <input type="checkbox" id="ai-include-note"> Include my notes for this chapter
+      </label>
+      <div class="ai-thread" id="ai-thread"></div>
+      <div class="ai-chips" id="ai-chips"></div>
+      <div class="ai-input-row">
+        <input type="text" id="ai-prompt" placeholder="What should the AI write? e.g. summarize this chapter in 5 bullets" autocomplete="off">
+        <button type="button" class="primary" id="ai-send">Send</button>
+      </div>
+      <div class="ai-status" id="ai-status"></div>`;
+    const chipsEl = $('#ai-chips', panel);
+    AI_QUICK_CHIPS.forEach((chip) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'ai-chip';
+      b.textContent = chip;
+      b.addEventListener('click', () => { $('#ai-prompt', panel).value = chip; askAi(); });
+      chipsEl.appendChild(b);
+    });
+    $('#ai-send', panel).addEventListener('click', askAi);
+    $('#ai-prompt', panel).addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); askAi(); }
+    });
+    $('#ai-clear', panel).addEventListener('click', () => {
+      aiThread().messages = [];
+      renderAiThread();
+    });
+    renderAiThread();
+  }
+  updateAiContext();
+}
+
+function renderAiThread() {
+  const thread = $('#ai-thread', view);
+  if (!thread) return;
+  const { messages } = aiThread();
+  if (!messages.length) {
+    thread.innerHTML = '<p class="hint">Ask in plain language — the AI drafts a note proposal from the current chapter. Apply inserts it under that chapter’s heading in notes.md.</p>';
+    return;
+  }
+  thread.innerHTML = '';
+  messages.forEach((msg, i) => {
+    const el = document.createElement('div');
+    el.className = `ai-msg ai-msg-${msg.role}`;
+    if (msg.role === 'user') {
+      el.textContent = msg.content;
+    } else {
+      const body = document.createElement('div');
+      body.className = 'ai-msg-body';
+      body.innerHTML = window.marked ? window.marked.parse(msg.markdown || '') : esc(msg.markdown || '');
+      const actions = document.createElement('div');
+      actions.className = 'ai-msg-actions';
+      const applyBtn = document.createElement('button');
+      applyBtn.type = 'button';
+      applyBtn.className = 'primary';
+      applyBtn.textContent = msg.applied ? 'Applied ✓' : 'Apply';
+      applyBtn.disabled = !!msg.applied;
+      applyBtn.addEventListener('click', () => applyAiNote(i));
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.textContent = 'Copy';
+      copyBtn.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(msg.markdown || '');
+          copyBtn.textContent = 'Copied ✓';
+          setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+        } catch { copyBtn.textContent = 'Copy failed'; }
+      });
+      actions.append(applyBtn, copyBtn);
+      el.append(body, actions);
+    }
+    thread.appendChild(el);
+  });
+  thread.scrollTop = thread.scrollHeight;
+}
+
+async function askAi() {
+  const panel = $('#ai-panel', view);
+  if (!panel || !state.aiPanelOpen) return;
+  const input = $('#ai-prompt', panel);
+  const statusEl = $('#ai-status', panel);
+  const sendBtn = $('#ai-send', panel);
+  const prompt = (input.value || '').trim();
+  statusEl.classList.remove('error');
+  if (!prompt) { statusEl.textContent = 'Type what you want the AI to write.'; return; }
+  if (prompt.length > 2000) { statusEl.textContent = 'Keep the request under 2000 characters.'; return; }
+  const thread = aiThread();
+  const ch = activeOutlineChapter();
+  const history = thread.messages.slice(-6).map((m) => ({
+    role: m.role,
+    content: m.role === 'assistant' ? (m.markdown || '') : m.content,
+  }));
+  thread.messages.push({ role: 'user', content: prompt });
+  input.value = '';
+  sendBtn.disabled = true;
+  statusEl.textContent = 'Asking the AI…';
+  renderAiThread();
+  try {
+    const res = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/ai-note`, 'POST', {
+      chapter: ch ? ch.title : null,
+      prompt,
+      includeNote: ch ? !!$('#ai-include-note', panel)?.checked : false,
+      history,
+    });
+    thread.messages.push({ role: 'assistant', content: '', markdown: res.markdown || '', applied: false });
+    statusEl.textContent = ch ? `Drafted from “${ch.title}”.` : 'Drafted (no chapter context).';
+  } catch (err) {
+    statusEl.textContent = /LLM not configured/i.test(err.message || '')
+      ? 'AI is not configured — set LLM_API_KEY and LLM_MODEL in server/.env, then restart the server.'
+      : err.message;
+    statusEl.classList.add('error');
+  } finally {
+    sendBtn.disabled = false;
+    renderAiThread();
+  }
+}
+
+async function applyAiNote(i) {
+  const thread = aiThread();
+  const msg = thread.messages[i];
+  if (!msg || msg.role !== 'assistant' || msg.applied) return;
+  const ch = activeOutlineChapter();
+  const heading = ch ? ch.title : 'AI notes';
+  const statusEl = $('#ai-status', view);
+  try {
+    const { inserted } = await insertIntoNotesMd(heading, msg.markdown);
+    msg.applied = true;
+    if (statusEl) {
+      statusEl.textContent = inserted
+        ? `Inserted under “${heading}” in notes.md.`
+        : 'Already in notes.md — nothing added.';
+    }
+  } catch (err) {
+    if (statusEl) {
+      statusEl.textContent = `Could not insert: ${err.message}`;
+      statusEl.classList.add('error');
+    }
+    return;
+  }
+  renderAiThread();
+}
+
+/* ---------------- export cells to Markdown ---------------- */
+
+// Plot files exported under notes/assets/ are referenced with relative
+// assets/... links in the markdown (portable for download). In the app's
+// own previews those links resolve through the asset API route.
+function rewriteAssetSrcs(el) {
+  const slug = state.project?.slug;
+  if (!slug) return;
+  $$('img', el).forEach((img) => {
+    const src = img.getAttribute('src');
+    if (src && src.startsWith('assets/')) {
+      img.src = `/api/projects/${encodeURIComponent(slug)}/assets/${src.slice('assets/'.length)}`;
+    }
+  });
+}
+
+function updateExportButton() {
+  const btn = $('#nb-export-md', view);
+  const count = $('#nb-export-count', view);
+  if (!btn) return;
+  const n = state.exportSelection.size;
+  btn.disabled = n === 0;
+  if (count) {
+    count.textContent = n === 0
+      ? 'Select cells to export'
+      : `${n} cell${n === 1 ? '' : 's'} selected`;
+  }
+}
+
+async function exportSelectedCells() {
+  const indices = [...state.exportSelection].sort((a, b) => a - b);
+  if (!indices.length || !state.activeNotebook) return;
+  const name = state.activeTabKind === 'lab' && state.activeLab
+    ? state.activeLab.name : state.activeNoteName;
+  const btn = $('#nb-export-md', view);
+  if (btn) { btn.disabled = true; btn.textContent = 'Exporting…'; }
+  try {
+    const res = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/export-cells`, 'POST', {
+      notebook: state.activeNotebook, name, cells: indices,
+    });
+    openCellExportModal(res.markdown, name, res.images || []);
+  } catch (err) {
+    const count = $('#nb-export-count', view);
+    if (count) count.textContent = `Export failed: ${err.message}`;
+  } finally {
+    if (btn) { btn.textContent = 'Export to Markdown'; updateExportButton(); }
+  }
+}
+
+function closeCellExportModal() {
+  const existing = document.getElementById('cell-export-modal');
+  if (existing) existing.remove();
+}
+
+/* Preview what the export produces, before anything is written to notes.md.
+   Two targets from one preview: [Insert into note] appends under the
+   current chapter's ## heading in notes.md; [Download .md] saves the file
+   (links resolve when it lives in notes/). */
+function openCellExportModal(markdown, name, images) {
+  closeCellExportModal();
+  const base = String(name || 'notebook').replace(/\.ipynb$/i, '');
+  const fileName = `${base}-cells.md`;
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay ai-preview-overlay';
+  overlay.id = 'cell-export-modal';
+  overlay.innerHTML = `
+    <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="cell-export-title">
+      <h2 id="cell-export-title">Export cells to Markdown</h2>
+      <p class="ai-notice">Deterministic export — no AI. Code as fenced blocks, outputs below,
+        plots as files under <code>notes/assets/</code> with relative links.
+        ${images.length ? 'Links resolve when this file lives in <code>notes/</code>.' : ''}</p>
+      <h3>Preview</h3>
+      <div class="ai-skeleton" id="cell-export-preview"></div>
+      <h3>Markdown</h3>
+      <textarea class="md-editor" id="cell-export-raw" rows="8" readonly spellcheck="false"></textarea>
+      <div class="form-error" id="cell-export-error"></div>
+      <div class="modal-actions">
+        <button type="button" id="cell-export-close">Close</button>
+        <button type="button" id="cell-export-copy">Copy</button>
+        <button type="button" id="cell-export-download">Download .md</button>
+        <button type="button" class="primary" id="cell-export-insert">Insert into note</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const previewEl = $('#cell-export-preview', overlay);
+  previewEl.innerHTML = window.marked ? window.marked.parse(markdown || '') : esc(markdown || '');
+  rewriteAssetSrcs(previewEl);
+  $('#cell-export-raw', overlay).value = markdown || '';
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeCellExportModal(); });
+  $('#cell-export-close', overlay).addEventListener('click', closeCellExportModal);
+  $('#cell-export-copy', overlay).addEventListener('click', async (e) => {
+    try {
+      await navigator.clipboard.writeText(markdown);
+      e.currentTarget.textContent = 'Copied ✓';
+      setTimeout(() => { e.currentTarget.textContent = 'Copy'; }, 1500);
+    } catch {
+      $('#cell-export-error', overlay).textContent = 'Copy failed — select the text manually.';
+    }
+  });
+  $('#cell-export-download', overlay).addEventListener('click', () => {
+    downloadBlob(markdown, fileName);
+  });
+  $('#cell-export-insert', overlay).addEventListener('click', async (e) => {
+    const errBox = $('#cell-export-error', overlay);
+    const btn = e.currentTarget;
+    errBox.textContent = '';
+    const ch = activeOutlineChapter();
+    const heading = ch ? ch.title : notebookDisplayName();
+    btn.disabled = true;
+    btn.textContent = 'Inserting…';
+    try {
+      const { inserted } = await insertIntoNotesMd(heading, markdown);
+      btn.textContent = inserted ? 'Inserted ✓' : 'Already inserted ✓';
+    } catch (err) {
+      errBox.textContent = err.message;
+      btn.disabled = false;
+      btn.textContent = 'Insert into note';
+    }
+  });
 }
 
 /* ---------------- boot ---------------- */

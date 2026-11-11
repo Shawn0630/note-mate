@@ -160,6 +160,81 @@ via `src/pdftext.js`; video: transcript text). The deterministic import path
 is unchanged: `POST /api/projects` with a file upload uses the PDF's own
 outline when present, an empty skeleton otherwise.
 
+## On-demand AI notes (Ask AI)
+
+The **✨ Ask AI** button in the notebook pane opens a conversation panel
+(one thread per notebook, kept in memory for the session — it resets on
+reload, the same v1 limit as Finance Mate's Refine panel). This is the
+**other** AI surface, and it works the opposite way from AI import:
+
+| | AI import | Ask AI |
+|---|---|---|
+| When | Once, at project creation | Any time, only when you ask |
+| The AI writes | Structure only: outline + headings-only skeleton + chapter map | Content: markdown notes, as a **proposal** |
+| Writes to your files | The skeleton, on Apply | Nothing — until you press **Apply** on a proposal |
+
+- **Context**: the text of the **current chapter** — the page range comes
+  from the project's outline, extracted server-side from the source PDF
+  (`src/pdftext.js`, capped at 40 pages per chapter and 30,000
+  characters sent to the model). The outline is the stored one when the
+  project has it (AI import); otherwise the server reads the PDF's own
+  outline (`src/pdfOutline.js`) — seeded and file-uploaded projects store
+  none, and the reader reads the same outline client-side. An "Include my
+  notes for this chapter" checkbox adds the current chapter's section from
+  `notes.md` (up to 4,000 characters). With no chapter selected the AI
+  works from your request only. The prompt is capped at 2,000 characters;
+  the last 6 thread messages are included as conversation context.
+- **Honesty rules** (same as import): the prompt forbids inventing page
+  numbers, quotes, formulas, or facts not in the chapter text — if the
+  chapter does not cover what you asked, the model says so instead.
+- **Output = a proposal**: the reply is rendered as a preview with
+  **Apply** and **Copy**. Apply inserts the markdown at the end of the
+  section under the current chapter's `##` heading in `notes.md` (through
+  the existing notes PUT path; a missing heading is created). A second
+  Apply of the same proposal is a no-op — it never duplicates. `##`/`#`
+  headings inside a proposal are demoted to `###`, so an inserted note
+  never splits the chapter section.
+- **API**: `POST /api/projects/:slug/ai-note`
+  `{chapter?, prompt, includeNote?, history?}` →
+  `{markdown, chapter: {title, startPage, endPage} | null, contextChars}`.
+  `chapter` is the outline title (matched with the same normalization as
+  the chapter map); omit it for a prompt-only note. 400 on an unknown
+  chapter, a chapter with no page, or a non-PDF project. 503
+  `{error: 'LLM not configured', hint: ...}` when the LLM is off, same as
+  import. Pure helpers live in `src/aiNote.js`.
+
+## Export cells to Markdown
+
+In an ipynb notebook, each code cell has an **Export** checkbox. The
+**Export to Markdown** button (above the cells) generates markdown from
+the selected cells — deterministic, no LLM:
+
+- Code as a fenced block (language from the notebook metadata — `python`,
+  `javascript`, `java`), stdout/stderr as output blocks, one `### Cell N`
+  heading per cell. Markdown cells are skipped; empty-output cells export
+  just the fence.
+- **Plots are files, not base64**: each `image/png` output is written to
+  `notes/assets/<notebook>-cell-<n>-<hash8>.png` (SHA-256 of the PNG bytes,
+  first 8 hex chars — re-exporting unchanged content reuses the same file)
+  and referenced with a relative link `![Cell N plot](assets/...)`.
+  `GET /api/projects/:slug/assets/:file` serves those PNGs, so the plots
+  also render in the app's own markdown previews (the markdown itself
+  keeps the relative link, which resolves when a downloaded file lives in
+  `notes/`).
+- The preview shows the rendered markdown and the raw text, with two
+  targets: **[Insert into note]** appends under the current chapter's
+  `##` heading in `notes.md` (same insert rule as Ask AI — a second Insert
+  of the same export is a no-op), and **[Download .md]** saves
+  `<notebook>-cells.md`. Nothing is inserted into your notes until you
+  press Insert. (Generating the preview does write the deduped plot files
+  under `notes/assets/` — the preview's links have to point at real files.)
+- **API**: `POST /api/projects/:slug/export-cells`
+  `{notebook, name, cells: [indexes]}` →
+  `{markdown, images: [{cellIndex, fileName, path}], cells}`. The notebook
+  JSON comes from the client (exactly what you see, saved or not); at most
+  200 cells per export. 400 on an empty selection, an out-of-range index,
+  or a non-code-only selection. Pure generation in `src/cellExport.js`.
+
 ## API
 
 | Method | Path | Notes |
@@ -181,6 +256,9 @@ outline when present, an empty skeleton otherwise.
 | POST | `/api/projects/:slug/chapter-map` | `{mapping}` merged into `project.json` `chapterMap` |
 | POST | `/api/import/ai/propose` | Multipart (`file` = PDF, `title?`) → structure-only proposal; 503 when the LLM is not configured, 400 on a bad PDF or unparseable model output |
 | POST | `/api/import/ai/apply` | Multipart (`file` = PDF, `proposal` = JSON string, `title`) → creates the project; 201 `{project}`, 409 on slug collision |
+| POST | `/api/projects/:slug/ai-note` | `{chapter?, prompt, includeNote?, history?}` → `{markdown, chapter, contextChars}` — on-demand AI note proposal; 503 when the LLM is not configured (see "On-demand AI notes") |
+| POST | `/api/projects/:slug/export-cells` | `{notebook, name, cells: [indexes]}` → `{markdown, images, cells}` — deterministic cell export; writes deduped PNGs under `notes/assets/` (see "Export cells to Markdown") |
+| GET | `/api/projects/:slug/assets/:file` | Serves an exported plot PNG from `notes/assets/` (`.png` file names only) |
 | POST | `/api/execute` | `{language: python\|java\|javascript, code}` → `{stdout, stderr, exitCode, images:[{data, mime:"image/png"}]}` |
 | POST | `/api/execute` | `{language: python\|javascript, cells:[{source}]}` → `{results:[{stdout, stderr, exitCode, images, skipped}]}` — run-all in one shared session (see below) |
 
@@ -280,6 +358,9 @@ npm test   # node --test tests/  (util + API integration tests)
 ## v1 limits
 
 - **No KaTeX / math rendering yet.**
+- **Ask AI threads are in-memory only** — they reset on reload (same v1
+  limit as Finance Mate's Refine panel). Proposals are never persisted
+  until you press Apply.
 - **`/api/execute` has a timeout but no network sandbox.** Code runs as the
   server user with network access. Do not expose the server to untrusted
   users; sandboxing (no-network, resource limits) is future work.
