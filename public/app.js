@@ -203,6 +203,10 @@ const state = {
   headings: [],         // headings of the active note
   outline: [],          // [{title, page, depth}] for PDFs
   chapterMap: {},       // normalized outline title -> note heading index (user override)
+  // "Edit links" mode for the Chapters panel: off by default the panel is
+  // just clean chapter rows; on, each row gets its "Link to a note heading…"
+  // dropdown (the manual chapterMap override). Session-only, defaults off.
+  editChapterLinks: false,
   activeChapter: null,  // normalized chapter title currently active
   pdfDoc: null,
   pdfPages: [],         // [{num, top}] measured offsets in the pdf container
@@ -2307,22 +2311,39 @@ function renderChapterPanel() {
     ? `<p class="chapter-source">Source: ${esc(activeSourceLabel())}</p>` : '';
 
   if (kind === 'pdf' && state.outline.length) {
-    panel.innerHTML = `<h2>Chapters</h2>${sourceNote}` + state.outline.map((ch, i) => {
+    // The manual chapterMap override ("Link to a note heading…") lives
+    // behind the Edit links toggle: off by default the panel is clean
+    // chapter rows; on, every row gets its dropdown, with the currently
+    // resolved heading (override or auto-match) pre-selected so the mode
+    // is a real link editor — including for chapters whose auto-match is
+    // wrong, which the old always-on dropdowns could never fix (they only
+    // showed for unmatched chapters).
+    const editLinks = state.editChapterLinks;
+    panel.innerHTML = `<div class="chapter-head"><h2>Chapters</h2>
+      <button type="button" id="edit-links-toggle" class="chapter-edit-toggle${editLinks ? ' active' : ''}"
+        aria-pressed="${editLinks}" title="Show the chapter → note heading link dropdowns">✎ Edit links</button></div>${sourceNote}` + state.outline.map((ch, i) => {
       const matched = resolvedChapterHeading(ch);
       const isActive = state.activeChapter === normalizeHeading(ch.title);
       const indent = ch.depth ? ` style="padding-left:${16 + ch.depth * 14}px"` : '';
       let row = `<button type="button" class="chapter-row${isActive ? ' active' : ''}"
           data-chapter="${i}"${indent}>${esc(ch.title)}${ch.page != null ? `<span class="chapter-page">p. ${ch.page}</span>` : ''}</button>`;
-      if (!matched) {
+      if (editLinks) {
+        const h2 = h2Headings(state.headings);
+        const matchedIdx = matched ? h2.findIndex((h) => h.norm === matched.norm) : -1;
         row += `<div class="chapter-link">
           <select data-link-chapter="${i}" aria-label="Link chapter to a note heading">
             <option value="">Link to a note heading…</option>
-            ${h2Headings(state.headings).map((h, hi) => `<option value="${hi}">${esc(h.text)}</option>`).join('')}
+            ${h2.map((h, hi) => `<option value="${hi}"${hi === matchedIdx ? ' selected' : ''}>${esc(h.text)}</option>`).join('')}
           </select>
         </div>`;
       }
       return row;
     }).join('');
+
+    $('#edit-links-toggle', panel)?.addEventListener('click', () => {
+      state.editChapterLinks = !state.editChapterLinks;
+      renderChapterPanel();
+    });
 
     $$('.chapter-row', panel).forEach((btn) => {
       btn.addEventListener('click', () => {

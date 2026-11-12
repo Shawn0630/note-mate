@@ -377,6 +377,33 @@ body.reader-open .reader {
   color: var(--ink-faint);
   margin: 4px 16px 10px;
 }
+/* Chapters header row: title left, compact "Edit links" toggle right. */
+.chapter-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 4px 12px 10px 16px;
+}
+.chapter-head h2 { margin: 0; }
+.chapter-edit-toggle {
+  flex: none;
+  font-size: 12px;
+  line-height: 1.2;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.chapter-edit-toggle:hover { background: rgba(138, 90, 43, .1); }
+.chapter-edit-toggle.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--ink);
+  font-weight: 700;
+}
 .chapter-empty { padding: 0 16px; color: var(--ink-soft); font-size: 13.5px; }
 .chapter-row {
   display: block;
