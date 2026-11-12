@@ -266,10 +266,15 @@ h1, h2, h3, .serif { font-family: Georgia, "Times New Roman", serif; }
 
 /* ---------- Reader layout ---------- */
 
+/* ---------- Reader layout ---------- */
+
+/* Seven columns: nav | divider | reading | divider | notebook | divider |
+   AI. Column widths are set inline by applyReaderLayout (a hidden pane or
+   divider is 0); the CSS only pins each pane to its column. AV scale: the
+   reader chrome is 13px so the reading / note space gets the room. */
 .reader {
-  --nav-w: 248px;
   display: grid;
-  grid-template-columns: 0 minmax(0, 1fr) minmax(0, 1fr) 0;
+  grid-template-columns: 248px 7px minmax(0, 1fr) 7px minmax(0, 1fr) 7px 0;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 0;
   height: calc(100vh - 118px);
@@ -279,29 +284,33 @@ h1, h2, h3, .serif { font-family: Georgia, "Times New Roman", serif; }
   border-radius: var(--radius);
   overflow: hidden;
   box-shadow: 0 6px 20px rgba(43, 33, 24, .15);
+  font-size: 13px;
 }
-/* Layout modes (four columns: nav | reading | notebook | AI). Navigation =
-   nav + reading, notebook and AI hidden; Focus = reading + notebook 50/50;
-   AI = reading + notebook + a 340px AI column. The manual Chapters toggle
-   adds/removes the nav column inside any mode. */
-.reader.layout-navigation { grid-template-columns: var(--nav-w) minmax(0, 1fr) 0 0; }
-.reader.layout-navigation.nav-hidden { grid-template-columns: 0 minmax(0, 1fr) 0 0; }
-.reader.layout-focus { grid-template-columns: 0 minmax(0, 1fr) minmax(0, 1fr) 0; }
-.reader.layout-focus.nav-visible { grid-template-columns: var(--nav-w) minmax(0, 1fr) minmax(0, 1fr) 0; }
-.reader.layout-ai { grid-template-columns: 0 minmax(0, 1fr) minmax(0, 1fr) 340px; }
-.reader.layout-ai.nav-visible { grid-template-columns: var(--nav-w) minmax(0, 1fr) minmax(0, 1fr) 340px; }
-.reader.nav-hidden .chapter-panel { display: none; }
-.reader.layout-navigation .notebook-pane,
-.reader.layout-navigation .ai-column { display: none; }
-.reader.layout-focus .ai-column { display: none; }
-/* Explicit columns for the four panes: without them, hiding the nav with
-   display:none drops it from auto-placement and the reading pane slides
-   into the 0px nav column — Focus/AI showed a 0px reading pane and the AI
-   column stretched to a full 1fr. The topbar already spans 1 / -1. */
-.reader .chapter-panel { grid-column: 1; }
-.reader .reading-pane { grid-column: 2; }
-.reader .notebook-pane { grid-column: 3; }
-.reader .ai-column { grid-column: 4; }
+/* Explicit columns for the panes and dividers: without them, hiding a pane
+   with display:none drops it from auto-placement and the next pane slides
+   into the wrong column. The topbar spans 1 / -1 in row 1. */
+.reader .chapter-panel { grid-column: 1; grid-row: 2; }
+.reader .reading-pane { grid-column: 3; grid-row: 2; }
+.reader .notebook-pane { grid-column: 5; grid-row: 2; }
+.reader .ai-column { grid-column: 7; grid-row: 2; }
+#divider-nav { grid-column: 2; grid-row: 2; }
+#divider-reading { grid-column: 4; grid-row: 2; }
+#divider-ai { grid-column: 6; grid-row: 2; }
+
+/* Draggable dividers (AV Divider look: 7px gutter, a 1px visible line,
+   col-resize, a hover/drag accent). Small and unobtrusive — they never eat
+   reading space. */
+.reader-divider {
+  background: transparent;
+  border: none;
+  border-left: 1px solid var(--line);
+  cursor: col-resize;
+  padding: 0;
+  width: 7px;
+  touch-action: none;
+}
+.reader-divider:hover,
+.reader-divider.dragging { background: rgba(164, 120, 70, .25); border-left-color: var(--accent); }
 
 /* Edge-to-edge reader: while a project is open the app header hides and
    the view padding drops, so the reader fills the viewport. */
@@ -319,8 +328,8 @@ body.reader-open .reader {
   grid-column: 1 / -1;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
+  gap: 8px;
+  padding: 6px 10px;
   background: var(--wood-dark);
   color: #f3e7d3;
 }
@@ -333,37 +342,23 @@ body.reader-open .reader {
 .topbar .back-link:hover { text-decoration: underline; }
 .topbar h1 {
   margin: 0;
-  font-size: 19px;
+  font-size: 15px;
   font-weight: bold;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   flex: 1;
 }
-.topbar .badge { background: rgba(255, 255, 255, .18); color: #f8efdd; }
 .topbar button {
   background: rgba(255, 255, 255, .12);
   border-color: transparent;
   color: #f3e7d3;
   white-space: nowrap;
+  font-size: 13px;
+  padding: 4px 8px;
 }
 .topbar button:hover { background: rgba(255, 255, 255, .22); }
 .topbar button[aria-pressed="true"] { background: rgba(255, 255, 255, .3); }
-.layout-switcher {
-  display: flex;
-  border: 1px solid rgba(255, 255, 255, .25);
-  border-radius: 8px;
-  overflow: hidden;
-  flex: none;
-}
-.layout-switcher button {
-  background: transparent;
-  border: none;
-  border-radius: 0;
-  padding: 5px 10px;
-  font-size: 13px;
-}
-.layout-switcher button.active { background: rgba(255, 255, 255, .3); font-weight: 700; }
 #ai-toggle-top.active { background: rgba(255, 255, 255, .3); font-weight: 700; }
 
 /* ---------- Chapter panel ---------- */
@@ -376,7 +371,7 @@ body.reader-open .reader {
   min-width: 0;
 }
 .chapter-panel h2 {
-  font-size: 13px;
+  font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 1px;
   color: var(--ink-faint);
@@ -425,6 +420,11 @@ body.reader-open .reader {
   flex: 1;
   overflow-y: auto;
   padding: 24px 16px 48px;
+  scrollbar-gutter: stable;
+  position: relative; /* the pin editor popover anchors to the scroller */
+  /* Touch scroll stays; the browser's own touch pinch-zoom is disabled —
+     a trackpad pinch arrives as ctrl+wheel and is handled in JS. */
+  touch-action: pan-x pan-y;
 }
 .pdf-page {
   margin: 0 auto 18px;
@@ -458,7 +458,7 @@ body.reader-open .reader {
   border: 0;
   background: #fff;
 }
-.slides-wrap { flex: 1; min-height: 0; display: flex; }
+.slides-wrap { flex: 1; min-height: 0; display: flex; overflow: auto; touch-action: pan-x pan-y; }
 .ppt-card {
   margin: auto;
   max-width: 460px;
@@ -486,7 +486,7 @@ body.reader-open .reader {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 8px 10px 0;
+  padding: 4px 8px 0;
   border-bottom: 1px solid var(--line);
   overflow-x: auto;
   flex: none;
@@ -496,8 +496,8 @@ body.reader-open .reader {
   border-bottom: none;
   background: transparent;
   border-radius: 8px 8px 0 0;
-  padding: 7px 12px;
-  font-size: 13.5px;
+  padding: 4px 10px;
+  font-size: 13px;
   white-space: nowrap;
   color: var(--ink-soft);
 }
@@ -513,29 +513,13 @@ body.reader-open .reader {
   background: transparent;
   color: var(--accent);
   font-weight: 700;
-  padding: 7px 8px;
+  font-size: 16px;
+  line-height: 1;
+  padding: 5px 8px;
   white-space: nowrap;
 }
-.notebook-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--line);
-  flex: none;
-  flex-wrap: wrap;
-}
-.notebook-toolbar .spacer { flex: 1; }
-.follow-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: var(--ink-soft);
-  user-select: none;
-}
-.follow-toggle input { accent-color: var(--accent); }
-.save-status { font-size: 12.5px; color: var(--ink-faint); min-width: 64px; text-align: right; }
+
+.save-status { font-size: 12.5px; color: var(--ink-faint); min-width: 64px; text-align: right; margin-left: auto; padding-right: 4px; }
 .save-status.dirty { color: var(--accent); }
 .save-status.error { color: var(--bad); }
 
@@ -665,8 +649,7 @@ body.reader-open .reader {
 .nb-add-row { display: flex; gap: 8px; justify-content: center; }
 .nb-add-row button { font-size: 12.5px; }
 
-@media (max-width: 1100px) {
-  .reader { --nav-w: 210px; }
+
 }
 
 /* ---------- Left (reading) pane tabs ---------- */
@@ -674,7 +657,7 @@ body.reader-open .reader {
 .reading-tabs {
   display: flex;
   gap: 2px;
-  padding: 8px 10px 0;
+  padding: 6px 8px 0;
   background: var(--reading-bg);
   flex: none;
 }
@@ -683,8 +666,8 @@ body.reader-open .reader {
   border-bottom: none;
   background: transparent;
   border-radius: 8px 8px 0 0;
-  padding: 6px 14px;
-  font-size: 13.5px;
+  padding: 5px 12px;
+  font-size: 13px;
   color: #cfcfd2;
   white-space: nowrap;
 }
@@ -696,10 +679,10 @@ body.reader-open .reader {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 8px 12px;
+  padding: 6px 10px;
   background: #2f2f31;
   color: #ddd;
-  font-size: 13px;
+  font-size: 12.5px;
   flex: none;
 }
 .deck-picker-row select { font-size: 13px; padding: 4px 6px; background: #fff; }
@@ -741,61 +724,6 @@ body.reader-open .reader {
 }
 .note-tab.lab-tab .tab-close:hover { background: var(--accent-soft); color: var(--ink); }
 
-.labs-section {
-  flex: none;
-  border-bottom: 1px solid var(--line);
-  background: var(--paper-dim);
-  max-height: 260px;
-  overflow-y: auto;
-}
-.labs-head, .labs-group-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  width: 100%;
-  border: none;
-  background: transparent;
-  border-radius: 0;
-  padding: 9px 14px;
-  font-size: 13.5px;
-  font-weight: 700;
-  color: var(--ink);
-  text-align: left;
-}
-.labs-head:hover, .labs-group-head:hover { background: rgba(138, 90, 43, .08); }
-.labs-count {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--ink-faint);
-  background: rgba(255, 255, 255, .6);
-  border-radius: 20px;
-  padding: 1px 8px;
-}
-.labs-groups { padding-bottom: 6px; }
-.labs-group-head { padding-left: 22px; font-weight: 600; }
-.labs-files { padding: 0 8px 6px 30px; }
-.lab-file {
-  display: block;
-  width: 100%;
-  text-align: left;
-  border: none;
-  background: transparent;
-  border-radius: 6px;
-  padding: 5px 10px;
-  font-size: 13px;
-  color: var(--ink-soft);
-  border-left: 3px solid transparent;
-}
-.lab-file:hover { background: rgba(138, 90, 43, .1); color: var(--ink); }
-.lab-file.open { color: var(--ink); }
-.lab-file.active {
-  background: var(--accent-soft);
-  border-left-color: var(--accent);
-  color: var(--ink);
-  font-weight: 700;
-}
-.labs-empty { font-size: 12.5px; color: var(--ink-faint); margin: 4px 10px; }
 
 /* ---------- v1.1: AI import ---------- */
 
@@ -887,6 +815,15 @@ body.reader-open .reader {
   overflow-x: auto;
   margin: 0 0 8px;
 }
+/* Tan-rectangle bug (2026-11-11): `.ai-msg-body pre` (0,1,1) beats
+   `.ai-code-proposal` (0,1,0), so the Code AI <pre> got the tan
+   paper-dim background while keeping the proposal's light-cream text —
+   invisible code. The compound selector below wins back the dark
+   background for proposal blocks only. */
+.ai-msg-body pre.ai-code-proposal {
+  background: #2b2620;
+  color: #f3ead7;
+}
 .ai-code-proposal code { background: transparent; color: inherit; font-size: 13px; }
 .ai-code-explanation { font-size: 13px; color: var(--ink-soft); margin: 0; }
 .ai-clear { align-self: flex-start; margin-top: 10px; font-size: 12.5px; padding: 4px 10px; }
@@ -924,7 +861,7 @@ body.reader-open .reader {
 .ai-include input { accent-color: var(--accent); }
 .ai-thread { display: flex; flex-direction: column; gap: 10px; max-height: 320px; overflow-y: auto; margin: 6px 0; }
 .ai-thread .hint { margin: 0; }
-.ai-msg { border-radius: 8px; padding: 8px 12px; font-size: 14px; }
+.ai-msg { border-radius: 8px; padding: 8px 12px; font-size: 13px; }
 .ai-msg-user { background: var(--accent-soft); align-self: flex-end; max-width: 85%; white-space: pre-wrap; }
 .ai-msg-assistant { background: #fff; border: 1px solid var(--line); align-self: stretch; }
 .ai-msg-body { overflow-x: auto; }
@@ -971,3 +908,274 @@ body.reader-open .reader {
 .nb-export-check input { accent-color: var(--accent); }
 #cell-export-raw { width: 100%; box-sizing: border-box; }
 #cell-export-preview img { max-width: 100%; }
+
+/* ---------- Reader round 2026-11-11: pickers, zoom, menus ---------- */
+
+/* Slim picker rows under a tab bar (Preview note picker, PDF zoom row):
+   the same compact row as the Slides deck picker — small controls, the
+   content below keeps the space. */
+.picker-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  flex: none;
+}
+.picker-row-dark { background: #2f2f31; color: #ddd; }
+.picker-row-paper { background: var(--paper-dim); color: var(--ink-soft); border-bottom: 1px solid var(--line); }
+.picker-row label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.picker-row select {
+  font-size: 12.5px;
+  padding: 3px 5px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  max-width: 220px;
+}
+.mini-btn {
+  font-size: 12.5px;
+  padding: 3px 10px;
+  border-radius: 6px;
+}
+
+/* Compact zoom controls: − / % / + / Fit on one slim row. The % is a
+   button too — clicking it fits the width. */
+.zoom-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+.deck-picker-row .zoom-controls { margin-left: auto; }
+.zoom-btn {
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  font-size: 12.5px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 5px;
+  min-width: 24px;
+}
+.zoom-btn:hover { background: rgba(255, 255, 255, .14); }
+.picker-row-paper .zoom-btn:hover { background: rgba(138, 90, 43, .12); }
+.zoom-pct {
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  font-size: 12.5px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  min-width: 44px;
+  text-align: center;
+}
+.zoom-pct:hover { background: rgba(255, 255, 255, .14); }
+.zoom-hint { font-size: 11.5px; color: var(--ink-faint); }
+
+/* PDF annotations: an overlay layer on each pdf.js page holder.
+   Highlights are translucent rects; note pins are small colored dots.
+   The layer only takes pointer events while a tool is active — otherwise
+   clicks pass through to the page and only the pins stay clickable. */
+.annot-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 8px;
+  padding-left: 8px;
+  border-left: 1px solid rgba(255, 255, 255, .2);
+}
+.annot-tool-btn.active { background: rgba(255, 255, 255, .25); font-weight: 700; }
+.annot-color-dot {
+  border: 1px solid transparent;
+  background: transparent;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.annot-color-dot:hover { background: rgba(255, 255, 255, .14); }
+.annot-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 3;
+}
+.annot-layer.annot-tool-active { pointer-events: auto; }
+.annot-layer.annot-tool-active[data-tool="highlight"],
+.annot-layer.annot-tool-active[data-tool="note"] { cursor: crosshair; }
+.annot-layer.annot-tool-active[data-tool="erase"] { cursor: pointer; }
+.annot-layer[data-tool] .annot-pin { pointer-events: none; }
+.annot-highlight {
+  position: absolute;
+  border-radius: 2px;
+  pointer-events: auto;
+}
+.annot-highlight[data-color="yellow"] { background: rgba(255, 235, 59, .35); }
+.annot-highlight[data-color="green"] { background: rgba(76, 175, 80, .3); }
+.annot-highlight[data-color="pink"] { background: rgba(244, 114, 182, .35); }
+.annot-highlight[data-color="blue"] { background: rgba(96, 165, 250, .35); }
+.annot-highlight.annot-ghost { outline: 1px dashed rgba(43, 33, 24, .5); }
+.annot-pin {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .45);
+  cursor: pointer;
+  pointer-events: auto;
+}
+.annot-pin[data-color="yellow"] { background: #eab308; }
+.annot-pin[data-color="green"] { background: #16a34a; }
+.annot-pin[data-color="pink"] { background: #db2777; }
+.annot-pin[data-color="blue"] { background: #2563eb; }
+.annot-editor {
+  position: absolute;
+  z-index: 5;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(43, 33, 24, .3);
+  padding: 8px;
+  color: var(--ink);
+}
+.annot-editor textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 13px;
+  font-family: inherit;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 5px 7px;
+  resize: vertical;
+}
+.annot-editor-row {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+.annot-del { color: #b91c1c; }
+
+/* Floating menus (Layout menu, + menu): fixed, anchored to the button
+   that opened them, AV popover style — white card, small radius, soft
+   shadow, 13px items. */
+.floating-menu {
+  position: fixed;
+  z-index: 80;
+  min-width: 230px;
+  max-width: 320px;
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 10px 32px rgba(43, 33, 24, .28);
+  padding: 6px;
+  font-size: 13px;
+}
+.menu-section {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .8px;
+  color: var(--ink-faint);
+  padding: 8px 8px 4px;
+}
+.menu-item,
+.menu-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  color: var(--ink);
+  text-align: left;
+}
+.menu-item:hover:not(:disabled),
+.menu-group-head:hover { background: rgba(138, 90, 43, .08); }
+.menu-item:disabled { opacity: .45; cursor: default; }
+.menu-ext { color: var(--ink-faint); font-size: 12px; }
+.menu-count {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-faint);
+  background: rgba(138, 90, 43, .08);
+  border-radius: 20px;
+  padding: 1px 7px;
+}
+.menu-group-head { font-weight: 600; }
+.add-menu .menu-item { padding-left: 16px; }
+
+/* Layout menu: preset thumbnail cards (mini split diagrams of the panel
+   arrangement) + a Panels checklist to show/hide and restore panels. */
+.layout-menu { width: 360px; }
+.layout-card {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--line);
+  background: transparent;
+  border-radius: 8px;
+  padding: 8px;
+  margin: 2px 0 6px;
+  text-align: left;
+}
+.layout-card:hover { background: rgba(138, 90, 43, .06); }
+.layout-card.active { border-color: var(--accent); background: var(--accent-soft); }
+.layout-card-name { display: block; font-size: 12px; font-weight: 700; margin-bottom: 6px; }
+.layout-diagram {
+  display: flex;
+  gap: 2px;
+  height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px;
+  background: var(--paper-dim);
+}
+.layout-cell { background: #fff; border: 1px solid var(--line); border-radius: 2px; flex: 1 1 0; min-width: 0; }
+.layout-cell.nav { flex: 0 0 22px; background: var(--paper-dim); }
+.layout-cell.ai { flex: 0 0 30px; background: var(--accent-soft); }
+.layout-panel-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  font-size: 13px;
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+.layout-panel-row:hover { background: rgba(138, 90, 43, .06); }
+.layout-panel-row input { accent-color: var(--accent); }
+
+/* AI model picker row under the AI column head (shared by Note AI and
+   Code AI). */
+.ai-model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  flex: none;
+}
+.ai-model-row label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; flex: 1; }
+.ai-model-row select {
+  font-size: 12.5px;
+  padding: 3px 5px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  min-width: 0;
+  flex: 1;
+}

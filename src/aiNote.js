@@ -258,8 +258,8 @@ export function buildAiNotePrompt({ bookTitle, chapter, chapterText, noteSection
  * from resolveChapterRange (or null); `chapterText`/`noteSection` are
  * already capped by the caller. Returns the validated markdown.
  */
-export async function generateAiNote({ bookTitle, chapter, chapterText, noteSection, prompt, history = [] }) {
+export async function generateAiNote({ bookTitle, chapter, chapterText, noteSection, prompt, history = [], model } = {}) {
   const llmPrompt = buildAiNotePrompt({ bookTitle, chapter, chapterText, noteSection, prompt, history });
-  const raw = await generateText(llmPrompt);
+  const raw = await generateText(llmPrompt, { model });
   return validateAiNoteMarkdown(raw);
 }

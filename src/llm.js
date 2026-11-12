@@ -17,6 +17,8 @@
 //                      instead of calling the API (no key needed) — for
 //                      proposeProjectData it must be JSON; for generateText
 //                      it is returned verbatim as the markdown.
+//   LLM_STUB_MODELS    tests/verification only: comma-separated models the
+//                      models endpoint offers while a stub is configured.
 // The key is never logged. `LLM_ENV_FILE` overrides the .env path (tests).
 import fs from 'node:fs';
 import path from 'node:path';
@@ -122,18 +124,98 @@ async function callGemini({ apiKey, model }, prompt, { json = false } = {}) {
  * Plain-text generation for on-demand AI notes. Returns the model's reply
  * verbatim (the caller validates it as markdown). With a stub configured,
  * the stub string is returned instead of calling the API.
+ * `opts.model` overrides the configured model for this one call (the AI
+ * panel's model picker); an unknown override is rejected by the caller —
+ * see listModels / isAllowedModel.
  * @throws {LlmError} LLM_NOT_CONFIGURED (status 503) when no stub and no
  *   key+model; LLM_BAD_RESPONSE (status 502) on an API error.
  */
-export async function generateText(prompt) {
+export async function generateText(prompt, opts = {}) {
   const { apiKey, model, stub } = getLlmConfig();
+  const useModel = typeof opts.model === 'string' && opts.model.trim()
+    ? opts.model.trim() : model;
   if (stub) return stub;
-  if (apiKey && model) return callGemini({ apiKey, model }, prompt);
+  if (apiKey && useModel) return callGemini({ apiKey, model: useModel }, prompt);
   throw new LlmError(
     LLM_NOT_CONFIGURED,
     'LLM not configured',
     { status: 503, hint: 'Add LLM_API_KEY and LLM_MODEL to server/.env' },
   );
+}
+
+// ---------------------------------------------------------------------------
+// Model list — the AI panel's picker. The server reports which models the
+// API key can actually use (Gemini models.list, filtered to models that
+// support generateContent), with the configured model first. Cached 5 min
+// in memory so every panel open is not a network call. When the list call
+// fails (or there is no key), the answer degrades to just the configured
+// model — the picker then offers only that. With a stub configured (tests
+// / verification), LLM_STUB_MODELS (comma-separated) supplies the list so
+// the picker can be exercised without a live key.
+// ---------------------------------------------------------------------------
+
+const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
+let modelsCache = null; // {at, result}
+
+export function clearModelsCache() {
+  modelsCache = null;
+}
+
+/** Short model name: 'models/gemini-2.5-flash' → 'gemini-2.5-flash'. */
+export function shortModelName(name) {
+  return String(name ?? '').replace(/^models\//, '');
+}
+
+function sortModelsFirst(models, first) {
+  const rest = models.filter((m) => m !== first).sort();
+  return first ? [first, ...rest] : rest;
+}
+
+export async function listModels() {
+  if (modelsCache && Date.now() - modelsCache.at < MODELS_CACHE_TTL_MS) {
+    return modelsCache.result;
+  }
+  const { apiKey, model, stub } = getLlmConfig();
+  const configured = Boolean(stub || (apiKey && model));
+  let models = [];
+  if (stub) {
+    // Test/verification seam: the stub list is explicit, never invented.
+    const stubList = (process.env.LLM_STUB_MODELS || '')
+      .split(',').map((s) => s.trim()).filter(Boolean);
+    models = sortModelsFirst(stubList, model);
+  } else if (apiKey) {
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}&pageSize=100`,
+      );
+      if (res.ok) {
+        const body = await res.json();
+        const usable = (Array.isArray(body?.models) ? body.models : [])
+          .filter((m) => Array.isArray(m.supportedGenerationMethods)
+            && m.supportedGenerationMethods.includes('generateContent'))
+          .map((m) => shortModelName(m.name))
+          .filter(Boolean);
+        models = sortModelsFirst(usable, model);
+      }
+    } catch {
+      // List fetch failed — fall through to the configured model only.
+    }
+  }
+  if (!models.length && model) models = [model];
+  const result = { configured, model: model || null, models };
+  modelsCache = { at: Date.now(), result };
+  return result;
+}
+
+/**
+ * Whether a client-requested model override may be used: it must be the
+ * configured model or one of the listed models. The list is fetched
+ * (cached) first; on a list failure only the configured model is allowed.
+ */
+export async function isAllowedModel(name) {
+  if (typeof name !== 'string' || !name.trim()) return false;
+  const { models, model } = await listModels();
+  return name.trim() === model || models.includes(name.trim());
 }
 
 /** Strip ```json / ``` fences if the model wrapped its JSON in them. */

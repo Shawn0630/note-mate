@@ -27,6 +27,13 @@
                                               (run-all: one shared session; java unsupported)
 */
 import * as pdfjsLib from './vendor/pdfjs/pdf.mjs';
+import {
+  clampNavWidth, clampAiWidth, splitReadingNotebook, gridTemplate,
+  sanitizeWidths, sanitizePanels, matchPreset, defaultPanels,
+  migrateLayoutModeName, LAYOUT_PRESET_NAMES,
+  clampZoom, zoomStep, zoomFromWheel, zoomFromGesture, zoomPercent,
+  fitScale, firstFreeName, PANE_DEFAULTS, LAYOUT_PRESETS,
+} from './readerLayout.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdfjs/pdf.worker.mjs';
 
@@ -192,7 +199,6 @@ const state = {
   execCounter: 0,     // per-notebook execution counter (execution_count)
   // The right pane is the WORKING side: a markdown note opens in its editor
   // there (the rendered preview lives in the LEFT pane's Preview tab).
-  follow: true,         // scroll-spy follow toggle
   editorFocused: false,
   headings: [],         // headings of the active note
   outline: [],          // [{title, page, depth}] for PDFs
@@ -201,16 +207,29 @@ const state = {
   pdfDoc: null,
   pdfPages: [],         // [{num, top}] measured offsets in the pdf container
   pdfContainer: null,
-  // Reader layout (reader split, 2026-11-11): three modes, per-session.
-  // Navigation = nav + reading pane, notebook hidden; Focus = nav hidden,
-  // reading + notebook 50/50; AI = Focus + the AI panel as the rightmost
-  // column. The Chapters button toggles the nav manually within the mode
-  // (navVisible) without changing the mode label; the mode buttons set the
-  // canonical arrangement. The ✨ Ask AI toggle and the AI mode button are
-  // the same action: opening AI switches to AI mode, closing the panel
-  // (its ×) returns to Focus.
-  layoutMode: 'focus',  // 'navigation' | 'focus' | 'ai'
-  navVisible: false,    // manual nav state within the current mode
+  // Reader layout (AV-style, 2026-11-11): four panes — chapters nav,
+  // reading, working (notebook), AI — in a 7-column grid with draggable
+  // dividers between them. `panels` is which panes are visible; `layoutMode`
+  // is the matching preset name ('reading' | 'navigation' | 'notetaking' | 'ai') or 'custom'
+  // when the Panels checklist diverges from every preset. Widths persist
+  // per project in localStorage (see loadReaderLayout / saveReaderLayout);
+  // the reading/notebook split is fractions of their combined width.
+  layoutMode: 'notetaking',
+  panels: { nav: false, reading: true, notebook: true, ai: false },
+  widths: { ...PANE_DEFAULTS },
+  // Zoom is a multiplier on the width-fitting PDF scale (1 = fit width),
+  // per source, per session (not persisted). 'slides' is the Google Slides
+  // iframe zoom (a visual scale — see applySlidesZoom).
+  zoom: { pdf: 1, deck: 1, slides: 1 },
+  // PDF annotations (highlight + note pin): all of the project's
+  // annotations, every source; rendered as an overlay on the pdf.js pages
+  // (see renderAnnotOverlays). Stored in annotations.json, separate from
+  // notes.md. annotTool null = no tool; the Google Slides iframe cannot
+  // be annotated (out of scope).
+  annotations: [],
+  annotTool: null,       // null | 'highlight' | 'note' | 'erase'
+  annotColor: 'yellow',  // current highlight / pin color
+  selectedAnnotationId: null, // pin whose editor popover is open
   // Left (reading) pane tabs — PDF projects only. pdf = the book PDF,
   // slides = the current chapter's slide deck, preview = the rendered
   // notes.md preview following the current chapter.
@@ -231,23 +250,31 @@ const state = {
   activeSourceId: null,
   // Labs (v1.1): chapters from GET .../labs; labTabs are labs opened as
   // notebook tabs. activeTabKind 'note' | 'lab' decides the save endpoint.
+  // The Labs index lives behind the tab-bar + menu (no visible section).
   labs: [],
   labTabs: [],          // [{chapter, name}]
   activeTabKind: 'note',
   activeLab: null,      // {chapter, name} when a lab tab is active
-  labsCollapsed: false,
-  labsOpenChapters: {}, // chapter -> true when its file group is expanded
+  labsOpenChapters: {}, // chapter -> true when its group is expanded in the + menu
   saveTimer: null,
-  suppressFollowScroll: false,
+  // Left Preview tab: the note being previewed. Null = not picked yet —
+  // defaults to the active markdown note, else the master notes.md.
+  // Once the user picks from the picker, the selection is manual.
+  previewNoteName: null,
   // On-demand AI notes + cell export: one AI thread per notebook, kept in
   // memory for the session (resets on reload — same v1 limit as Finance
   // Mate's Refine panel). Export selection is per notebook too.
-  aiPanelOpen: false,   // true exactly while layoutMode is 'ai'
   aiTab: 'note',        // 'note' (Note AI) | 'code' (Code AI)
   aiThreads: {},        // notebookKey -> {messages: [{role, content, markdown, applied}]}
   aiCodeThreads: {},    // notebookKey -> {messages: [{role, content, code, explanation, applied}]}
   exportSelection: new Set(), // notebook cell indexes selected for export
   exportSelectionFor: null,   // notebook key the selection belongs to
+  // AI model picker (AV-style): the server lists the models the key can
+  // use (GET /api/llm/models); the choice persists in localStorage and is
+  // sent with every ai-note / ai-code request.
+  aiModels: [],         // [{name}] from the server, or [] when unconfigured
+  aiModel: '',          // selected model id ('' = configured default)
+  aiModelsLoaded: false,
   // Scroll-spy suppression while a programmatic chapter-click scroll is in
   // flight: the smooth scroll fires scroll events the whole way down, and
   // without this the spy would overwrite the clicked chapter with the first
@@ -278,8 +305,15 @@ function resetReaderState() {
   state.suppressSpyUntil = 0;
   state.suppressSpyPage = null;
   state.suppressSpyTop = null;
-  state.layoutMode = 'focus';
-  state.navVisible = false;
+  state.layoutMode = 'notetaking';
+  state.panels = { nav: false, reading: true, notebook: true, ai: false };
+  state.widths = { ...PANE_DEFAULTS };
+  state.zoom = { pdf: 1, deck: 1, slides: 1 };
+  state.annotations = [];
+  state.annotTool = null;
+  state.annotColor = 'yellow';
+  state.selectedAnnotationId = null;
+  state.previewNoteName = null;
   state.leftTab = 'pdf';
   state.deckDoc = null;
   state.deckPages = [];
@@ -293,14 +327,16 @@ function resetReaderState() {
   state.labTabs = [];
   state.activeTabKind = 'note';
   state.activeLab = null;
-  state.labsCollapsed = false;
   state.labsOpenChapters = {};
   state.coverGenerated = false;
   state.editorFocused = false;
-  state.aiPanelOpen = false;
   state.aiTab = 'note';
   state.aiThreads = {};
   state.aiCodeThreads = {};
+  state.aiModels = [];
+  state.aiModel = '';
+  try { state.aiModel = window.localStorage.getItem(AI_MODEL_KEY) || ''; } catch { /* ignore */ }
+  state.aiModelsLoaded = false;
   state.exportSelection = new Set();
   state.exportSelectionFor = null;
   if (state.saveTimer) { clearTimeout(state.saveTimer); state.saveTimer = null; }
@@ -320,6 +356,35 @@ function route() {
 }
 
 window.addEventListener('hashchange', route);
+
+/* Zoom shortcuts (bound once): Cmd/Ctrl + +/- zooms the reading pane's
+   document, Cmd/Ctrl + 0 fits it to the pane width. Skipped while typing
+   in an input/textarea, and on the Preview tab (nothing to zoom there).
+   The pinch gesture is handled separately on the scroll containers
+   (ctrl+wheel / Safari gesture events — see mountPdfViewer). */
+document.addEventListener('keydown', (e) => {
+  if (!document.body.classList.contains('reader-open')) return;
+  // Escape closes the pin editor, then clears the active annotation tool.
+  // (In a text field it only closes the editor — clearing the tool from a
+  // text field would be surprising.)
+  if (e.key === 'Escape') {
+    if (state.selectedAnnotationId) { closeAnnotEditor(); return; }
+    if (state.annotTool) {
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      setAnnotTool(null);
+    }
+    return;
+  }
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+  const key = activeZoomKey();
+  if (!key) return;
+  if (e.key === '=' || e.key === '+') { e.preventDefault(); setZoom(key, zoomStep(state.zoom[key], 1), { immediate: true }); }
+  else if (e.key === '-') { e.preventDefault(); setZoom(key, zoomStep(state.zoom[key], -1), { immediate: true }); }
+  else if (e.key === '0') { e.preventDefault(); setZoom(key, 1, { immediate: true }); }
+});
 
 function showError(message, detail) {
   view.innerHTML = `
@@ -747,6 +812,7 @@ async function openProject(slug) {
   } catch {
     state.labs = [];
   }
+  await loadAnnotations();
 
   // Default note: notes.md if present, else the first note.
   const def = state.notes.find((n) => n.name === 'notes.md')
@@ -778,28 +844,27 @@ function renderReaderShell() {
          ${state.materials.map((m) => `<option value="${esc(m.id)}"${m.hasFile ? '' : ' disabled'}>${esc(m.label || m.id)}${m.hasFile ? '' : ' — download only'}</option>`).join('')}
        </select>`
     : '';
+  loadReaderLayout(); // per-project persisted panels + widths, else Notetaking
   document.body.classList.add('reader-open'); // edge-to-edge: no app header, no view padding
   view.innerHTML = `
-    <div class="reader layout-${state.layoutMode} ${state.navVisible ? 'nav-visible' : 'nav-hidden'}" id="reader">
+    <div class="reader" id="reader">
       <header class="topbar">
         <a class="back-link" href="#/">‹ Shelf</a>
-        <button type="button" id="chapter-toggle" aria-pressed="${state.navVisible ? 'true' : 'false'}"
+        <button type="button" id="chapter-toggle" aria-pressed="${state.panels.nav ? 'true' : 'false'}"
                 title="Show or hide the chapter panel">Chapters</button>
         <h1>${esc(p.title || 'Untitled')}</h1>
-        <div class="layout-switcher" role="group" aria-label="Layout">
-          <button type="button" data-layout-mode="navigation" class="${state.layoutMode === 'navigation' ? 'active' : ''}">Navigation</button>
-          <button type="button" data-layout-mode="focus" class="${state.layoutMode === 'focus' ? 'active' : ''}">Focus</button>
-          <button type="button" data-layout-mode="ai" class="${state.layoutMode === 'ai' ? 'active' : ''}">AI</button>
-        </div>
+        <button type="button" id="layout-menu-btn" title="Layout — presets and panels">▦ Layout</button>
         ${switcher}
-        <button type="button" id="ai-toggle-top" class="${state.aiPanelOpen ? 'active' : ''}"
-                title="Ask the AI — opens the AI panel (same as the AI layout)">✨ Ask AI</button>
-        <span class="badge">${esc(kindLabel(p.kind))}</span>
+        <button type="button" id="ai-toggle-top" class="${state.panels.ai ? 'active' : ''}"
+                title="Ask the AI — opens the AI panel">✨ Ask AI</button>
       </header>
       <aside class="chapter-panel" id="chapter-panel" aria-label="Chapters"></aside>
+      <div class="reader-divider" id="divider-nav" data-divider="nav" title="Drag to resize the chapter panel" aria-hidden="true"></div>
       <section class="reading-pane" id="reading-pane" aria-label="Reading pane"></section>
+      <div class="reader-divider" id="divider-reading" data-divider="reading" title="Drag to resize the reading and working panes" aria-hidden="true"></div>
       <aside class="notebook-pane" id="notebook-pane" aria-label="Notebook"></aside>
-      <aside class="ai-column" id="ai-column" aria-label="AI panel" hidden></aside>
+      <div class="reader-divider" id="divider-ai" data-divider="ai" title="Drag to resize the AI panel" aria-hidden="true"></div>
+      <aside class="ai-column" id="ai-column" aria-label="AI panel"></aside>
     </div>`;
 
   const switcherEl = $('#source-switcher', view);
@@ -809,57 +874,267 @@ function renderReaderShell() {
     });
   }
 
-  $$('.layout-switcher [data-layout-mode]', view).forEach((btn) => {
-    btn.addEventListener('click', () => setLayoutMode(btn.dataset.layoutMode));
+  $('#layout-menu-btn', view).addEventListener('click', (e) => {
+    openLayoutMenu(e.currentTarget);
   });
-  $('#ai-toggle-top', view).addEventListener('click', () => {
-    setLayoutMode(state.layoutMode === 'ai' ? 'focus' : 'ai');
-  });
+  $('#ai-toggle-top', view).addEventListener('click', toggleAiPanel);
   $('#chapter-toggle', view).addEventListener('click', () => {
-    state.navVisible = !state.navVisible;
-    applyReaderLayout();
+    updatePanels({ ...state.panels, nav: !state.panels.nav });
   });
+  bindDivider($('#divider-nav', view), 'nav');
+  bindDivider($('#divider-reading', view), 'reading');
+  bindDivider($('#divider-ai', view), 'ai');
 
   renderNotebookPane();
   renderAiColumn();
+  applyReaderLayout({ save: false });
 }
 
-/* Apply the current layout mode + manual nav state to the reader grid:
-   which panes are visible, the mode buttons' active state, the Chapters
-   button's pressed state, and the AI column. A layout change re-measures
-   the PDF pages (the containers change width) and refreshes the left
-   preview + the page-note button. */
-function applyReaderLayout() {
+/* ---------------- reader layout: persistence ---------------- */
+
+// The AI model choice is global (not per project): one localStorage key,
+// like the AV's av-ai-model-v1.
+const AI_MODEL_KEY = 'nm-ai-model-v1';
+
+// One localStorage entry per project: {panels, widths, layoutMode}.
+// Same spirit as the AV's av-dock-v1 key. A missing/corrupt entry means
+// the Notetaking default; widths/panels are sanitized on load.
+function readerLayoutKey() {
+  return `nm-reader-layout:${state.project?.slug || 'default'}`;
+}
+
+function loadReaderLayout() {
+  try {
+    const raw = JSON.parse(window.localStorage.getItem(readerLayoutKey()) || 'null');
+    if (!raw || typeof raw !== 'object') return;
+    state.panels = sanitizePanels(raw.panels);
+    state.widths = sanitizeWidths(raw.widths);
+    // The mode is re-derived from the panels, so a stored 'focus' (the
+    // pre-rename name for Notetaking) migrates by itself; the stored name
+    // is still passed through the one-time alias as a fallback.
+    state.layoutMode = matchPreset(state.panels)
+      || migrateLayoutModeName(raw.layoutMode) || 'custom';
+  } catch {
+    // Corrupt entry — keep the Notetaking default.
+  }
+}
+
+function saveReaderLayout() {
+  try {
+    window.localStorage.setItem(readerLayoutKey(), JSON.stringify({
+      panels: state.panels,
+      widths: state.widths,
+      layoutMode: state.layoutMode,
+    }));
+  } catch {
+    // Storage unavailable — the layout simply does not persist.
+  }
+}
+
+/* Apply the current panels + widths to the reader grid: the 7-column
+   template, which panes are visible, which dividers are live, the
+   Chapters button's pressed state, and the ✨ Ask AI toggle. A layout
+   change re-measures the PDF pages (the containers change width) and
+   re-fits the viewers at the new width. */
+function applyReaderLayout({ save = true } = {}) {
   const reader = $('#reader', view);
   if (!reader) return;
-  reader.className = `reader layout-${state.layoutMode} ${state.navVisible ? 'nav-visible' : 'nav-hidden'}`;
-  $$('.layout-switcher [data-layout-mode]', view).forEach((btn) => {
-    btn.classList.toggle('active', btn.dataset.layoutMode === state.layoutMode);
+  reader.style.gridTemplateColumns = gridTemplate(state.panels, state.widths);
+  const show = (sel, visible) => {
+    const el = $(sel, view);
+    if (el) el.style.display = visible ? '' : 'none';
+  };
+  show('#chapter-panel', state.panels.nav);
+  show('#reading-pane', state.panels.reading);
+  show('#notebook-pane', state.panels.notebook);
+  show('#ai-column', state.panels.ai);
+  const dividerVisible = {
+    'divider-nav': state.panels.nav && state.panels.reading,
+    'divider-reading': state.panels.reading && state.panels.notebook,
+    'divider-ai': state.panels.notebook && state.panels.ai,
+  };
+  Object.entries(dividerVisible).forEach(([id, visible]) => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = visible ? '' : 'none';
   });
   const chBtn = $('#chapter-toggle', view);
-  if (chBtn) chBtn.setAttribute('aria-pressed', state.navVisible ? 'true' : 'false');
+  if (chBtn) chBtn.setAttribute('aria-pressed', state.panels.nav ? 'true' : 'false');
   const aiTop = $('#ai-toggle-top', view);
-  if (aiTop) aiTop.classList.toggle('active', state.aiPanelOpen);
-  const col = $('#ai-column', view);
-  if (col) col.hidden = state.layoutMode !== 'ai';
+  if (aiTop) aiTop.classList.toggle('active', state.panels.ai);
   if (state.pdfDoc) measurePdfPages();
   if (state.deckDoc) measureDeckPages();
   renderAiColumn();
-  updatePageNoteButton();
+  if (state.pdfContainer) scheduleRefit(state.pdfContainer, 60);
+  if (state.deckContainer) scheduleRefit(state.deckContainer, 60);
+  if (save) saveReaderLayout();
 }
 
-/* Set a layout mode. The mode buttons set the canonical arrangement
-   (Navigation = nav on + notebook off; Focus = nav off + notebook on;
-   AI = Focus + the AI panel); the mode only changes which panes are
-   visible — the chapter, page, active tabs and selection survive. */
-function setLayoutMode(mode) {
-  if (!['navigation', 'focus', 'ai'].includes(mode)) return;
-  if (state.layoutMode === mode) return;
-  state.layoutMode = mode;
-  state.aiPanelOpen = mode === 'ai';
-  state.navVisible = mode === 'navigation';
+/* Apply a preset's panels (Reading / Navigation / Notetaking / AI). The mode only
+   changes which panes are visible — the chapter, page, active tabs and
+   selection survive. */
+function applyLayoutPreset(name) {
+  if (!LAYOUT_PRESETS[name]) return;
+  state.panels = { ...LAYOUT_PRESETS[name] };
+  state.layoutMode = name;
   applyReaderLayout();
-  renderNotebookToolbar();
+}
+
+/* Set panels directly (checklist, Chapters button, Ask AI toggle). The
+   mode label follows: the matching preset name, or 'custom'. */
+function updatePanels(next) {
+  state.panels = { ...next };
+  state.layoutMode = matchPreset(state.panels) || 'custom';
+  applyReaderLayout();
+}
+
+/* The ✨ Ask AI toggle and the AI column's × are the same action: show
+   the AI panel (with the working pane, like the AI preset) or hide it. */
+function toggleAiPanel() {
+  if (state.panels.ai) {
+    updatePanels({ ...state.panels, ai: false });
+  } else {
+    updatePanels({ ...state.panels, notebook: true, ai: true });
+  }
+}
+
+/* Draggable divider (AV ResizableContainer pattern, without the docking
+   system: resize only). Pointer drag on the 7px gutter; the widths are
+   applied live and persisted on release. */
+function bindDivider(div, key) {
+  if (!div) return;
+  div.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const start = { ...state.widths };
+    const readingEl = $('.reading-pane', view);
+    const notebookEl = $('.notebook-pane', view);
+    const total = (readingEl?.getBoundingClientRect().width || 0)
+      + (notebookEl?.getBoundingClientRect().width || 0);
+    const startReadingPx = readingEl?.getBoundingClientRect().width || 0;
+    div.classList.add('dragging');
+    const move = (ev) => {
+      const dx = ev.clientX - startX;
+      if (key === 'nav') {
+        state.widths.nav = clampNavWidth(start.nav + dx);
+      } else if (key === 'ai') {
+        state.widths.ai = clampAiWidth(start.ai - dx);
+      } else {
+        const s = splitReadingNotebook(startReadingPx + dx, total);
+        state.widths.readingFr = s.readingFr;
+        state.widths.notebookFr = s.notebookFr;
+      }
+      applyReaderLayout({ save: false });
+      if (state.pdfContainer) scheduleRefit(state.pdfContainer, 60);
+      if (state.deckContainer) scheduleRefit(state.deckContainer, 60);
+    };
+    const up = () => {
+      div.classList.remove('dragging');
+      document.removeEventListener('pointermove', move);
+      document.removeEventListener('pointerup', up);
+      saveReaderLayout();
+      if (state.pdfContainer) scheduleRefit(state.pdfContainer, 0);
+      if (state.deckContainer) scheduleRefit(state.deckContainer, 0);
+    };
+    document.addEventListener('pointermove', move);
+    document.addEventListener('pointerup', up);
+  });
+}
+
+/* ---------------- floating menus (Layout menu, + menu) ---------------- */
+
+// One floating menu at a time, fixed-positioned under its anchor button
+// (the AV's LayoutsMenu does the same — the header clips overflow, so an
+// in-flow absolute popover would be cut off). Closes on outside click or
+// Escape; repositioned to stay inside the viewport.
+let floatingMenu = null;
+
+function closeFloatingMenu() {
+  if (!floatingMenu) return;
+  floatingMenu.el.remove();
+  document.removeEventListener('pointerdown', floatingMenu.onOutside, true);
+  document.removeEventListener('keydown', floatingMenu.onKey, true);
+  floatingMenu = null;
+}
+
+function showFloatingMenu(anchorEl, el) {
+  closeFloatingMenu();
+  document.body.appendChild(el);
+  const rect = anchorEl.getBoundingClientRect();
+  const mw = el.offsetWidth;
+  const mh = el.offsetHeight;
+  let left = Math.min(rect.left, window.innerWidth - mw - 8);
+  left = Math.max(8, left);
+  let top = rect.bottom + 4;
+  if (top + mh > window.innerHeight - 8) top = Math.max(8, rect.top - mh - 4);
+  el.style.left = `${left}px`;
+  el.style.top = `${top}px`;
+  const onOutside = (e) => {
+    if (!el.contains(e.target) && !anchorEl.contains(e.target)) closeFloatingMenu();
+  };
+  const onKey = (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); closeFloatingMenu(); }
+  };
+  document.addEventListener('pointerdown', onOutside, true);
+  document.addEventListener('keydown', onKey, true);
+  floatingMenu = { el, anchor: anchorEl, onOutside, onKey };
+  return el;
+}
+
+/* The Layout menu (AV LayoutsMenu pattern): three preset cards with
+   miniature split diagrams, plus a Panels checklist to show/hide
+   individual panes — so a hidden panel can be restored without picking
+   a whole preset. No custom saved layouts (the AV's "+ Save Current
+   Layout" is out of scope here). */
+function openLayoutMenu(anchorBtn) {
+  if (floatingMenu?.anchor === anchorBtn) { closeFloatingMenu(); return; }
+  const el = document.createElement('div');
+  el.className = 'floating-menu layout-menu';
+  el.setAttribute('role', 'menu');
+  el.setAttribute('aria-label', 'Layout');
+  // Mini split diagrams: nav is the narrow dark strip, AI the narrow
+  // accent strip; reading/working are the wide cells. Reading is one
+  // wide cell alone.
+  const diagrams = {
+    reading: [''],
+    navigation: ['nav', ''],
+    notetaking: ['', ''],
+    ai: ['', '', 'ai'],
+  };
+  const names = { reading: 'Reading', navigation: 'Navigation', notetaking: 'Notetaking', ai: 'AI' };
+  const panelKeys = ['nav', 'reading', 'notebook', 'ai'];
+  const render = () => {
+    el.innerHTML = `
+      <div class="layout-grid">
+        ${LAYOUT_PRESET_NAMES.map((name) => `
+          <div class="layout-card${state.layoutMode === name ? ' active' : ''}" data-layout-preset="${name}" role="menuitem" tabindex="0">
+            <div class="layout-diagram">
+              ${diagrams[name].map((cls) => `<div class="layout-cell${cls ? ` ${cls}` : ''}"></div>`).join('')}
+            </div>
+            <div class="layout-card-name">${names[name]}</div>
+          </div>`).join('')}
+      </div>
+      <div class="menu-section">Panels</div>
+      <div class="layout-panels">
+        ${panelKeys.map((key) => `
+          <label class="layout-panel-row">
+            <input type="checkbox" data-panel="${key}" ${state.panels[key] ? 'checked' : ''}>
+            <span>${{ nav: 'Chapters', reading: 'Reading pane', notebook: 'Working pane', ai: 'AI panel' }[key]}</span>
+          </label>`).join('')}
+      </div>`;
+    $$('.layout-card', el).forEach((card) => {
+      const pick = () => { applyLayoutPreset(card.dataset.layoutPreset); closeFloatingMenu(); };
+      card.addEventListener('click', pick);
+      card.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+    });
+    $$('.layout-panel-row input', el).forEach((box) => {
+      box.addEventListener('change', () => {
+        updatePanels({ ...state.panels, [box.dataset.panel]: box.checked });
+        render(); // refresh the active-card highlight; the menu stays open
+      });
+    });
+  };
+  render();
+  showFloatingMenu(anchorBtn, el);
 }
 
 /* ---------------- source switching (v1.1) ---------------- */
@@ -906,7 +1181,8 @@ async function renderReadingPane() {
   if (kind === 'pdf') {
     // Tabbed reading pane: PDF | Slides | Markdown preview. The book PDF
     // and the deck PDF live in separate containers so each tab keeps its
-    // scroll position; the preview renders notes.md for the current chapter.
+    // scroll position; the preview renders a markdown note the user picks
+    // (the master notes.md by default).
     pane.innerHTML = `
       <div class="reading-tabs" id="reading-tabs" role="tablist" aria-label="Reading">
         <button type="button" class="reading-tab${state.leftTab === 'pdf' ? ' active' : ''}" data-left-tab="pdf" role="tab">PDF</button>
@@ -915,16 +1191,26 @@ async function renderReadingPane() {
       </div>
       <div class="reading-tab-panels">
         <div class="reading-tab-panel" id="panel-pdf" ${state.leftTab === 'pdf' ? '' : 'hidden'}>
+          <div class="picker-row picker-row-dark" id="pdf-zoom-row">
+            ${zoomControlsHtml('pdf')}
+            ${annotToolsHtml()}
+          </div>
           <div class="reading-scroll" id="pdf-scroll"><p class="reading-note">Loading PDF…</p></div>
         </div>
         <div class="reading-tab-panel" id="panel-slides" ${state.leftTab === 'slides' ? '' : 'hidden'}>
           <div class="deck-picker-row">
             <label>Deck <select id="deck-picker" aria-label="Slide deck"></select></label>
             <span class="deck-page-indicator" id="deck-page-indicator"></span>
+            ${zoomControlsHtml('deck')}
+            ${annotToolsHtml()}
           </div>
           <div class="reading-scroll" id="deck-scroll"><p class="reading-note">${state.materials.length ? 'Open the Slides tab to read a deck.' : 'No slide decks in this project.'}</p></div>
         </div>
         <div class="reading-tab-panel" id="panel-preview" ${state.leftTab === 'preview' ? '' : 'hidden'}>
+          <div class="picker-row picker-row-paper" id="preview-picker-row">
+            <label>Note <select id="preview-note-picker" aria-label="Note to preview"></select></label>
+            <button type="button" id="preview-export-btn" class="mini-btn" title="Download the note being previewed">Export</button>
+          </div>
           <div class="reading-scroll" id="left-preview-scroll"><div class="md-preview" id="left-md-preview"></div></div>
         </div>
       </div>`;
@@ -935,6 +1221,14 @@ async function renderReadingPane() {
     $('#deck-picker', pane).addEventListener('change', (e) => {
       if (e.target.value) ensureDeckLoaded(e.target.value);
     });
+    syncPreviewNotePicker();
+    $('#preview-note-picker', pane).addEventListener('change', (e) => {
+      state.previewNoteName = e.target.value || null;
+      renderLeftPreview();
+    });
+    $('#preview-export-btn', pane).addEventListener('click', exportPreviewedNote);
+    bindZoomControls(pane);
+    bindAnnotTools(pane);
     await loadPdf(fileUrl, sourceUrl);
     applyLeftTab();
     return;
@@ -951,8 +1245,15 @@ async function renderReadingPane() {
     }
   } else if (kind === 'slides') {
     const embed = sourceUrl ? slidesEmbedUrl(sourceUrl) : fileUrl;
-    pane.innerHTML = `<div class="slides-wrap"><iframe src="${esc(embed)}" title="Slides"
+    pane.innerHTML = `
+      <div class="picker-row picker-row-dark" id="slides-zoom-row">
+        ${zoomControlsHtml('slides')}
+        <span class="zoom-hint">Google Slides embed — zoom is a visual scale</span>
+      </div>
+      <div class="slides-wrap" id="slides-wrap"><iframe src="${esc(embed)}" title="Slides"
       allowfullscreen></iframe></div>`;
+    bindZoomControls(pane);
+    applySlidesZoom();
   } else if (kind === 'ppt') {
     pane.innerHTML = `
       <div class="ppt-card">
@@ -1005,7 +1306,6 @@ function setLeftTab(tab) {
   applyLeftTab();
   renderChapterPanel();
   updateAiContext();
-  updatePageNoteButton();
 }
 
 function applyLeftTab() {
@@ -1017,7 +1317,10 @@ function applyLeftTab() {
     const el = $(sel, view);
     if (el) el.hidden = tab !== state.leftTab;
   });
-  if (state.leftTab === 'pdf') measurePdfPages();
+  if (state.leftTab === 'pdf') {
+    measurePdfPages();
+    if (state.pdfContainer) scheduleRefit(state.pdfContainer, 60);
+  }
   if (state.leftTab === 'slides') {
     const want = defaultDeckId();
     // The deck follows the chapter: a chapter clicked while the PDF tab was
@@ -1031,8 +1334,509 @@ function applyLeftTab() {
       ensureDeckLoaded(state.deckMaterialId || want);
     }
     measureDeckPages();
+    if (state.deckContainer) scheduleRefit(state.deckContainer, 60);
   }
-  if (state.leftTab === 'preview') renderLeftPreview({ follow: true });
+  if (state.leftTab === 'preview') {
+    syncPreviewNotePicker();
+    renderLeftPreview({ follow: true });
+  }
+  updateZoomLabels();
+}
+
+/* ---------------- zoom ---------------- */
+
+// Compact zoom controls (same "no big buttons" direction as the rest of
+// this round): − / % / + / Fit on one slim row per viewer. PDF pages
+// re-render at the zoom scale — never a CSS stretch of a rendered canvas
+// (see mountPdfViewer). Zoom is a multiplier on the width-fitting scale:
+// 1 = fit width, 1.25 = 125%, and so on. Per source, per session.
+function zoomControlsHtml(key) {
+  return `
+    <span class="zoom-controls" data-zoom-key="${key}">
+      <button type="button" class="zoom-btn" data-zoom-out title="Zoom out (Ctrl+-)">−</button>
+      <button type="button" class="zoom-pct" data-zoom-pct title="Zoom — click to fit width">${zoomPercent(state.zoom[key] ?? 1)}%</button>
+      <button type="button" class="zoom-btn" data-zoom-in title="Zoom in (Ctrl++)">+</button>
+      <button type="button" class="zoom-btn zoom-fit" data-zoom-fit title="Fit width (Ctrl+0)">Fit</button>
+    </span>`;
+}
+
+/* One delegated click handler per reading pane covers every zoom row in
+   it (PDF row, deck row, Slides row). */
+function bindZoomControls(root) {
+  if (!root || root.dataset.zoomBound) return;
+  root.dataset.zoomBound = '1';
+  root.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-zoom-in], [data-zoom-out], [data-zoom-fit], [data-zoom-pct]');
+    if (!btn) return;
+    const wrap = btn.closest('[data-zoom-key]');
+    if (!wrap) return;
+    const key = wrap.dataset.zoomKey;
+    if (btn.hasAttribute('data-zoom-in')) setZoom(key, zoomStep(state.zoom[key], 1), { immediate: true });
+    else if (btn.hasAttribute('data-zoom-out')) setZoom(key, zoomStep(state.zoom[key], -1), { immediate: true });
+    else setZoom(key, 1, { immediate: true }); // Fit, or the % label — both reset to fit width
+  });
+}
+
+function updateZoomLabels() {
+  $$('[data-zoom-pct]', view).forEach((el) => {
+    const key = el.closest('[data-zoom-key]')?.dataset.zoomKey;
+    if (key) el.textContent = `${zoomPercent(state.zoom[key] ?? 1)}%`;
+  });
+}
+
+/* Which viewer the zoom shortcuts / wheel act on right now: the active
+   left tab for PDF projects, the Slides embed for slides projects. The
+   Preview tab has nothing to zoom. */
+function activeZoomKey() {
+  if (String(state.project?.kind || '').toLowerCase() === 'slides') return 'slides';
+  if (String(state.project?.kind || '').toLowerCase() !== 'pdf') return null;
+  if (state.leftTab === 'pdf') return 'pdf';
+  if (state.leftTab === 'slides') return 'deck';
+  return null;
+}
+
+function setZoom(key, value, { immediate = false } = {}) {
+  if (!['pdf', 'deck', 'slides'].includes(key)) return;
+  state.zoom[key] = clampZoom(value);
+  updateZoomLabels();
+  if (key === 'slides') {
+    applySlidesZoom();
+    return;
+  }
+  const container = key === 'deck' ? state.deckContainer : state.pdfContainer;
+  if (container) scheduleRefit(container, immediate ? 0 : 120);
+}
+
+/* Google Slides embed (kind 'slides'): there is no re-renderable document,
+   so zoom is a visual scale on the iframe — the iframe's layout size
+   shrinks to 1/zoom and a transform scales it back up, so the content
+   renders larger inside the same wrapper. Honest limit: the embed keeps
+   its own internal resolution; this is not a true re-render like the
+   pdf.js viewers. */
+function applySlidesZoom() {
+  const wrap = $('#slides-wrap', view);
+  if (!wrap) return;
+  const iframe = $('iframe', wrap);
+  if (!iframe) return;
+  const z = state.zoom.slides ?? 1;
+  if (z === 1) {
+    iframe.style.width = '';
+    iframe.style.height = '';
+    iframe.style.transform = '';
+    return;
+  }
+  iframe.style.width = `${100 / z}%`;
+  iframe.style.height = `${100 / z}%`;
+  iframe.style.transform = `scale(${z})`;
+  iframe.style.transformOrigin = '0 0';
+}
+
+// A pane-width change re-fits the PDF viewers at the new width (resize
+// drag, layout switch, tab return). Debounced, and a no-op when the width
+// (and therefore the scale) has not moved — the ResizeObserver also fires
+// on mount, so the guard matters.
+const pdfResizeObserver = new ResizeObserver((entries) => {
+  entries.forEach((entry) => scheduleRefit(entry.target, 120));
+});
+
+const refitTimers = new WeakMap();
+function scheduleRefit(container, delay = 120) {
+  if (!container) return;
+  const prev = refitTimers.get(container);
+  if (prev) clearTimeout(prev);
+  refitTimers.set(container, setTimeout(() => {
+    refitTimers.delete(container);
+    refitPdfViewer(container);
+  }, delay));
+}
+
+function pdfScrollAnchor(container, zoomKey) {
+  const pages = zoomKey === 'deck' ? state.deckPages : state.pdfPages;
+  const mount = container._pdfMount;
+  const pageH = mount?.pageH || 1;
+  let page = 1;
+  const y = container.scrollTop + 80;
+  for (const pg of pages) {
+    if (pg.top <= y) page = pg.num;
+    else break;
+  }
+  const pg = pages.find((p) => p.num === page);
+  const fraction = pg ? Math.min(1, Math.max(0, (container.scrollTop - pg.top) / pageH)) : 0;
+  return { page, fraction };
+}
+
+// Refit one viewer, serialized per container so rapid drags cannot
+// interleave two re-mounts of the same element.
+function refitPdfViewer(container) {
+  const prev = container._pdfRefit || Promise.resolve();
+  const next = prev.then(() => refitPdfViewerInner(container)).catch(() => {});
+  container._pdfRefit = next;
+  return next;
+}
+
+async function refitPdfViewerInner(container) {
+  const mount = container._pdfMount;
+  if (!mount || !container.isConnected) return;
+  if (!container.getClientRects().length) return; // hidden tab — nothing to fit
+  const newWidth = container.clientWidth;
+  const newScale = fitScale(Math.max(200, newWidth - 32), mount.pageWpt)
+    * (state.zoom[mount.zoomKey] ?? 1);
+  if (Math.abs(newWidth - mount.width) <= 4 && Math.abs(newScale - mount.scale) < 0.01) return;
+  const anchor = pdfScrollAnchor(container, mount.zoomKey);
+  await mountPdfViewer(container, mount.pdf, {
+    measure: mount.measure, onScroll: mount.onScroll, zoomKey: mount.zoomKey,
+    sourceId: mount.sourceId,
+  });
+  // mountPdfViewer re-measures; restore the anchored page + fraction.
+  const pages = mount.zoomKey === 'deck' ? state.deckPages : state.pdfPages;
+  const pg = pages.find((p) => p.num === anchor.page);
+  const pageH = container._pdfMount?.pageH || mount.pageH;
+  if (pg) container.scrollTop = Math.max(0, pg.top - 8 + anchor.fraction * pageH);
+}
+
+/* ---------------- PDF annotations ---------------- */
+
+// Highlight (drag a rectangle) + note pin (click to drop a pin with
+// text). No freehand in this round. Stored per project in annotations.json
+// (see src/annotations.js + src/server.js), rendered as an overlay layer
+// on the pdf.js page holders — never baked into the PDF file. Coordinates
+// are normalized (0..1 of the page box), so highlights and pins survive
+// pane resizes, refits and zooms. Deck slides are PDFs too, so the same
+// mechanism applies there (source = the deck material id); the Google
+// Slides iframe cannot be annotated and gets no tools.
+const ANNOT_COLORS = ['yellow', 'green', 'pink', 'blue'];
+const ANNOT_COLOR_HEX = { yellow: '#eab308', green: '#16a34a', pink: '#db2777', blue: '#2563eb' };
+let annotDrag = null; // in-flight highlight drag {container, holder, sourceId, page, startX, startY, rect, ghost}
+
+async function loadAnnotations() {
+  try {
+    const data = await apiGet(`/api/projects/${encodeURIComponent(state.project.slug)}/annotations`);
+    state.annotations = Array.isArray(data?.annotations) ? data.annotations : [];
+  } catch {
+    state.annotations = [];
+  }
+}
+
+async function createAnnotation(fields) {
+  const res = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/annotations`, 'POST', fields);
+  if (res?.annotation) {
+    state.annotations.push(res.annotation);
+    refreshAnnotOverlays();
+    return res.annotation;
+  }
+  return null;
+}
+
+async function updateAnnotation(id, patch) {
+  const res = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/annotations/${encodeURIComponent(id)}`, 'PUT', patch);
+  if (res?.annotation) {
+    const i = state.annotations.findIndex((a) => a.id === id);
+    if (i !== -1) state.annotations[i] = res.annotation;
+    refreshAnnotOverlays();
+    return res.annotation;
+  }
+  return null;
+}
+
+async function deleteAnnotation(id) {
+  // No body: apiJson would send JSON 'null', which Express's strict JSON
+  // parser rejects with 400.
+  await api(`/api/projects/${encodeURIComponent(state.project.slug)}/annotations/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  state.annotations = state.annotations.filter((a) => a.id !== id);
+  if (state.selectedAnnotationId === id) closeAnnotEditor();
+  refreshAnnotOverlays();
+}
+
+/* Compact annotation tools (same "no big buttons" direction as the rest
+   of this round): Highlight / Note / Erase toggles + a color dot that
+   cycles the highlight color. One group per PDF viewer row (book + deck);
+   both reflect the same tool state. */
+function annotToolsHtml() {
+  return `
+    <span class="annot-tools">
+      <button type="button" class="zoom-btn annot-tool-btn" data-annot-tool="highlight" title="Highlight — drag a rectangle on the page">🖍</button>
+      <button type="button" class="zoom-btn annot-tool-btn" data-annot-tool="note" title="Note pin — click to drop a pin with text">📍</button>
+      <button type="button" class="zoom-btn annot-tool-btn" data-annot-tool="erase" title="Erase — click an annotation to delete it">⌫</button>
+      <button type="button" class="annot-color-dot" data-annot-color title="Highlight color — click to cycle">●</button>
+    </span>`;
+}
+
+function bindAnnotTools(root) {
+  if (!root || root.dataset.annotBound) return;
+  root.dataset.annotBound = '1';
+  root.addEventListener('click', (e) => {
+    const toolBtn = e.target.closest('[data-annot-tool]');
+    if (toolBtn) {
+      const tool = toolBtn.dataset.annotTool;
+      setAnnotTool(state.annotTool === tool ? null : tool);
+      return;
+    }
+    if (e.target.closest('[data-annot-color]')) cycleAnnotColor();
+  });
+}
+
+function syncAnnotTools() {
+  $$('[data-annot-tool]', view).forEach((b) => {
+    b.classList.toggle('active', b.dataset.annotTool === state.annotTool);
+  });
+  $$('[data-annot-color]', view).forEach((b) => {
+    b.style.color = ANNOT_COLOR_HEX[state.annotColor] || ANNOT_COLOR_HEX.yellow;
+    b.title = `Highlight color: ${state.annotColor} — click to cycle`;
+  });
+}
+
+function setAnnotTool(tool) {
+  state.annotTool = tool || null;
+  closeAnnotEditor();
+  refreshAnnotOverlays();
+}
+
+function cycleAnnotColor() {
+  const i = ANNOT_COLORS.indexOf(state.annotColor);
+  state.annotColor = ANNOT_COLORS[(i + 1) % ANNOT_COLORS.length];
+  syncAnnotTools();
+}
+
+/* Rebuild the overlay layers of one viewer from state.annotations.
+   Each .pdf-page holder gets one .annot-layer (created once, kept across
+   re-renders); the layer's children are rebuilt from the annotations for
+   that source + page. The layer only takes pointer events while a tool
+   is active — otherwise clicks pass through to the page and only the
+   pins (pointer-events auto) stay clickable. */
+function renderAnnotOverlays(container) {
+  const mount = container._pdfMount;
+  if (!mount) return;
+  const sourceId = mount.sourceId || 'book';
+  const byPage = new Map();
+  for (const a of state.annotations) {
+    if (a.source !== sourceId) continue;
+    if (!byPage.has(a.page)) byPage.set(a.page, []);
+    byPage.get(a.page).push(a);
+  }
+  container.querySelectorAll('.pdf-page').forEach((holder) => {
+    const page = Number(holder.dataset.page);
+    let layer = holder.querySelector('.annot-layer');
+    if (!layer) {
+      layer = document.createElement('div');
+      layer.className = 'annot-layer';
+      holder.appendChild(layer);
+      layer.addEventListener('pointerdown', (e) => onAnnotLayerPointerDown(e, container, layer));
+      layer.addEventListener('click', (e) => onAnnotLayerClick(e, container, layer));
+    }
+    layer.innerHTML = '';
+    layer.classList.toggle('annot-tool-active', !!state.annotTool);
+    layer.dataset.tool = state.annotTool || '';
+    for (const a of byPage.get(page) || []) {
+      if (a.type === 'highlight') {
+        const el = document.createElement('div');
+        el.className = 'annot-highlight';
+        el.dataset.annotId = a.id;
+        el.dataset.color = a.color || 'yellow';
+        el.style.left = `${a.rect.x * 100}%`;
+        el.style.top = `${a.rect.y * 100}%`;
+        el.style.width = `${a.rect.w * 100}%`;
+        el.style.height = `${a.rect.h * 100}%`;
+        layer.appendChild(el);
+      } else {
+        const el = document.createElement('button');
+        el.type = 'button';
+        el.className = 'annot-pin';
+        el.dataset.annotId = a.id;
+        el.dataset.color = a.color || 'yellow';
+        el.style.left = `${a.rect.x * 100}%`;
+        el.style.top = `${a.rect.y * 100}%`;
+        el.title = a.text ? a.text : 'Note — click to edit';
+        el.setAttribute('aria-label', a.text ? `Note: ${a.text}` : 'Note pin');
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openAnnotEditor(a);
+        });
+        layer.appendChild(el);
+      }
+    }
+  });
+  repositionAnnotEditor();
+}
+
+function refreshAnnotOverlays() {
+  if (state.pdfContainer) renderAnnotOverlays(state.pdfContainer);
+  if (state.deckContainer) renderAnnotOverlays(state.deckContainer);
+  syncAnnotTools();
+}
+
+/* Highlight drag: pointerdown starts it on the layer (only while the
+   highlight tool is active); a document-level move/up pair tracks it so
+   the drag survives leaving the page. A drag under 6px in either
+   dimension is an accidental click, not a highlight. */
+function onAnnotLayerPointerDown(e, container, layer) {
+  if (state.annotTool !== 'highlight') return;
+  const holder = layer.closest('.pdf-page');
+  if (!holder) return;
+  e.preventDefault();
+  const r = holder.getBoundingClientRect();
+  const startX = (e.clientX - r.left) / r.width;
+  const startY = (e.clientY - r.top) / r.height;
+  const ghost = document.createElement('div');
+  ghost.className = 'annot-highlight annot-ghost';
+  ghost.dataset.color = state.annotColor;
+  layer.appendChild(ghost);
+  annotDrag = {
+    container, layer, holder,
+    sourceId: container._pdfMount?.sourceId || 'book',
+    page: Number(holder.dataset.page), startX, startY, rect: null, ghost,
+  };
+  const move = (ev) => {
+    if (!annotDrag) return;
+    const hr = annotDrag.holder.getBoundingClientRect();
+    const cx = Math.min(1, Math.max(0, (ev.clientX - hr.left) / hr.width));
+    const cy = Math.min(1, Math.max(0, (ev.clientY - hr.top) / hr.height));
+    const x = Math.min(annotDrag.startX, cx);
+    const y = Math.min(annotDrag.startY, cy);
+    const w = Math.abs(cx - annotDrag.startX);
+    const h = Math.abs(cy - annotDrag.startY);
+    annotDrag.rect = { x, y, w, h };
+    Object.assign(annotDrag.ghost.style, {
+      left: `${x * 100}%`, top: `${y * 100}%`,
+      width: `${w * 100}%`, height: `${h * 100}%`,
+    });
+  };
+  const up = async (ev) => {
+    document.removeEventListener('pointermove', move);
+    document.removeEventListener('pointerup', up);
+    const d = annotDrag;
+    annotDrag = null;
+    if (!d) return;
+    move(ev);
+    const rect = d.rect || { x: d.startX, y: d.startY, w: 0, h: 0 };
+    const hr = d.holder.getBoundingClientRect();
+    d.ghost.remove();
+    if (rect.w * hr.width < 6 || rect.h * hr.height < 6) return;
+    try {
+      await createAnnotation({
+        source: d.sourceId, page: d.page, type: 'highlight',
+        rect, color: state.annotColor,
+      });
+    } catch (err) {
+      window.alert(`Could not save the highlight: ${err.message}`);
+    }
+  };
+  document.addEventListener('pointermove', move);
+  document.addEventListener('pointerup', up);
+}
+
+/* Layer click: note tool drops a pin (and opens its editor); erase deletes
+   the annotation under the cursor; with no tool the layer never receives
+   the click (pins handle their own clicks). */
+async function onAnnotLayerClick(e, container, layer) {
+  const holder = layer.closest('.pdf-page');
+  if (!holder) return;
+  const tool = state.annotTool;
+  if (tool === 'erase') {
+    const el = e.target.closest('[data-annot-id]');
+    if (!el) return;
+    try {
+      await deleteAnnotation(el.dataset.annotId);
+    } catch (err) {
+      window.alert(`Could not delete the annotation: ${err.message}`);
+    }
+    return;
+  }
+  if (tool !== 'note') return;
+  const r = holder.getBoundingClientRect();
+  const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+  const y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+  try {
+    const a = await createAnnotation({
+      source: container._pdfMount?.sourceId || 'book',
+      page: Number(holder.dataset.page), type: 'note',
+      rect: { x, y, w: 0, h: 0 }, color: state.annotColor, text: '',
+    });
+    if (a) openAnnotEditor(a);
+  } catch (err) {
+    window.alert(`Could not save the note: ${err.message}`);
+  }
+}
+
+/* The pin editor: a small popover positioned over the pin, inside the
+   scroll container so it scrolls with the page. It is NOT a child of the
+   overlay layer, so overlay re-renders (refit, tool change) never destroy
+   it — it is repositioned instead. */
+function openAnnotEditor(annotation) {
+  closeAnnotEditor();
+  state.selectedAnnotationId = annotation.id;
+  const container = annotation.source === 'book' ? state.pdfContainer : state.deckContainer;
+  if (!container) return;
+  const holder = container.querySelector(`.pdf-page[data-page="${annotation.page}"]`);
+  if (!holder) return;
+  const editor = document.createElement('div');
+  editor.className = 'annot-editor';
+  editor.dataset.annotId = annotation.id;
+  const ta = document.createElement('textarea');
+  ta.value = annotation.text || '';
+  ta.placeholder = 'Note…';
+  ta.rows = 3;
+  ta.setAttribute('aria-label', 'Note text');
+  const row = document.createElement('div');
+  row.className = 'annot-editor-row';
+  const save = document.createElement('button');
+  save.type = 'button';
+  save.className = 'mini-btn';
+  save.textContent = 'Save';
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'mini-btn annot-del';
+  del.textContent = 'Delete';
+  row.append(save, del);
+  editor.append(ta, row);
+  editor.addEventListener('pointerdown', (e) => e.stopPropagation());
+  save.addEventListener('click', async () => {
+    try {
+      await updateAnnotation(annotation.id, { text: ta.value });
+      closeAnnotEditor();
+    } catch (err) {
+      window.alert(`Could not save the note: ${err.message}`);
+    }
+  });
+  del.addEventListener('click', async () => {
+    try {
+      await deleteAnnotation(annotation.id);
+    } catch (err) {
+      window.alert(`Could not delete the note: ${err.message}`);
+    }
+  });
+  container.appendChild(editor);
+  positionAnnotEditor(editor, annotation, holder, container);
+  ta.focus();
+}
+
+function positionAnnotEditor(editor, annotation, holder, container) {
+  const hr = holder.getBoundingClientRect();
+  const cr = container.getBoundingClientRect();
+  const x = hr.left - cr.left + container.scrollLeft + annotation.rect.x * hr.width;
+  const y = hr.top - cr.top + container.scrollTop + annotation.rect.y * hr.height;
+  const w = Math.min(240, container.clientWidth - 16);
+  editor.style.width = `${w}px`;
+  editor.style.left = `${Math.min(Math.max(8, x - 12), Math.max(8, container.clientWidth - w - 8))}px`;
+  editor.style.top = `${y + 16}px`;
+}
+
+function repositionAnnotEditor() {
+  const editor = $('.annot-editor', view);
+  if (!editor) return;
+  const a = state.annotations.find((x) => x.id === state.selectedAnnotationId);
+  if (!a) { closeAnnotEditor(); return; }
+  const container = a.source === 'book' ? state.pdfContainer : state.deckContainer;
+  if (!container) { closeAnnotEditor(); return; }
+  const holder = container.querySelector(`.pdf-page[data-page="${a.page}"]`);
+  if (!holder) { closeAnnotEditor(); return; }
+  if (editor.parentElement !== container) container.appendChild(editor);
+  positionAnnotEditor(editor, a, holder, container);
+}
+
+function closeAnnotEditor() {
+  state.selectedAnnotationId = null;
+  const editor = $('.annot-editor', view);
+  if (editor) editor.remove();
 }
 
 /* The page the user is reading, as a page-anchor {sourceId, page}:
@@ -1130,7 +1934,7 @@ async function loadPdf(fileUrl, sourceUrl) {
   }
   renderChapterPanel();
 
-  await mountPdfViewer(container, pdf, { measure: measurePdfPages, onScroll: onPdfScroll });
+  await mountPdfViewer(container, pdf, { measure: measurePdfPages, onScroll: onPdfScroll, zoomKey: 'pdf', sourceId: 'book' });
 
   // Lazy cover: first page rendered small, posted once per open.
   if (!state.project.cover && !state.coverGenerated) {
@@ -1144,10 +1948,20 @@ async function loadPdf(fileUrl, sourceUrl) {
    lazily near the viewport (IntersectionObserver), scroll events throttled
    through requestAnimationFrame. Used by the book (loadPdf) and by slide
    decks (loadDeckPdf) so both tabs keep their own scroll position. */
-async function mountPdfViewer(container, pdf, { measure, onScroll }) {
-  const SCALE = 1.3;
+/* Shared PDF viewer mounting: one placeholder per page, canvases render
+   lazily near the viewport (IntersectionObserver), scroll events throttled
+   through requestAnimationFrame. Used by the book (loadPdf) and by slide
+   decks (loadDeckPdf) so both tabs keep their own scroll position.
+   The scale is WIDTH-FITTING: the container's usable width over page 1's
+   width in points, times the zoom multiplier (1 = fit width). A pane
+   resize or a zoom change re-mounts at the new scale (see refitPdfViewer)
+   — pages re-render, never CSS-stretched. */
+async function mountPdfViewer(container, pdf, { measure, onScroll, zoomKey = 'pdf', sourceId = 'book' }) {
   const page = await pdf.getPage(1);
-  const vp = page.getViewport({ scale: SCALE });
+  const pageWpt = page.getViewport({ scale: 1 }).width;
+  const scale = fitScale(Math.max(200, container.clientWidth - 32), pageWpt)
+    * (state.zoom[zoomKey] ?? 1);
+  const vp = page.getViewport({ scale });
   const pageW = Math.floor(vp.width);
   const pageH = Math.floor(vp.height);
   container.innerHTML = '';
@@ -1165,13 +1979,20 @@ async function mountPdfViewer(container, pdf, { measure, onScroll }) {
   }
   container.appendChild(frag);
   measure();
+  // The re-fit record: what refitPdfViewer needs to decide whether the
+  // width/scale moved and to rebuild at the new size.
+  container._pdfMount = {
+    pdf, measure, onScroll, zoomKey, sourceId, pageWpt, pageW, pageH,
+    width: container.clientWidth, scale,
+  };
+  renderAnnotOverlays(container);
 
   const renderPage = async (holder) => {
     if (holder.dataset.rendered) return;
     holder.dataset.rendered = '1';
     try {
       const pg = await pdf.getPage(Number(holder.dataset.page));
-      const viewport = pg.getViewport({ scale: SCALE });
+      const viewport = pg.getViewport({ scale });
       const canvas = document.createElement('canvas');
       canvas.width = Math.floor(viewport.width);
       canvas.height = Math.floor(viewport.height);
@@ -1194,7 +2015,13 @@ async function mountPdfViewer(container, pdf, { measure, onScroll }) {
 
   // The scroll listener is bound once per element: the book container is
   // recreated on every renderReadingPane, and the deck container is
-  // replaced on every deck load (see loadDeckPdf).
+  // replaced on every deck load (see loadDeckPdf). The zoom listeners
+  // ride along: Ctrl/Cmd+wheel (the trackpad pinch arrives as wheel
+  // events with ctrlKey set in Chrome — and in Safari, which additionally
+  // fires gesture events) zooms the document, never the whole page.
+  // The wheel listener is non-passive so preventDefault can stop the
+  // browser's own pinch-zoom; touch-action (CSS) keeps touch scrolling
+  // while the browser stays out of touch pinch-zoom.
   if (!container.dataset.scrollBound) {
     container.dataset.scrollBound = '1';
     let ticking = false;
@@ -1203,7 +2030,23 @@ async function mountPdfViewer(container, pdf, { measure, onScroll }) {
       ticking = true;
       requestAnimationFrame(() => { ticking = false; onScroll(); });
     }, { passive: true });
+    container.addEventListener('wheel', (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      setZoom(zoomKey, zoomFromWheel(state.zoom[zoomKey] ?? 1, e.deltaY), { immediate: false });
+    }, { passive: false });
+    let gestureStartZoom = 1;
+    container.addEventListener('gesturestart', (e) => {
+      e.preventDefault();
+      gestureStartZoom = state.zoom[zoomKey] ?? 1;
+    });
+    container.addEventListener('gesturechange', (e) => {
+      e.preventDefault();
+      setZoom(zoomKey, zoomFromGesture(gestureStartZoom, e.scale || 1), { immediate: false });
+    });
+    container.addEventListener('gestureend', (e) => { e.preventDefault(); });
   }
+  pdfResizeObserver.observe(container);
 }
 
 /* Load a slide deck into the Slides tab's own container (the book PDF is
@@ -1263,7 +2106,7 @@ async function loadDeckPdf(materialId) {
     return;
   }
   state.deckDoc = pdf;
-  await mountPdfViewer(fresh, pdf, { measure: measureDeckPages, onScroll: onDeckScroll });
+  await mountPdfViewer(fresh, pdf, { measure: measureDeckPages, onScroll: onDeckScroll, zoomKey: 'deck', sourceId: materialId });
   // The Slides tab may have opened before the load finished; the chapter
   // panel's source note and the AI context line follow the loaded deck.
   if (state.leftTab === 'slides') {
@@ -1273,7 +2116,6 @@ async function loadDeckPdf(materialId) {
   }
   syncDeckPicker();
   updateDeckPageIndicator();
-  updatePageNoteButton();
 }
 
 function measureDeckPages() {
@@ -1313,7 +2155,6 @@ function updateDeckPageIndicator() {
 function onDeckScroll() {
   updateDeckPageIndicator();
   updateAiContext();
-  updatePageNoteButton();
 }
 
 async function flattenOutline(pdf, items, depth = 0, out = []) {
@@ -1486,7 +2327,7 @@ function renderChapterPanel() {
     $$('.chapter-row', panel).forEach((btn) => {
       btn.addEventListener('click', () => {
         const ch = state.outline[Number(btn.dataset.chapter)];
-        setActiveChapter(ch, { scrollNotebook: true, scrollPdf: true, force: true });
+        setActiveChapter(ch, { scrollNotebook: true, scrollPdf: true });
       });
     });
     $$('select[data-link-chapter]', panel).forEach((sel) => {
@@ -1521,12 +2362,12 @@ function renderChapterPanel() {
       state.activeChapter = h.norm;
       $$('.chapter-row', panel).forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
-      scrollNotebookToHeading(h, true);
+      scrollNotebookToHeading(h);
     });
   });
 }
 
-function setActiveChapter(chapter, { scrollNotebook = false, scrollPdf = false, force = false } = {}) {
+function setActiveChapter(chapter, { scrollNotebook = false, scrollPdf = false } = {}) {
   state.activeChapter = normalizeHeading(chapter.title);
   $$('#chapter-panel .chapter-row').forEach((row) => {
     const idx = Number(row.dataset.chapter);
@@ -1550,10 +2391,9 @@ function setActiveChapter(chapter, { scrollNotebook = false, scrollPdf = false, 
   }
   if (scrollNotebook) {
     const heading = resolvedChapterHeading(chapter);
-    scrollNotebookToHeading(heading, force); // null -> leave the notebook alone
+    scrollNotebookToHeading(heading); // null -> leave the notebook alone
   }
   updateAiContext(); // keep the Ask AI panel's context line live
-  updatePageNoteButton(); // the "+ Note here" button follows the page
   followDeckToChapter(chapter);
   scrollLeftPreviewToChapter();
 }
@@ -1585,23 +2425,69 @@ function syncNotesMdCache(text) {
    when notes.md is open, else the cached text, fetched lazily. The preview
    keeps its scroll position across re-renders; with follow=true it scrolls
    to the current chapter once (tab open), never on content updates. */
+/* The Preview tab's note picker (like the Slides tab's deck picker): the
+   project's markdown notes, master notes.md included. The effective note
+   is the manual pick, else the active markdown note, else the master. */
+function mdNotes() {
+  const notes = (state.notes || []).filter((n) => n.kind === 'md');
+  notes.sort((a, b) => (a.name === 'notes.md' ? -1 : b.name === 'notes.md' ? 1 : a.name.localeCompare(b.name)));
+  return notes;
+}
+
+function previewNoteName() {
+  const names = mdNotes().map((n) => n.name);
+  if (state.previewNoteName && names.includes(state.previewNoteName)) {
+    return state.previewNoteName;
+  }
+  if (state.activeNoteKind === 'md' && state.activeNoteName && names.includes(state.activeNoteName)) {
+    return state.activeNoteName;
+  }
+  if (names.includes('notes.md')) return 'notes.md';
+  return names[0] || null;
+}
+
+function syncPreviewNotePicker() {
+  const sel = $('#preview-note-picker', view);
+  if (!sel) return;
+  const current = previewNoteName();
+  sel.innerHTML = mdNotes().map((n) => (
+    `<option value="${esc(n.name)}"${n.name === current ? ' selected' : ''}>${esc(n.name)}</option>`
+  )).join('');
+}
+
+/* Fetch the previewed note's text: the live editor content when it is
+   the active note, the notes.md cache when that is it, else the API. */
+async function previewNoteText() {
+  const name = previewNoteName();
+  if (!name) return { name, text: '' };
+  if (state.activeTabKind === 'note' && state.activeNoteName === name) {
+    return { name, text: state.activeNoteContent };
+  }
+  if (name === 'notes.md' && state.notesMdContent != null) {
+    return { name, text: state.notesMdContent };
+  }
+  try {
+    const data = await apiGet(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/${encodeURIComponent(name)}`);
+    const text = typeof data === 'string' ? data : (data.content ?? '');
+    if (name === 'notes.md') state.notesMdContent = text;
+    return { name, text };
+  } catch {
+    return { name, text: '' };
+  }
+}
+
+/* Download the note currently being previewed (the old toolbar Export
+   notes, moved here next to the picker). */
+async function exportPreviewedNote() {
+  const { name, text } = await previewNoteText();
+  if (!name) return;
+  downloadBlob(text, `${state.project.slug}-${name}`);
+}
+
 async function renderLeftPreview({ follow = false } = {}) {
   const el = $('#left-md-preview', view);
   if (!el) return;
-  let text;
-  if (state.activeTabKind === 'note' && state.activeNoteName === 'notes.md') {
-    text = state.activeNoteContent;
-  } else if (state.notesMdContent != null) {
-    text = state.notesMdContent;
-  } else {
-    try {
-      const data = await apiGet(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/notes.md`);
-      text = typeof data === 'string' ? data : (data.content ?? '');
-      state.notesMdContent = text;
-    } catch {
-      text = '';
-    }
-  }
+  const { text } = await previewNoteText();
   renderMdPreview(el, text);
   if (follow) scrollLeftPreviewToChapter(false);
 }
@@ -1620,18 +2506,15 @@ function scrollLeftPreviewToChapter(smooth = true) {
   target.scrollIntoView({ behavior: smooth ? 'smooth' : 'auto', block: 'start' });
 }
 
-/* Scroll the notebook pane to a heading.
-   Guards: never while the markdown editor textarea is focused (user typing),
-   and never while the Follow toggle is off — except for explicit chapter clicks,
-   which pass force=true.
+/* Scroll the notebook pane to a heading. Guards: never while the markdown
+   editor textarea is focused (user typing). The Follow toggle is gone
+   (toolbar removed 2026-11-11) — the scroll-spy follow itself stays
+   always on, as it was by default.
    A heading with no match never scrolls the notebook: top-of-note is never a
    useful destination, so a null heading (or a heading with no element in the
    rendered note) leaves the notebook exactly where it is. */
-function scrollNotebookToHeading(heading, force = false) {
-  if (!force) {
-    if (!state.follow) return;
-    if (state.editorFocused) return;
-  }
+function scrollNotebookToHeading(heading) {
+  if (state.editorFocused) return;
   if (!heading) return;
   const body = $('.notebook-body', view);
   if (!body) return;
@@ -1689,12 +2572,13 @@ function resetExecCounter() {
 function renderNotebookPane() {
   const pane = $('#notebook-pane', view);
   if (!pane) return;
-  // The AI panel used to live here (embedded); it is now the rightmost
-  // column of the reader (see renderAiColumn) — no ai-panel div here.
+  // No toolbar row: the tab bar is on top, the editor/notebook directly
+  // below. Preview lives in the left pane (picker + Export next to it),
+  // Ask AI in the top bar, + Note here / new note / new notebook / labs
+  // in the + menu, and everything autosaves (see renderNotebookBody and
+  // saveNotebook) — so nothing needs a Save button.
   pane.innerHTML = `
     <div class="notebook-tabs" id="notebook-tabs"></div>
-    <div class="notebook-toolbar" id="notebook-toolbar"></div>
-    <div class="labs-section" id="labs-section" hidden></div>
     <div class="notebook-body" id="notebook-body"></div>`;
 
   const tabs = $('#notebook-tabs', pane);
@@ -1735,15 +2619,21 @@ function renderNotebookPane() {
     });
     tabs.appendChild(tab);
   });
-  const addNb = document.createElement('button');
-  addNb.type = 'button';
-  addNb.className = 'note-tab-add';
-  addNb.textContent = '+ Notebook';
-  addNb.addEventListener('click', createIpynbNote);
-  tabs.appendChild(addNb);
+  // The + button is just a +: it opens the chooser (new note, new
+  // notebook per language, labs, Note here) — AV TabContainer style.
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'note-tab-add';
+  addBtn.textContent = '+';
+  addBtn.title = 'Add — note, notebook, lab, or a note at the current page';
+  addBtn.addEventListener('click', (e) => { e.stopPropagation(); openAddMenu(addBtn); });
+  tabs.appendChild(addBtn);
+  // Autosave status lives at the right end of the tab bar.
+  const status = document.createElement('span');
+  status.className = 'save-status';
+  status.id = 'save-status';
+  tabs.appendChild(status);
 
-  renderNotebookToolbar();
-  renderLabsSection();
   renderNotebookBody();
 }
 
@@ -1768,59 +2658,91 @@ function labDisplayName(name) {
   return base.replace(/_/g, ' ');
 }
 
-function renderLabsSection() {
-  const sec = $('#labs-section', view);
-  if (!sec) return;
-  if (!state.labs.length) { sec.innerHTML = ''; sec.hidden = true; return; }
-  sec.hidden = false;
-  const total = state.labs.reduce((n, c) => n + (Array.isArray(c.files) ? c.files.length : 0), 0);
-  const toggle = state.labsCollapsed ? '▸' : '▾';
-  let html = `
-    <button type="button" class="labs-head" id="labs-head" aria-expanded="${state.labsCollapsed ? 'false' : 'true'}">
-      <span>${toggle} Labs</span>
-      <span class="labs-count">${total} notebook${total === 1 ? '' : 's'}</span>
-    </button>`;
-  if (!state.labsCollapsed) {
-    html += `<div class="labs-groups">` + state.labs.map((group) => {
+/* The tab-bar + menu (AV TabContainer spirit: a bare + that opens a
+   chooser): Note here, new markdown note, new notebooks — one per
+   runnable language, since language is stored per notebook in metadata,
+   so each kind is one click with no language prompt — and the lab index
+   grouped by chapter with counts. Choosing a lab opens a new tab; the
+   same lab twice focuses the existing tab. */
+function openAddMenu(anchorBtn) {
+  const reading = currentReadingPage();
+  const pageLabel = reading
+    ? `Note here — at ${reading.sourceId === PAGE_ANCHOR_SOURCE_BOOK ? `p. ${reading.page}` : `slide ${reading.page}`}`
+    : 'Note here — at current page';
+  const menu = document.createElement('div');
+  menu.className = 'floating-menu add-menu';
+  const addSection = (title) => {
+    const h = document.createElement('div');
+    h.className = 'menu-section';
+    h.textContent = title;
+    menu.appendChild(h);
+  };
+  const addItem = ({ label, ext = '', disabled = false, hint = '', onClick }) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'menu-item';
+    b.disabled = disabled;
+    const l = document.createElement('span');
+    l.textContent = label;
+    const e = document.createElement('span');
+    e.className = 'menu-ext';
+    e.textContent = ext;
+    b.append(l, e);
+    if (hint) b.title = hint;
+    b.addEventListener('click', () => { closeFloatingMenu(); onClick(); });
+    menu.appendChild(b);
+  };
+  addSection('Add');
+  addItem({
+    label: pageLabel,
+    disabled: !reading,
+    hint: reading
+      ? 'Anchor a note under the current chapter in notes.md'
+      : 'No page here — switch to the PDF or Slides tab to anchor a note',
+    onClick: addNoteAtCurrentPage,
+  });
+  addItem({ label: 'Markdown note', ext: '.md', onClick: createMdNote });
+  addItem({ label: 'IPython notebook', ext: '.ipynb', onClick: () => createIpynbNote('python') });
+  addItem({ label: 'Java notebook', ext: '.ipynb', onClick: () => createIpynbNote('java') });
+  addItem({ label: 'JavaScript notebook', ext: '.ipynb', onClick: () => createIpynbNote('javascript') });
+  if (state.labs.length) {
+    addSection('Labs');
+    state.labs.forEach((group) => {
       const files = Array.isArray(group.files) ? group.files : [];
+      if (!files.length) return;
       const open = !!state.labsOpenChapters[group.chapter];
-      const rows = open ? files.map((f) => {
-        const isOpen = state.labTabs.some((t) => t.chapter === group.chapter && t.name === f.name);
-        const isActive = state.activeTabKind === 'lab' && state.activeLab
-          && state.activeLab.chapter === group.chapter && state.activeLab.name === f.name;
-        return `<button type="button" class="lab-file${isActive ? ' active' : ''}${isOpen ? ' open' : ''}"
-            data-lab-chapter="${esc(group.chapter)}" data-lab-name="${esc(f.name)}"
-            title="${esc(group.chapter)}/${esc(f.name)}">${esc(labDisplayName(f.name))}</button>`;
-      }).join('') : '';
-      return `
-        <div class="labs-group">
-          <button type="button" class="labs-group-head" data-labs-chapter="${esc(group.chapter)}">
-            <span>${open ? '▾' : '▸'} ${esc(chapterDisplayName(group.chapter))}</span>
-            <span class="labs-count">${files.length}</span>
-          </button>
-          ${open ? `<div class="labs-files">${rows || '<p class="labs-empty">No files in this chapter.</p>'}</div>` : ''}
-        </div>`;
-    }).join('') + `</div>`;
+      const head = document.createElement('button');
+      head.type = 'button';
+      head.className = 'menu-group-head';
+      const headLabel = document.createElement('span');
+      headLabel.textContent = `${open ? '▾' : '▸'} ${chapterDisplayName(group.chapter)}`;
+      const headCount = document.createElement('span');
+      headCount.className = 'menu-count';
+      headCount.textContent = String(files.length);
+      head.append(headLabel, headCount);
+      head.addEventListener('click', () => {
+        state.labsOpenChapters[group.chapter] = !open;
+        closeFloatingMenu();
+        openAddMenu(anchorBtn);
+      });
+      menu.appendChild(head);
+      if (open) {
+        files.forEach((f) => {
+          const isOpen = state.labTabs.some((t) => t.chapter === group.chapter && t.name === f.name);
+          const isActive = state.activeTabKind === 'lab' && state.activeLab
+            && state.activeLab.chapter === group.chapter && state.activeLab.name === f.name;
+          addItem({
+            label: `${isOpen ? '● ' : ''}${labDisplayName(f.name)}`,
+            ext: isActive ? 'active' : '',
+            onClick: () => openLab(group.chapter, f.name),
+          });
+        });
+      }
+    });
   }
-  sec.innerHTML = html;
-
-  $('#labs-head', sec).addEventListener('click', () => {
-    state.labsCollapsed = !state.labsCollapsed;
-    renderLabsSection();
-  });
-  $$('.labs-group-head', sec).forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const ch = btn.dataset.labsChapter;
-      state.labsOpenChapters[ch] = !state.labsOpenChapters[ch];
-      renderLabsSection();
-    });
-  });
-  $$('.lab-file', sec).forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      await openLab(btn.dataset.labChapter, btn.dataset.labName);
-    });
-  });
+  showFloatingMenu(anchorBtn, menu);
 }
+
 
 /* Open a lab as a notebook tab (same rendering + ▶ Run path as note
    notebooks). Only this lab becomes a tab — the rest stay listed. */
@@ -1886,68 +2808,6 @@ async function closeLabTab(lab) {
   renderChapterPanel();
 }
 
-function renderNotebookToolbar() {
-  const bar = $('#notebook-toolbar', view);
-  if (!bar) return;
-  if (state.activeNoteKind === 'md') {
-    bar.innerHTML = `
-      <button type="button" id="md-preview-btn" title="Open the rendered preview in the left pane">Preview</button>
-      <button type="button" id="ai-toggle" class="${state.aiPanelOpen ? 'active' : ''}" title="Ask the AI to draft markdown notes from the current chapter — a proposal, never a silent write">✨ Ask AI</button>
-      <button type="button" id="page-note-btn" title="Add a note anchored at the page being read">+ Note here</button>
-      <label class="follow-toggle" title="Follow the reading pane: scroll the notebook to the current chapter">
-        <input type="checkbox" id="follow-toggle" ${state.follow ? 'checked' : ''}> Follow
-      </label>
-      <span class="spacer"></span>
-      <span class="save-status" id="save-status"></span>
-      <button type="button" id="nb-export-notes" title="Download the master notes.md">Export notes</button>
-      <button type="button" id="md-save-btn">Save</button>`;
-    // Preview opens the LEFT pane's Markdown preview tab (the one preview);
-    // the right pane stays in Edit mode.
-    $('#md-preview-btn', bar).addEventListener('click', () => setLeftTab('preview'));
-    $('#follow-toggle', bar).addEventListener('change', (e) => { state.follow = e.target.checked; });
-    $('#md-save-btn', bar).addEventListener('click', () => saveActiveMdNote(true));
-  } else {
-    bar.innerHTML = `
-      <button type="button" id="ai-toggle" class="${state.aiPanelOpen ? 'active' : ''}" title="Ask the AI to draft markdown notes from the current chapter — a proposal, never a silent write">✨ Ask AI</button>
-      <button type="button" id="page-note-btn" title="Add a note anchored at the page being read">+ Note here</button>
-      <label class="follow-toggle" title="Follow the reading pane: scroll the notebook to the current chapter">
-        <input type="checkbox" id="follow-toggle" ${state.follow ? 'checked' : ''}> Follow
-      </label>
-      <span class="spacer"></span>
-      <span class="save-status" id="save-status"></span>
-      <button type="button" id="nb-export-notes" title="Download the master notes.md">Export notes</button>`;
-    $('#follow-toggle', bar).addEventListener('change', (e) => { state.follow = e.target.checked; });
-  }
-  const exportBtn = $('#nb-export-notes', bar);
-  if (exportBtn) exportBtn.addEventListener('click', exportNotesMaster);
-  const aiBtn = $('#ai-toggle', bar);
-  if (aiBtn) {
-    // The ✨ Ask AI toggle and the AI mode button are the same action:
-    // opening AI switches to AI mode, closing it returns to Focus.
-    aiBtn.addEventListener('click', () => {
-      setLayoutMode(state.layoutMode === 'ai' ? 'focus' : 'ai');
-    });
-  }
-  const pageBtn = $('#page-note-btn', bar);
-  if (pageBtn) {
-    pageBtn.addEventListener('click', addNoteAtCurrentPage);
-    updatePageNoteButton();
-  }
-}
-
-/* The "+ Note here" button (notebook toolbar) is enabled exactly when the
-   reader is on a page: book PDF / Slides tab, or the Preview tab with an
-   active chapter. Video / slides / ppt projects have no pages. */
-function updatePageNoteButton() {
-  const btn = $('#page-note-btn', view);
-  if (!btn) return;
-  const reading = currentReadingPage();
-  btn.disabled = !reading;
-  btn.title = reading
-    ? `Add a note anchored at ${reading.sourceId === PAGE_ANCHOR_SOURCE_BOOK ? `p. ${reading.page}` : `slide ${reading.page}`} — it lands under this chapter in notes.md`
-    : 'No page here — switch to the PDF or Slides tab to anchor a note';
-}
-
 /* Add a note anchored at the page being read: insert the anchor comment
    under the current chapter's ## heading in notes.md (end of the section;
    create the heading if missing — same rule as Ask AI Apply), then open
@@ -1996,7 +2856,7 @@ function renderNotebookBody() {
     return;
   }
   // Markdown notes are always edited here; the rendered preview lives in
-  // the LEFT pane's Preview tab (opened by the Preview button).
+  // the LEFT pane's Preview tab (pick the note there).
   body.innerHTML = `<textarea class="md-editor" id="md-editor" spellcheck="false"></textarea>`;
   const ta = $('#md-editor', body);
   ta.value = state.activeNoteContent;
@@ -2010,9 +2870,13 @@ function renderNotebookBody() {
   ta.addEventListener('input', () => {
     state.activeNoteContent = ta.value;
     setSaveStatus('Unsaved changes', 'dirty');
-    // The left Preview tab shows the same notes.md — keep it live.
-    if (state.activeNoteName === 'notes.md') {
-      syncNotesMdCache(ta.value);
+    // Autosave (debounced): the Save button is gone — typing saves itself.
+    if (state.saveTimer) clearTimeout(state.saveTimer);
+    state.saveTimer = setTimeout(() => saveActiveMdNote(false), 800);
+    // The left Preview tab shows the same note when it is the previewed
+    // one — keep it live.
+    if (previewNoteName() === state.activeNoteName) {
+      if (state.activeNoteName === 'notes.md') syncNotesMdCache(ta.value);
       if (leftPreviewTimer) clearTimeout(leftPreviewTimer);
       leftPreviewTimer = setTimeout(() => renderLeftPreview(), 400);
     }
@@ -2123,10 +2987,9 @@ async function saveActiveMdNote(showStatus) {
       'PUT', { content });
     state.headings = headingsFromMarkdown(content);
     renderChapterPanel();
-    if (name === 'notes.md') {
-      syncNotesMdCache(content);
-      renderLeftPreview();
-    }
+    if (name === 'notes.md') syncNotesMdCache(content);
+    // Only the note being previewed refreshes the left Preview tab.
+    if (previewNoteName() === name) renderLeftPreview();
     if (showStatus) {
       const t = new Date();
       setSaveStatus(`Saved ${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`);
@@ -2164,24 +3027,48 @@ async function saveNotebook() {
 // One-click export of the master: the master IS a single file, so export
 // downloads the saved notes.md as `<slug>-notes.md`. (The editor may hold
 // unsaved typing — the export is the saved file, like a download.)
-async function exportNotesMaster() {
+/* Create a markdown note from the + menu: prompt for the name with a
+   prefilled first-free name; if the name already exists, open it instead
+   of overwriting. */
+async function createMdNote() {
+  const name = window.prompt('New markdown note name (ends with .md):',
+    firstFreeName(state.notes.map((n) => n.name), 'note', '.md'));
+  if (!name) return;
+  const clean = name.trim().endsWith('.md') ? name.trim() : `${name.trim()}.md`;
+  if (state.notes.some((n) => n.name === clean)) {
+    await loadNote(clean);
+    renderNotebookPane();
+    renderChapterPanel();
+    return;
+  }
   try {
-    const data = await apiGet(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/notes.md`);
-    const text = typeof data === 'string' ? data : (data.content ?? '');
-    downloadBlob(text, `${state.project.slug}-notes.md`);
-    setSaveStatus('Exported notes.md.');
+    await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/${encodeURIComponent(clean)}`,
+      'PUT', { content: `# ${clean.replace(/\.md$/, '')}\n` });
+    state.notes.push({ name: clean, kind: 'md' });
+    await loadNote(clean);
+    renderNotebookPane();
+    renderChapterPanel();
   } catch (err) {
-    setSaveStatus(`Export failed: ${err.message}`, 'error');
+    window.alert(`Could not create the note: ${err.message}`);
   }
 }
 
-async function createIpynbNote() {
-  const name = window.prompt('New notebook name (ends with .ipynb):', 'scratch.ipynb');
+/* Create a notebook of one language from the + menu. Language is stored
+   per notebook in metadata (kernelspec + language_info), so each kind is
+   one click — no language prompt. A name that already exists opens the
+   existing notebook instead of overwriting it. */
+async function createIpynbNote(lang = 'python') {
+  lang = RUNNABLE_LANGS.includes(lang) ? lang : 'python';
+  const name = window.prompt('New notebook name (ends with .ipynb):',
+    firstFreeName(state.notes.map((n) => n.name), `${lang}-scratch`, '.ipynb'));
   if (!name) return;
   const clean = name.trim().endsWith('.ipynb') ? name.trim() : `${name.trim()}.ipynb`;
-  let lang = window.prompt('Language (python, java, or javascript):', 'python');
-  lang = (lang || 'python').trim().toLowerCase();
-  if (!RUNNABLE_LANGS.includes(lang)) lang = 'python';
+  if (state.notes.some((n) => n.name === clean)) {
+    await loadNote(clean);
+    renderNotebookPane();
+    renderChapterPanel();
+    return;
+  }
   const nb = {
     cells: [{ cell_type: 'markdown', metadata: {}, source: [`# ${clean.replace(/\.ipynb$/, '')}\n`] }],
     metadata: { kernelspec: { display_name: lang, language: lang, name: lang }, language_info: { name: lang } },
@@ -2720,13 +3607,13 @@ function aiThread() {
 }
 
 /* The AI panel is its own column on the far right of the reader (AI mode
-   only — never open in Navigation or Focus). Head: two tabs (Note AI |
-   Code AI) + a close × that returns to Focus. Body: #ai-panel, rendered
+   only — never open in Navigation or Notetaking). Head: two tabs (Note AI |
+   Code AI) + a close × that returns to Notetaking. Body: #ai-panel, rendered
    by renderAiPanel. */
 function renderAiColumn() {
   const col = $('#ai-column', view);
   if (!col) return;
-  if (state.layoutMode !== 'ai') { col.hidden = true; return; }
+  if (!state.panels.ai) { col.hidden = true; return; }
   col.hidden = false;
   if (col.dataset.built !== '1') {
     col.dataset.built = '1';
@@ -2736,7 +3623,10 @@ function renderAiColumn() {
           <button type="button" class="ai-tab" data-ai-tab="note" role="tab">✨ Note AI</button>
           <button type="button" class="ai-tab" data-ai-tab="code" role="tab">Code AI</button>
         </div>
-        <button type="button" id="ai-close" title="Close the AI panel (back to Focus)">✕</button>
+        <button type="button" id="ai-close" title="Close the AI panel (back to Notetaking)">✕</button>
+      </div>
+      <div class="ai-model-row">
+        <label>Model <select id="ai-model" aria-label="AI model"></select></label>
       </div>
       <div class="ai-column-body" id="ai-panel"></div>`;
     $$('.ai-tab', col).forEach((btn) => {
@@ -2745,7 +3635,12 @@ function renderAiColumn() {
         renderAiColumn();
       });
     });
-    $('#ai-close', col).addEventListener('click', () => setLayoutMode('focus'));
+    $('#ai-close', col).addEventListener('click', () => toggleAiPanel());
+    $('#ai-model', col).addEventListener('change', (e) => {
+      state.aiModel = e.target.value || '';
+      try { window.localStorage.setItem(AI_MODEL_KEY, state.aiModel); } catch { /* ignore */ }
+    });
+    loadAiModels();
   }
   $$('.ai-tab', col).forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.aiTab === state.aiTab);
@@ -2753,10 +3648,48 @@ function renderAiColumn() {
   renderAiPanel();
 }
 
+/* The model picker (AV AiAssistant style): the server lists the models
+   the configured key can use (GET /api/llm/models, configured model
+   first); the choice is remembered in localStorage and sent with every
+   ai-note / ai-code request. Fetched once per page load. */
+async function loadAiModels() {
+  if (state.aiModelsLoaded) { syncAiModelSelect(); return; }
+  state.aiModelsLoaded = true;
+  try {
+    const data = await apiGet('/api/llm/models');
+    state.aiModels = Array.isArray(data?.models) ? data.models.map((m) => String(m.name || m)) : [];
+    // `configured` is a boolean on this endpoint; the configured model's
+    // name is `model`. (A boolean `true` once landed in the list as a
+    // bogus option — do not read the name from `configured`.)
+    if (data?.model && !state.aiModels.includes(data.model)) {
+      state.aiModels.unshift(data.model);
+    }
+  } catch {
+    state.aiModels = [];
+  }
+  syncAiModelSelect();
+}
+
+function syncAiModelSelect() {
+  const sel = $('#ai-model', view);
+  if (!sel) return;
+  const models = state.aiModels.length ? state.aiModels : (state.aiModel ? [state.aiModel] : []);
+  const current = state.aiModel || models[0] || '';
+  sel.innerHTML = models.map((m) => (
+    `<option value="${esc(m)}"${m === current ? ' selected' : ''}>${esc(String(m).replace(/^models\//, ''))}</option>`
+  )).join('');
+  if (!models.length) {
+    sel.innerHTML = '<option value="">No model configured</option>';
+    sel.disabled = true;
+  } else {
+    sel.disabled = false;
+  }
+}
+
 function renderAiPanel() {
   const panel = $('#ai-panel', view);
   if (!panel) return;
-  if (state.layoutMode !== 'ai') { panel.innerHTML = ''; panel.dataset.key = ''; return; }
+  if (!state.panels.ai) { panel.innerHTML = ''; panel.dataset.key = ''; return; }
   const key = `${state.aiTab}:${notebookKey()}`;
   if (panel.dataset.key !== key) {
     panel.dataset.key = key;
@@ -2897,7 +3830,7 @@ function renderAiCodeThread() {
 
 async function askAiCode() {
   const panel = $('#ai-panel', view);
-  if (!panel || state.layoutMode !== 'ai' || state.aiTab !== 'code') return;
+  if (!panel || !state.panels.ai || state.aiTab !== 'code') return;
   const input = $('#ai-code-prompt', panel);
   const statusEl = $('#ai-code-status', panel);
   const sendBtn = $('#ai-code-send', panel);
@@ -2941,6 +3874,7 @@ async function askAiCode() {
       page: reading ? reading.page : null,
       cells,
       history,
+      model: state.aiModel || undefined,
     });
     thread.messages.push({ role: 'assistant', content: '', code: res.code || '', explanation: res.explanation || '', applied: false });
     statusEl.textContent = res.chapter?.title ? `Drafted from “${res.chapter.title}”.` : 'Drafted.';
@@ -3031,7 +3965,7 @@ function renderAiThread() {
 
 async function askAi() {
   const panel = $('#ai-panel', view);
-  if (!panel || !state.aiPanelOpen) return;
+  if (!panel || !state.panels.ai) return;
   const input = $('#ai-prompt', panel);
   const statusEl = $('#ai-status', panel);
   const sendBtn = $('#ai-send', panel);
@@ -3059,6 +3993,7 @@ async function askAi() {
       history,
       source: reading && reading.sourceId !== PAGE_ANCHOR_SOURCE_BOOK ? reading.sourceId : null,
       page: reading ? reading.page : null,
+      model: state.aiModel || undefined,
     });
     thread.messages.push({ role: 'assistant', content: '', markdown: res.markdown || '', applied: false });
     const ctxLabel = res.chapter?.title || (res.source ? activeSourceLabel() : null);

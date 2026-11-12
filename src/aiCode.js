@@ -93,8 +93,8 @@ export function parseAiCodeResponse(raw) {
  * from resolveChapterRange / resolvePageRange (or null); `readingText` and
  * `notebookCells` are already capped by the caller.
  */
-export async function generateAiCode({ bookTitle, chapter, sourceLabel, page, readingText, notebookCells, prompt, history = [] }) {
+export async function generateAiCode({ bookTitle, chapter, sourceLabel, page, readingText, notebookCells, prompt, history = [], model } = {}) {
   const llmPrompt = buildAiCodePrompt({ bookTitle, chapter, sourceLabel, page, readingText, notebookCells, prompt, history });
-  const raw = await generateText(llmPrompt);
+  const raw = await generateText(llmPrompt, { model });
   return parseAiCodeResponse(raw);
 }

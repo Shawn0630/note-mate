@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { slugify, resolveProjectPath, parseNotebook } from './util.js';
 import { extractPdfText } from './pdftext.js';
 import { extractPdfOutline } from './pdfOutline.js';
-import { proposeProjectData, LLM_NOT_CONFIGURED } from './llm.js';
+import { proposeProjectData, LLM_NOT_CONFIGURED, listModels, isAllowedModel } from './llm.js';
 import { validateProposal } from './aiImport.js';
 import {
   generateAiNote, resolveChapterRange, resolvePageRange, extractChapterSection,
@@ -28,6 +28,10 @@ import {
   dropEmptySections, stripLabsBlock, foldChapterFiles,
   INDEX_FILE, LEGACY_NOTES_FILE, MIGRATED_BACKUP_FILE, CHAPTER_BACKUP_DIR,
 } from './masterNotes.js';
+import {
+  ANNOTATIONS_FILE, emptyAnnotationsDoc, parseAnnotationsDoc,
+  newAnnotationId, validateAnnotationInput,
+} from './annotations.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -714,6 +718,97 @@ app.put('/api/projects/:slug/notes/:name', async (req, res, next) => {
   }
 });
 
+// PDF annotations (highlight + note pin) — one per-project file,
+// `annotations.json` beside `notes/`. Separate from notes.md, so the
+// master-notes migration never touches them. Rendering is an overlay on
+// the pdf.js pages (never baked into the PDF file).
+async function readAnnotations(slug) {
+  const file = resolveProjectPath(DATA_DIR, slug, ANNOTATIONS_FILE);
+  try {
+    return parseAnnotationsDoc(await fsp.readFile(file, 'utf8'));
+  } catch (err) {
+    if (err.code === 'ENOENT') return emptyAnnotationsDoc();
+    throw err;
+  }
+}
+
+async function writeAnnotations(slug, doc) {
+  const file = resolveProjectPath(DATA_DIR, slug, ANNOTATIONS_FILE);
+  await fsp.writeFile(file, `${JSON.stringify(doc, null, 2)}\n`, 'utf8');
+}
+
+app.get('/api/projects/:slug/annotations', async (req, res, next) => {
+  try {
+    await readProject(req.params.slug);
+    const doc = await readAnnotations(req.params.slug);
+    res.json({ annotations: doc.annotations });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+app.post('/api/projects/:slug/annotations', async (req, res, next) => {
+  try {
+    await readProject(req.params.slug);
+    let fields;
+    try {
+      fields = validateAnnotationInput(req.body ?? {});
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    const now = new Date().toISOString();
+    const annotation = { id: newAnnotationId(), ...fields, createdAt: now, updatedAt: now };
+    const doc = await readAnnotations(req.params.slug);
+    doc.annotations.push(annotation);
+    await writeAnnotations(req.params.slug, doc);
+    res.status(201).json({ annotation });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+app.put('/api/projects/:slug/annotations/:id', async (req, res, next) => {
+  try {
+    await readProject(req.params.slug);
+    const doc = await readAnnotations(req.params.slug);
+    const idx = doc.annotations.findIndex((a) => a.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'annotation not found' });
+    let fields;
+    try {
+      // Validate the merged object so partial updates (e.g. text only) work.
+      fields = validateAnnotationInput({ ...doc.annotations[idx], ...(req.body ?? {}) });
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    const annotation = {
+      ...doc.annotations[idx], ...fields, updatedAt: new Date().toISOString(),
+    };
+    doc.annotations[idx] = annotation;
+    await writeAnnotations(req.params.slug, doc);
+    res.json({ annotation });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+app.delete('/api/projects/:slug/annotations/:id', async (req, res, next) => {
+  try {
+    await readProject(req.params.slug);
+    const doc = await readAnnotations(req.params.slug);
+    const idx = doc.annotations.findIndex((a) => a.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'annotation not found' });
+    doc.annotations.splice(idx, 1);
+    await writeAnnotations(req.params.slug, doc);
+    res.json({ deleted: true });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
 // Serve a project's cover image (written by POST .../cover).
 // The bookshelf uses this URL as the <img> src; 404 when the project
 // has no cover yet (the UI falls back to a title-letter tile).
@@ -886,6 +981,21 @@ function parseAiHistory(history) {
 }
 
 // ---------------------------------------------------------------------------
+// LLM models — the AI panel's model picker (same pattern as the AV's
+// /ai/models): the server reports which models the API key can use, the
+// client remembers the choice and sends it with each ai-note / ai-code
+// request. AI import keeps using the configured model.
+// ---------------------------------------------------------------------------
+
+app.get('/api/llm/models', async (req, res, next) => {
+  try {
+    res.json(await listModels());
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // On-demand AI notes — the user asks in plain language for markdown notes
 // based on the CURRENT chapter; the model returns a PROPOSAL and nothing is
 // written until the user presses Apply in the notebook pane (client-side,
@@ -899,9 +1009,13 @@ function parseAiHistory(history) {
 
 app.post('/api/projects/:slug/ai-note', async (req, res, next) => {
   try {
-    const { chapter, prompt, includeNote, history, source, page } = req.body ?? {};
+    const { chapter, prompt, includeNote, history, source, page, model } = req.body ?? {};
     if (typeof prompt !== 'string' || !prompt.trim()) {
       return res.status(400).json({ error: 'prompt (string) is required' });
+    }
+    if (model !== undefined && model !== null
+      && (typeof model !== 'string' || !(await isAllowedModel(model)))) {
+      return res.status(400).json({ error: 'model is not available for this API key' });
     }
     if (prompt.length > MAX_AI_NOTE_PROMPT_CHARS) {
       return res.status(400).json({ error: `prompt exceeds the ${MAX_AI_NOTE_PROMPT_CHARS}-character limit` });
@@ -936,6 +1050,7 @@ app.post('/api/projects/:slug/ai-note', async (req, res, next) => {
         noteSection,
         prompt: prompt.trim(),
         history: cleanHistory,
+        model: typeof model === 'string' && model.trim() ? model.trim() : undefined,
       });
     } catch (err) {
       if (err.code === LLM_NOT_CONFIGURED) {
@@ -966,9 +1081,13 @@ app.post('/api/projects/:slug/ai-note', async (req, res, next) => {
 
 app.post('/api/projects/:slug/ai-code', async (req, res, next) => {
   try {
-    const { chapter, prompt, notebook, source, page, cells, history } = req.body ?? {};
+    const { chapter, prompt, notebook, source, page, cells, history, model } = req.body ?? {};
     if (typeof prompt !== 'string' || !prompt.trim()) {
       return res.status(400).json({ error: 'prompt (string) is required' });
+    }
+    if (model !== undefined && model !== null
+      && (typeof model !== 'string' || !(await isAllowedModel(model)))) {
+      return res.status(400).json({ error: 'model is not available for this API key' });
     }
     if (prompt.length > MAX_AI_CODE_PROMPT_CHARS) {
       return res.status(400).json({ error: `prompt exceeds the ${MAX_AI_CODE_PROMPT_CHARS}-character limit` });
@@ -1011,6 +1130,7 @@ app.post('/api/projects/:slug/ai-code', async (req, res, next) => {
         notebookCells,
         prompt: prompt.trim(),
         history: cleanHistory,
+        model: typeof model === 'string' && model.trim() ? model.trim() : undefined,
       });
     } catch (err) {
       if (err.code === LLM_NOT_CONFIGURED) {
