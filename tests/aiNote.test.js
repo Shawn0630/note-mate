@@ -142,6 +142,20 @@ test('insertMarkdownUnderHeading: second Apply of the same block is a no-op', ()
   assert.equal(insertMarkdownUnderHeading(NOTES, 'Transformers', '  ').inserted, false);
 });
 
+test('insertMarkdownUnderHeading: heading created on demand carries its page anchor', () => {
+  // Missing heading + anchor: the new section is `##` + anchor + block.
+  const r = insertMarkdownUnderHeading(NOTES, 'New Chapter', '- fresh', '<!-- p. 91 -->');
+  assert.equal(r.inserted, true);
+  assert.match(r.text, /## New Chapter\n\n<!-- p\. 91 -->\n\n- fresh\n$/);
+  // Missing heading, no anchor: the old bare shape.
+  const bare = insertMarkdownUnderHeading(NOTES, 'New Chapter', '- fresh');
+  assert.match(bare.text, /## New Chapter\n\n- fresh\n$/);
+  // Existing heading: the anchor is NOT re-added (the section already has one).
+  const existing = insertMarkdownUnderHeading(NOTES, 'Transformers', '- a note', '<!-- p. 221 -->');
+  assert.equal(existing.inserted, true);
+  assert.equal((existing.text.match(/<!-- p\. 221 -->/g) || []).length, 0);
+});
+
 test('stripMarkdownFences + demoteHeadings', () => {
   assert.equal(stripMarkdownFences('```markdown\n# Hi\n```'), '# Hi');
   assert.equal(stripMarkdownFences('```\n- a\n```'), '- a');

@@ -9,20 +9,13 @@
    - GET    /api/projects/:slug/labs
    - GET    /api/projects/:slug/labs/:chapter/:name
    - PUT    /api/projects/:slug/labs/:chapter/:name   {content}
-   - GET    /api/projects/:slug/chapters
-   - POST   /api/projects/:slug/chapters  {title, page?} -> {chapter, chapters}
    - POST   /api/import/ai/propose   (multipart file + optional title)
    - POST   /api/import/ai/apply     (multipart file + proposal JSON + title)
    - GET    /api/projects/:slug/notes
    - GET    /api/projects/:slug/notes/:name
    - PUT    /api/projects/:slug/notes/:name   {content}
-     (index.md and notes.md are rejected: the index is app-maintained,
-     notes.md is legacy; chapter files return {name, content, chapter})
-   - POST   /api/projects/:slug/notes/migrate  -> {migrated, chapters}
-   - GET    /api/projects/:slug/notes/export   (one combined .md download)
    - POST   /api/projects/:slug/cover         {dataUrl}
-   - POST   /api/projects/:slug/chapter-map   {mapping} (kept for compat;
-     chapter resolution no longer uses chapterMap — see below)
+   - POST   /api/projects/:slug/chapter-map   {mapping}
    - POST   /api/projects/:slug/ai-note       {chapter?, prompt, includeNote?, history?}
                                               → {markdown, chapter, contextChars}
    - POST   /api/projects/:slug/export-cells  {notebook, name, cells:[indexes]}
@@ -32,17 +25,6 @@
    - POST   /api/execute                      {language, cells:[{source}]}
                                               → {results:[{stdout, stderr, exitCode, images, skipped}]}
                                               (run-all: one shared session; java unsupported)
-
-   Per-chapter notes (2026-11-11): notes live in one file per chapter
-   (notes/chapter-NN-slug.md) and the app owns a master index
-   (notes/index.md) with hyperlinks to each chapter file and its labs.
-   Chapters resolve by FILE — the old heading-index chapterMap is gone
-   for notes (a ### inside a chapter file can never shift another
-   chapter). Opening a chapter opens its file in the right pane; the
-   left Markdown preview tab renders that file (the index when no
-   chapter is active). "+ Note here", Ask AI Apply, and cell-export
-   Insert all write into the current chapter's file, before its
-   generated ### Labs block.
 */
 import * as pdfjsLib from './vendor/pdfjs/pdf.mjs';
 
@@ -82,13 +64,11 @@ const apiJson = (path, method, body) => api(path, {
 });
 
 /* Shared chapter <-> note-heading matching rule.
-   This is a verbatim port of normalizeHeading in src/util.js.
+   This is a verbatim port of normalizeHeading in src/util.js — the keys must
+   match the backend's chapterMap exactly (e.g. {"introduction": 0}).
    normalize: lowercase, strip leading "Chapter N:" / "Appendix A -" /
    numbering like "1.2 ", strip trailing dots, strip punctuation, collapse spaces.
-   Match exact, then startsWith/contains. Chapter resolution uses it to
-   match an outline title to a chapter file's `##` heading (the heading
-   carries its number, e.g. "12. Transformers" — the number is stripped
-   here, so it matches the outline's "Transformers"). */
+   Match exact, then startsWith/contains. */
 function normalizeHeading(text) {
   let s = String(text ?? '').toLowerCase().trim();
   // Leading "chapter 1:", "appendix a -", "part 2." etc.
@@ -115,9 +95,7 @@ function matchHeading(chapterTitle, headings) {
 }
 
 /* Extract ## / ### headings from markdown text.
-   Returns [{text, norm, line}] where line is the 0-based source line.
-   Used only by the AI-import preview (skeleton headings); chapter
-   navigation no longer reads headings — chapters are files. */
+   Returns [{text, norm, line}] where line is the 0-based source line. */
 function headingsFromMarkdown(text) {
   const out = [];
   String(text || '').split('\n').forEach((line, i) => {
@@ -127,14 +105,26 @@ function headingsFromMarkdown(text) {
   return out;
 }
 
-/* A per-chapter file name: chapter-NN-slug.md. */
-function isChapterFileName(name) {
-  return /^chapter-\d+-.+\.md$/i.test(String(name ?? ''));
+/* ## headings only — the chapterMap index space. ### sub-headings (e.g. an
+   AI note's "### Attention in one line") sit inside a ## section and must
+   never shift the chapter indexes: the seeded map counts ## headings
+   (0–20 for 21 chapters), and a ### inserted mid-file used to push every
+   later chapter one early in notebook follow. Headings without a recorded
+   level count as ##. */
+function h2Headings(headings) {
+  return (headings || []).filter((h) => (h.level ?? 2) === 2);
 }
 
-/* The lab group dir for a chapter number: chapter 12 -> "Chap12". */
-function labGroupForChapterNumber(n) {
-  return n == null ? null : `Chap${String(n).padStart(2, '0')}`;
+/* Headings from an ipynb notebook object (markdown cells only). */
+function headingsFromNotebook(nb) {
+  const out = [];
+  if (!nb || !Array.isArray(nb.cells)) return out;
+  nb.cells.forEach((cell, ci) => {
+    if (cell.cell_type !== 'markdown') return;
+    const src = Array.isArray(cell.source) ? cell.source.join('') : String(cell.source || '');
+    headingsFromMarkdown(src).forEach((h) => out.push({ ...h, cellIndex: ci }));
+  });
+  return out;
 }
 
 function kindLabel(kind) {
@@ -204,11 +194,9 @@ const state = {
   // there (the rendered preview lives in the LEFT pane's Preview tab).
   follow: true,         // scroll-spy follow toggle
   editorFocused: false,
-  mdDirty: false,       // the active markdown note has unsaved edits
+  headings: [],         // headings of the active note
   outline: [],          // [{title, page, depth}] for PDFs
-  // Per-chapter notes: [{number, title, page, file, labs}] from GET
-  // .../:slug (chapters resolve by FILE — no heading-index map anymore).
-  chapters: [],
+  chapterMap: {},       // normalized outline title -> note heading index (user override)
   activeChapter: null,  // normalized chapter title currently active
   pdfDoc: null,
   pdfPages: [],         // [{num, top}] measured offsets in the pdf container
@@ -225,7 +213,7 @@ const state = {
   navVisible: false,    // manual nav state within the current mode
   // Left (reading) pane tabs — PDF projects only. pdf = the book PDF,
   // slides = the current chapter's slide deck, preview = the rendered
-  // chapter file (or the master index when no chapter is active).
+  // notes.md preview following the current chapter.
   leftTab: 'pdf',       // 'pdf' | 'slides' | 'preview'
   // The deck PDF shown in the Slides tab lives in its own container so
   // each tab keeps its scroll position (the book PDF is never unloaded).
@@ -234,9 +222,7 @@ const state = {
   deckContainer: null,
   deckMaterialId: null, // material id of the deck currently shown
   deckChapter: null, // normalized chapter the current deck was chosen for (see loadDeckPdf)
-  noteCache: {},        // md note name -> last-known text (left Preview tab)
-  previewFile: null,    // the file the left Preview tab last rendered
-  showIndex: false,     // the left Preview tab shows notes/index.md
+  notesMdContent: null, // cached notes.md text for the left Preview tab
   // Multi-source reader (v1.1): materials[] from GET .../materials.
   // activeSourceId null = the project's main (Book) source. It mirrors the
   // left tab (pdf -> null, slides -> the deck id) so the chapter panel's
@@ -282,9 +268,9 @@ function resetReaderState() {
   state.activeNoteKind = null;
   state.activeNoteContent = '';
   state.activeNotebook = null;
-  state.mdDirty = false;
+  state.headings = [];
   state.outline = [];
-  state.chapters = [];
+  state.chapterMap = {};
   state.activeChapter = null;
   state.pdfDoc = null;
   state.pdfPages = [];
@@ -300,9 +286,7 @@ function resetReaderState() {
   state.deckContainer = null;
   state.deckMaterialId = null;
   state.deckChapter = null;
-  state.noteCache = {};
-  state.previewFile = null;
-  state.showIndex = false;
+  state.notesMdContent = null;
   state.materials = [];
   state.activeSourceId = null;
   state.labs = [];
@@ -737,9 +721,8 @@ async function openProject(slug) {
     return;
   }
   state.project = project;
-  // Per-chapter notes: [{number, title, page, file, labs}] — the GET
-  // already migrated a legacy notes.md (see the backend).
-  state.chapters = Array.isArray(project.chapters) ? project.chapters : [];
+  state.chapterMap = (project.chapterMap && typeof project.chapterMap === 'object')
+    ? project.chapterMap : {};
 
   try {
     const notes = await apiGet(`/api/projects/${encodeURIComponent(slug)}/notes`);
@@ -765,10 +748,8 @@ async function openProject(slug) {
     state.labs = [];
   }
 
-  // Default note: the first chapter's file when there are chapters,
-  // else the first markdown note, else the first note.
-  const firstChapter = (state.chapters || [])[0];
-  const def = (firstChapter && state.notes.find((n) => n.name === firstChapter.file))
+  // Default note: notes.md if present, else the first note.
+  const def = state.notes.find((n) => n.name === 'notes.md')
     || state.notes.find((n) => n.kind === 'md')
     || state.notes[0];
   if (def) {
@@ -925,8 +906,7 @@ async function renderReadingPane() {
   if (kind === 'pdf') {
     // Tabbed reading pane: PDF | Slides | Markdown preview. The book PDF
     // and the deck PDF live in separate containers so each tab keeps its
-    // scroll position; the preview renders the current chapter's file
-    // (or the master index when no chapter is active).
+    // scroll position; the preview renders notes.md for the current chapter.
     pane.innerHTML = `
       <div class="reading-tabs" id="reading-tabs" role="tablist" aria-label="Reading">
         <button type="button" class="reading-tab${state.leftTab === 'pdf' ? ' active' : ''}" data-left-tab="pdf" role="tab">PDF</button>
@@ -945,7 +925,6 @@ async function renderReadingPane() {
           <div class="reading-scroll" id="deck-scroll"><p class="reading-note">${state.materials.length ? 'Open the Slides tab to read a deck.' : 'No slide decks in this project.'}</p></div>
         </div>
         <div class="reading-tab-panel" id="panel-preview" ${state.leftTab === 'preview' ? '' : 'hidden'}>
-          <div class="preview-crumb" id="preview-crumb"></div>
           <div class="reading-scroll" id="left-preview-scroll"><div class="md-preview" id="left-md-preview"></div></div>
         </div>
       </div>`;
@@ -1053,7 +1032,7 @@ function applyLeftTab() {
     }
     measureDeckPages();
   }
-  if (state.leftTab === 'preview') renderLeftPreview();
+  if (state.leftTab === 'preview') renderLeftPreview({ follow: true });
 }
 
 /* The page the user is reading, as a page-anchor {sourceId, page}:
@@ -1388,17 +1367,18 @@ function currentPdfPage() {
 
 function chapterForPage(pageNum) {
   // Resolve to the CHAPTER containing the page — a depth-0 outline entry —
-  // never a subsection (depth 1+): subsections have no chapter file, so
-  // settling on one would strand note-follow, page anchors and AI
+  // never a subsection (depth 1+): subsections have no notes.md section,
+  // so settling on one would strand note-follow, page anchors and AI
   // context ("Momentum" at p.100 instead of "Fitting models"). Entries
-  // that resolve to a chapter file (by title or page) are the chapters;
+  // with a chapterMap match (a ## heading in notes.md) are the chapters;
   // front matter (Preface, Acknowledgements) and appendices (Notation,
-  // Bibliography, Index) are skipped. When no entry resolves — e.g. an
+  // Bibliography, Index) are skipped. When the map is empty — e.g. an
   // uploaded PDF whose headings never matched — any depth-0 entry counts.
   // Before the first chapter (cover / front matter) the first chapter is
   // current, so the note/AI context is never empty on the opening pages.
+  const map = state.chapterMap || {};
   const mapped = state.outline.filter((ch) => ch.depth === 0 && ch.page != null
-    && resolvedChapter(ch) !== null);
+    && Object.prototype.hasOwnProperty.call(map, normalizeHeading(ch.title)));
   const pool = mapped.length
     ? mapped
     : state.outline.filter((ch) => ch.depth === 0 && ch.page != null);
@@ -1437,11 +1417,6 @@ function onPdfScroll() {
   if (ch && normalizeHeading(ch.title) !== state.activeChapter) {
     setActiveChapter(ch, { scrollNotebook: true });
   }
-  // The button advertises the page being read: refresh it on every scroll,
-  // not only on chapter changes — otherwise a manual scroll inside the
-  // same chapter leaves it showing the old page (the deck scroll already
-  // does this; the book scroll did not).
-  updatePageNoteButton();
 }
 
 async function generateCover(pdf) {
@@ -1464,49 +1439,19 @@ async function generateCover(pdf) {
 
 /* ---------------- chapter panel ---------------- */
 
-/* Resolve an outline chapter (or a chapter title) to its chapter file:
-   the entry in state.chapters [{number, title, page, file, labs}].
-   Title match first (normalized — the file's `##` heading carries its
-   number, e.g. "12. Transformers", which normalizes to the outline's
-   "Transformers"), then page match (so a renamed heading still resolves
-   by its `<!-- p. N -->` comment). Null when the chapter has no file yet. */
-function resolvedChapter(chapter) {
-  const list = state.chapters || [];
-  const title = typeof chapter === 'string' ? chapter : chapter?.title;
-  const page = typeof chapter === 'object' ? chapter?.page : null;
-  if (title) {
-    const norm = normalizeHeading(title);
-    if (norm) {
-      const byTitle = list.find((c) => normalizeHeading(c.title) === norm);
-      if (byTitle) return byTitle;
-    }
+function resolvedChapterHeading(chapter) {
+  // User override (chapterMap) wins; otherwise the shared matching rule.
+  // Canonical backend shape: { "<normalized outline title>": <heading index> },
+  // e.g. {"introduction": 0, "supervised learning": 1, ...}. Lookup order:
+  // chapterMap[normalizeHeading(title)] (if in range) -> auto-match -> null.
+  // The index counts ## headings only (h2Headings): ### sub-headings must
+  // not shift it — see h2Headings.
+  const h2 = h2Headings(state.headings);
+  const override = state.chapterMap[normalizeHeading(chapter.title)];
+  if (typeof override === 'number' && h2[override]) {
+    return h2[override];
   }
-  if (Number.isInteger(page)) {
-    const byPage = list.find((c) => c.page === page);
-    if (byPage) return byPage;
-  }
-  return null;
-}
-
-/* The chapter file the reader is on (null when no chapter is active). */
-function currentChapterFile() {
-  const ch = activeOutlineChapter();
-  if (ch) {
-    const entry = resolvedChapter(ch);
-    if (entry) return entry.file;
-  }
-  // No outline chapter: the active note when it is a chapter file, else
-  // the first chapter (a video project still has chapters to preview).
-  if (state.activeTabKind === 'note' && isChapterFileName(state.activeNoteName)) {
-    return state.activeNoteName;
-  }
-  return (state.chapters || [])[0]?.file ?? null;
-}
-
-/* The chapter entry the reader is on (null when no chapter is active). */
-function currentChapterEntry() {
-  const file = currentChapterFile();
-  return file ? (state.chapters || []).find((c) => c.file === file) ?? null : null;
+  return matchHeading(chapter.title, h2);
 }
 
 function renderChapterPanel() {
@@ -1516,16 +1461,26 @@ function renderChapterPanel() {
 
   // A slide deck has no PDF outline of its own: when the active source's PDF
   // yields no outline, state.outline is empty and this falls through to the
-  // chapter-files nav below — nothing is invented.
+  // note-headings nav below — nothing is invented.
   const sourceNote = state.activeSourceId
     ? `<p class="chapter-source">Source: ${esc(activeSourceLabel())}</p>` : '';
 
   if (kind === 'pdf' && state.outline.length) {
     panel.innerHTML = `<h2>Chapters</h2>${sourceNote}` + state.outline.map((ch, i) => {
+      const matched = resolvedChapterHeading(ch);
       const isActive = state.activeChapter === normalizeHeading(ch.title);
       const indent = ch.depth ? ` style="padding-left:${16 + ch.depth * 14}px"` : '';
-      return `<button type="button" class="chapter-row${isActive ? ' active' : ''}"
-          data-chapter="${i}" data-chapter-title="${esc(normalizeHeading(ch.title))}"${indent}>${esc(ch.title)}${ch.page != null ? `<span class="chapter-page">p. ${ch.page}</span>` : ''}</button>`;
+      let row = `<button type="button" class="chapter-row${isActive ? ' active' : ''}"
+          data-chapter="${i}"${indent}>${esc(ch.title)}${ch.page != null ? `<span class="chapter-page">p. ${ch.page}</span>` : ''}</button>`;
+      if (!matched) {
+        row += `<div class="chapter-link">
+          <select data-link-chapter="${i}" aria-label="Link chapter to a note heading">
+            <option value="">Link to a note heading…</option>
+            ${h2Headings(state.headings).map((h, hi) => `<option value="${hi}">${esc(h.text)}</option>`).join('')}
+          </select>
+        </div>`;
+      }
+      return row;
     }).join('');
 
     $$('.chapter-row', panel).forEach((btn) => {
@@ -1534,32 +1489,48 @@ function renderChapterPanel() {
         setActiveChapter(ch, { scrollNotebook: true, scrollPdf: true, force: true });
       });
     });
+    $$('select[data-link-chapter]', panel).forEach((sel) => {
+      sel.addEventListener('change', async () => {
+        const ch = state.outline[Number(sel.dataset.linkChapter)];
+        if (sel.value === '' || !ch) return;
+        state.chapterMap[normalizeHeading(ch.title)] = Number(sel.value);
+        try {
+          await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/chapter-map`,
+            'POST', { mapping: state.chapterMap });
+        } catch {
+          // Keep the local mapping even if the save failed; it still works this visit.
+        }
+        renderChapterPanel();
+      });
+    });
     return;
   }
 
-  // No PDF outline (or not a PDF): the chapter files are the nav.
-  const chapters = state.chapters || [];
-  panel.innerHTML = `<h2>Chapters</h2>${sourceNote}` +
-    (chapters.length
-      ? chapters.map((c) => `
-          <button type="button" class="chapter-row${state.activeChapter === normalizeHeading(c.title) ? ' active' : ''}"
-            data-chapter-title="${esc(normalizeHeading(c.title))}">${esc(c.title)}${c.page != null ? `<span class="chapter-page">p. ${c.page}</span>` : ''}</button>`).join('')
-      : `<p class="chapter-empty">No chapters yet — add a note and it will
-         show up here as navigation.</p>`);
+  // No PDF outline (or not a PDF): the note's ## headings are the nav.
+  const headings = state.headings;
+  panel.innerHTML = `<h2>${kind === 'pdf' ? 'Headings' : 'Notes'}</h2>${sourceNote}` +
+    (headings.length
+      ? headings.map((h, i) => `
+          <button type="button" class="chapter-row${state.activeChapter === h.norm ? ' active' : ''}"
+            data-heading="${i}">${esc(h.text)}</button>`).join('')
+      : `<p class="chapter-empty">No headings yet — add a <code>## Heading</code>
+         to your note and it will show up here as navigation.</p>`);
   $$('.chapter-row', panel).forEach((btn) => {
     btn.addEventListener('click', () => {
-      const entry = (state.chapters || []).find((c) => normalizeHeading(c.title) === btn.dataset.chapterTitle);
-      if (!entry) return;
-      setActiveChapter(entry, { scrollNotebook: true, force: true });
+      const h = state.headings[Number(btn.dataset.heading)];
+      state.activeChapter = h.norm;
+      $$('.chapter-row', panel).forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      scrollNotebookToHeading(h, true);
     });
   });
 }
 
-async function setActiveChapter(chapter, { scrollNotebook = false, scrollPdf = false, force = false } = {}) {
+function setActiveChapter(chapter, { scrollNotebook = false, scrollPdf = false, force = false } = {}) {
   state.activeChapter = normalizeHeading(chapter.title);
-  state.showIndex = false; // a chapter change shows the chapter, not the index
   $$('#chapter-panel .chapter-row').forEach((row) => {
-    row.classList.toggle('active', row.dataset.chapterTitle === state.activeChapter);
+    const idx = Number(row.dataset.chapter);
+    row.classList.toggle('active', !Number.isNaN(idx) && state.outline[idx] === chapter);
   });
   if (scrollPdf && chapter.page != null && state.pdfContainer) {
     const pg = state.pdfPages.find((p) => p.num === chapter.page);
@@ -1577,54 +1548,14 @@ async function setActiveChapter(chapter, { scrollNotebook = false, scrollPdf = f
       state.pdfContainer.scrollTo({ top, behavior: 'smooth' });
     }
   }
-  if (scrollNotebook) await followChapterFile(chapter, force);
+  if (scrollNotebook) {
+    const heading = resolvedChapterHeading(chapter);
+    scrollNotebookToHeading(heading, force); // null -> leave the notebook alone
+  }
   updateAiContext(); // keep the Ask AI panel's context line live
   updatePageNoteButton(); // the "+ Note here" button follows the page
   followDeckToChapter(chapter);
-  followLabsToChapter(chapter);
-  renderLeftPreview(); // the preview renders the chapter's file
-}
-
-/* Follow the chapter in the notebook pane: open the chapter's file.
-   An explicit chapter click (force) always opens the file. The scroll-spy
-   (not force) only switches when the user is already in a chapter file —
-   a lab or a standalone note is never yanked away by scrolling — and
-   never while the editor is focused or Follow is off. A chapter with no
-   file yet gets one created on demand (explicit click only). Unsaved
-   edits in the current markdown note are saved first so following never
-   drops them. */
-async function followChapterFile(chapter, force) {
-  const entry = resolvedChapter(chapter);
-  if (!entry) {
-    if (!force) return;
-    try {
-      const created = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/chapters`,
-        'POST', { title: chapter.title, page: chapter.page ?? null });
-      if (Array.isArray(created.chapters)) state.chapters = created.chapters;
-      if (created.chapter) await openChapterFile(created.chapter);
-    } catch {
-      // Leave the pane alone — the chapter still has no file.
-    }
-    return;
-  }
-  if (!force) {
-    if (!state.follow || state.editorFocused) return;
-    if (!(state.activeTabKind === 'note' && isChapterFileName(state.activeNoteName))) return;
-  }
-  if (state.activeTabKind === 'note' && state.activeNoteName === entry.file) return;
-  await openChapterFile(entry);
-}
-
-async function openChapterFile(entry) {
-  if (state.activeTabKind === 'note' && state.activeNoteKind === 'md' && state.mdDirty) {
-    await saveActiveMdNote(false);
-  }
-  try {
-    await loadNote(entry.file);
-  } catch {
-    return;
-  }
-  renderNotebookPane();
+  scrollLeftPreviewToChapter();
 }
 
 /* The Slides tab follows the chapter: when the chapter has its own deck,
@@ -1640,69 +1571,85 @@ function followDeckToChapter(chapter) {
   ensureDeckLoaded(deck.id);
 }
 
-/* The Labs section follows the chapter: the chapter's lab group expands
-   (ChapNN from the chapter file's number) so its labs are visible. The
-   notebook pane is never scrolled — expanding is enough. */
-function followLabsToChapter(chapter) {
-  const entry = resolvedChapter(chapter);
-  const group = labGroupForChapterNumber(entry?.number ?? null);
-  if (!group || !state.labs.some((g) => g.chapter === group)) return;
-  if (state.labsOpenChapters[group]) return;
-  state.labsOpenChapters[group] = true;
-  renderLabsSection();
+/* The Labs section never follows the chapter: the index lists the labs and
+   the user chooses which one to open by clicking it. No chapter click,
+   scroll-spy move, or tab change ever opens, switches, or expands a lab. */
+
+/* Keep the cached notes.md text fresh (the left Preview tab renders from
+   it when the active right tab is not notes.md). */
+function syncNotesMdCache(text) {
+  state.notesMdContent = typeof text === 'string' ? text : null;
 }
 
-/* Keep the cached note text fresh (the left Preview tab renders from it
-   when the active right tab is not the previewed file). */
-function syncNoteCache(name, text) {
-  if (typeof name === 'string') state.noteCache[name] = typeof text === 'string' ? text : null;
-}
-
-/* Render the left Preview tab: the current chapter's file, or the master
-   index when no chapter is active (or the user picked Index in the crumb).
-   The preview keeps its scroll position across re-renders of the SAME file;
-   a different file scrolls to the top. The crumb above it links back to
-   the index. */
-async function renderLeftPreview() {
+/* Render the left Preview tab from notes.md: the active note's content
+   when notes.md is open, else the cached text, fetched lazily. The preview
+   keeps its scroll position across re-renders; with follow=true it scrolls
+   to the current chapter once (tab open), never on content updates. */
+async function renderLeftPreview({ follow = false } = {}) {
   const el = $('#left-md-preview', view);
   if (!el) return;
-  const file = (state.showIndex || !currentChapterFile()) ? 'index.md' : currentChapterFile();
   let text;
-  if (state.activeTabKind === 'note' && state.activeNoteName === file) {
+  if (state.activeTabKind === 'note' && state.activeNoteName === 'notes.md') {
     text = state.activeNoteContent;
-  } else if (state.noteCache[file] != null) {
-    text = state.noteCache[file];
+  } else if (state.notesMdContent != null) {
+    text = state.notesMdContent;
   } else {
     try {
-      const data = await apiGet(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/${encodeURIComponent(file)}`);
+      const data = await apiGet(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/notes.md`);
       text = typeof data === 'string' ? data : (data.content ?? '');
-      state.noteCache[file] = text;
+      state.notesMdContent = text;
     } catch {
       text = '';
     }
   }
-  const changed = state.previewFile !== file;
   renderMdPreview(el, text);
-  state.previewFile = file;
-  if (changed) {
-    const scroll = $('#left-preview-scroll', view);
-    if (scroll) scroll.scrollTop = 0;
-  }
-  const crumb = $('#preview-crumb', view);
-  if (crumb) {
-    if (file === 'index.md') {
-      crumb.innerHTML = `<span class="preview-crumb-here">Index</span>`;
-    } else {
-      const entry = (state.chapters || []).find((c) => c.file === file);
-      crumb.innerHTML = `<button type="button" class="preview-crumb-link" id="preview-crumb-index">Index</button><span class="preview-crumb-sep"> › </span><span>${esc(entry ? entry.title : file)}</span>`;
-      $('#preview-crumb-index', crumb).addEventListener('click', () => {
-        state.showIndex = true;
-        renderLeftPreview();
-      });
-    }
-  }
+  if (follow) scrollLeftPreviewToChapter(false);
 }
 
+/* Scroll the left Preview tab to the current chapter's heading. */
+function scrollLeftPreviewToChapter(smooth = true) {
+  const scroll = $('#left-preview-scroll', view);
+  const el = $('#left-md-preview', view);
+  if (!scroll || !el) return;
+  const ch = activeOutlineChapter();
+  if (!ch) return;
+  const heading = resolvedChapterHeading(ch);
+  if (!heading) return;
+  const target = el.querySelector(`[data-h="${CSS.escape(heading.norm)}"]`);
+  if (!target) return;
+  target.scrollIntoView({ behavior: smooth ? 'smooth' : 'auto', block: 'start' });
+}
+
+/* Scroll the notebook pane to a heading.
+   Guards: never while the markdown editor textarea is focused (user typing),
+   and never while the Follow toggle is off — except for explicit chapter clicks,
+   which pass force=true.
+   A heading with no match never scrolls the notebook: top-of-note is never a
+   useful destination, so a null heading (or a heading with no element in the
+   rendered note) leaves the notebook exactly where it is. */
+function scrollNotebookToHeading(heading, force = false) {
+  if (!force) {
+    if (!state.follow) return;
+    if (state.editorFocused) return;
+  }
+  if (!heading) return;
+  const body = $('.notebook-body', view);
+  if (!body) return;
+
+  if (state.activeNoteKind === 'ipynb') {
+    const el = body.querySelector(`[data-h="${CSS.escape(heading.norm)}"]`);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return;
+  }
+
+  // Edit mode: scroll the textarea so the heading line is visible.
+  const ta = $('.md-editor', body);
+  if (!ta) return;
+  const lines = ta.value.split('\n');
+  const idx = Math.min(heading.line ?? 0, lines.length - 1);
+  const lineHeight = 22; // 13.5px font * 1.65 line-height
+  ta.scrollTop = Math.max(0, idx * lineHeight - 40);
+}
 
 /* ---------------- notebook ---------------- */
 
@@ -1716,13 +1663,15 @@ async function loadNote(name) {
   state.activeNoteKind = name.toLowerCase().endsWith('.ipynb') ? 'ipynb' : 'md';
   state.activeNoteContent = content;
   state.activeNotebook = null;
-  state.mdDirty = false;
-  syncNoteCache(name, content);
+  if (name === 'notes.md') syncNotesMdCache(content);
   if (state.activeNoteKind === 'ipynb') {
     try { state.activeNotebook = JSON.parse(content || '{"cells":[]}'); }
     catch { state.activeNotebook = { cells: [], metadata: {}, nbformat: 4, nbformat_minor: 5 }; }
     if (!Array.isArray(state.activeNotebook.cells)) state.activeNotebook.cells = [];
+    state.headings = headingsFromNotebook(state.activeNotebook);
     resetExecCounter();
+  } else {
+    state.headings = headingsFromMarkdown(content);
   }
 }
 
@@ -1753,20 +1702,12 @@ function renderNotebookPane() {
     const tab = document.createElement('button');
     tab.type = 'button';
     tab.className = `note-tab${state.activeTabKind === 'note' && n.name === state.activeNoteName ? ' active' : ''}`;
-    // A chapter file shows its chapter title; the filename is the tooltip.
-    const chapter = (state.chapters || []).find((c) => c.file === n.name);
-    tab.textContent = chapter ? chapter.title : n.name;
-    tab.title = n.name;
+    tab.textContent = n.name;
     tab.addEventListener('click', async () => {
       if (state.activeTabKind === 'note' && n.name === state.activeNoteName) return;
       await loadNote(n.name);
       renderNotebookPane();
-      // Opening a chapter file makes it the current chapter (same rule as
-      // an index link): the preview, the AI context and the "+ Note here"
-      // button follow the file. A plain note leaves the chapter alone.
-      const entry = (state.chapters || []).find((c) => c.file === n.name);
-      if (entry) await setActiveChapter(entry, { scrollNotebook: true });
-      else renderChapterPanel();
+      renderChapterPanel();
     });
     tabs.appendChild(tab);
   });
@@ -1794,12 +1735,6 @@ function renderNotebookPane() {
     });
     tabs.appendChild(tab);
   });
-  const addMd = document.createElement('button');
-  addMd.type = 'button';
-  addMd.className = 'note-tab-add';
-  addMd.textContent = '+ Note';
-  addMd.addEventListener('click', createMdNote);
-  tabs.appendChild(addMd);
   const addNb = document.createElement('button');
   addNb.type = 'button';
   addNb.className = 'note-tab-add';
@@ -1921,6 +1856,7 @@ async function loadLab(chapter, name) {
   try { state.activeNotebook = JSON.parse(content || '{"cells":[]}'); }
   catch { state.activeNotebook = { cells: [], metadata: {}, nbformat: 4, nbformat_minor: 5 }; }
   if (!Array.isArray(state.activeNotebook.cells)) state.activeNotebook.cells = [];
+  state.headings = headingsFromNotebook(state.activeNotebook);
   resetExecCounter();
 }
 
@@ -1932,8 +1868,7 @@ async function closeLabTab(lab) {
   const wasActive = state.activeTabKind === 'lab' && state.activeLab
     && state.activeLab.chapter === lab.chapter && state.activeLab.name === lab.name;
   if (!wasActive) { renderNotebookPane(); return; }
-  const firstChapter = (state.chapters || [])[0];
-  const def = (firstChapter && state.notes.find((n) => n.name === firstChapter.file))
+  const def = state.notes.find((n) => n.name === 'notes.md')
     || state.notes.find((n) => n.kind === 'md')
     || state.notes[0];
   if (def) {
@@ -1945,6 +1880,7 @@ async function closeLabTab(lab) {
     state.activeNoteKind = 'md';
     state.activeNoteContent = '';
     state.activeNotebook = null;
+    state.headings = [];
   }
   renderNotebookPane();
   renderChapterPanel();
@@ -1958,12 +1894,12 @@ function renderNotebookToolbar() {
       <button type="button" id="md-preview-btn" title="Open the rendered preview in the left pane">Preview</button>
       <button type="button" id="ai-toggle" class="${state.aiPanelOpen ? 'active' : ''}" title="Ask the AI to draft markdown notes from the current chapter — a proposal, never a silent write">✨ Ask AI</button>
       <button type="button" id="page-note-btn" title="Add a note anchored at the page being read">+ Note here</button>
-      <label class="follow-toggle" title="Follow the reading pane: open the current chapter's file">
+      <label class="follow-toggle" title="Follow the reading pane: scroll the notebook to the current chapter">
         <input type="checkbox" id="follow-toggle" ${state.follow ? 'checked' : ''}> Follow
       </label>
       <span class="spacer"></span>
       <span class="save-status" id="save-status"></span>
-      <button type="button" id="notes-export-btn" title="Download all chapter notes as one combined .md file">Export notes</button>
+      <button type="button" id="nb-export-notes" title="Download the master notes.md">Export notes</button>
       <button type="button" id="md-save-btn">Save</button>`;
     // Preview opens the LEFT pane's Markdown preview tab (the one preview);
     // the right pane stays in Edit mode.
@@ -1974,14 +1910,16 @@ function renderNotebookToolbar() {
     bar.innerHTML = `
       <button type="button" id="ai-toggle" class="${state.aiPanelOpen ? 'active' : ''}" title="Ask the AI to draft markdown notes from the current chapter — a proposal, never a silent write">✨ Ask AI</button>
       <button type="button" id="page-note-btn" title="Add a note anchored at the page being read">+ Note here</button>
-      <label class="follow-toggle" title="Follow the reading pane: open the current chapter's file">
+      <label class="follow-toggle" title="Follow the reading pane: scroll the notebook to the current chapter">
         <input type="checkbox" id="follow-toggle" ${state.follow ? 'checked' : ''}> Follow
       </label>
       <span class="spacer"></span>
-      <button type="button" id="notes-export-btn" title="Download all chapter notes as one combined .md file">Export notes</button>
-      <span class="save-status" id="save-status"></span>`;
+      <span class="save-status" id="save-status"></span>
+      <button type="button" id="nb-export-notes" title="Download the master notes.md">Export notes</button>`;
     $('#follow-toggle', bar).addEventListener('change', (e) => { state.follow = e.target.checked; });
   }
+  const exportBtn = $('#nb-export-notes', bar);
+  if (exportBtn) exportBtn.addEventListener('click', exportNotesMaster);
   const aiBtn = $('#ai-toggle', bar);
   if (aiBtn) {
     // The ✨ Ask AI toggle and the AI mode button are the same action:
@@ -1995,8 +1933,6 @@ function renderNotebookToolbar() {
     pageBtn.addEventListener('click', addNoteAtCurrentPage);
     updatePageNoteButton();
   }
-  const exportBtn = $('#notes-export-btn', bar);
-  if (exportBtn) exportBtn.addEventListener('click', exportNotesCombined);
 }
 
 /* The "+ Note here" button (notebook toolbar) is enabled exactly when the
@@ -2008,27 +1944,28 @@ function updatePageNoteButton() {
   const reading = currentReadingPage();
   btn.disabled = !reading;
   btn.title = reading
-    ? `Add a note anchored at ${reading.sourceId === PAGE_ANCHOR_SOURCE_BOOK ? `p. ${reading.page}` : `slide ${reading.page}`} — it lands in this chapter's note file`
+    ? `Add a note anchored at ${reading.sourceId === PAGE_ANCHOR_SOURCE_BOOK ? `p. ${reading.page}` : `slide ${reading.page}`} — it lands under this chapter in notes.md`
     : 'No page here — switch to the PDF or Slides tab to anchor a note';
 }
 
 /* Add a note anchored at the page being read: insert the anchor comment
-   into the current chapter's file (before its generated ### Labs block;
-   create the chapter file on demand), then open that file in the editor
-   with the cursor on the line after the anchor so the user can type the
-   note right there. */
+   under the current chapter's ## heading in notes.md (end of the section;
+   create the heading if missing — same rule as Ask AI Apply), then open
+   notes.md in the editor with the cursor on the line after the anchor so
+   the user can type the note right there. */
 async function addNoteAtCurrentPage() {
   const reading = currentReadingPage();
   if (!reading) return;
-  const entry = currentChapterEntry();
+  const ch = activeOutlineChapter();
+  const heading = ch ? ch.title : 'AI notes';
   const anchor = formatPageAnchor({ page: reading.page, sourceId: reading.sourceId });
-  const { inserted, file } = await insertIntoChapterFile(entry, anchor);
+  const { inserted } = await insertIntoNotesMd(heading, anchor, chapterPageAnchor(ch));
   if (!inserted) {
     setSaveStatus('A note is already anchored here — nothing added.');
     return;
   }
-  if (!(state.activeTabKind === 'note' && state.activeNoteName === file)) {
-    try { await loadNote(file); } catch { /* pane renders empty */ }
+  if (!(state.activeTabKind === 'note' && state.activeNoteName === 'notes.md')) {
+    try { await loadNote('notes.md'); } catch { /* pane renders empty */ }
   }
   renderNotebookPane();
   renderChapterPanel();
@@ -2043,7 +1980,7 @@ async function addNoteAtCurrentPage() {
       ta.setSelectionRange(pos, pos);
     }
   }
-  setSaveStatus(`Note anchored at ${anchorChipLabel(reading, activeSourceLabel())} in ${file}.`);
+  setSaveStatus(`Note anchored at ${anchorChipLabel(reading, activeSourceLabel())} in notes.md.`);
 }
 
 function setSaveStatus(text, cls = '') {
@@ -2072,12 +2009,13 @@ function renderNotebookBody() {
   });
   ta.addEventListener('input', () => {
     state.activeNoteContent = ta.value;
-    state.mdDirty = true;
     setSaveStatus('Unsaved changes', 'dirty');
-    // The left Preview tab shows the same file — keep it live.
-    syncNoteCache(state.activeNoteName, ta.value);
-    if (leftPreviewTimer) clearTimeout(leftPreviewTimer);
-    leftPreviewTimer = setTimeout(() => renderLeftPreview(), 400);
+    // The left Preview tab shows the same notes.md — keep it live.
+    if (state.activeNoteName === 'notes.md') {
+      syncNotesMdCache(ta.value);
+      if (leftPreviewTimer) clearTimeout(leftPreviewTimer);
+      leftPreviewTimer = setTimeout(() => renderLeftPreview(), 400);
+    }
   });
 }
 
@@ -2141,38 +2079,6 @@ function renderMdPreview(el, text) {
     pre.after(bar);
     bar.after(out);
   });
-  // In-app links: a relative .md link opens that chapter file in the
-  // notebook pane; a labs/ChapNN/*.ipynb link opens that lab. (The master
-  // index and the chapter files' ### Labs blocks link this way.)
-  $$('a', el).forEach((a) => {
-    const href = a.getAttribute('href');
-    if (!href || /^(https?:|mailto:|#)/i.test(href)) return;
-    const labMatch = href.match(/^labs\/(Chap\d+)\/([^/]+\.ipynb)(?:#.*)?$/i);
-    if (labMatch) {
-      a.addEventListener('click', (e) => {
-        e.preventDefault();
-        openLab(labMatch[1], labMatch[2]);
-      });
-      return;
-    }
-    const mdMatch = href.match(/^([^/#?]+\.md)(?:#.*)?$/i);
-    if (mdMatch) {
-      const target = decodeURIComponent(mdMatch[1]);
-      a.addEventListener('click', async (e) => {
-        e.preventDefault();
-        if (!(state.notes || []).some((n) => n.name === target)) return;
-        const entry = (state.chapters || []).find((c) => c.file === target);
-        try { await loadNote(target); } catch { return; }
-        renderNotebookPane();
-        // A chapter-file link is a jump to that chapter: make it current
-        // so the preview, the AI context and the "+ Note here" button
-        // follow the file that just opened (a plain note leaves the
-        // chapter alone).
-        if (entry) await setActiveChapter(entry, { scrollNotebook: true });
-        else { renderChapterPanel(); renderLeftPreview(); }
-      });
-    }
-  });
 }
 
 async function runCode(language, code) {
@@ -2213,19 +2119,14 @@ async function saveActiveMdNote(showStatus) {
   const content = state.activeNoteContent;
   if (showStatus) setSaveStatus('Saving…');
   try {
-    const res = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/${encodeURIComponent(name)}`,
+    await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/${encodeURIComponent(name)}`,
       'PUT', { content });
-    // The PUT refreshes the generated ### Labs block and returns the
-    // stored text; adopt it so the editor and the preview agree.
-    const stored = res && typeof res.content === 'string' ? res.content : content;
-    state.activeNoteContent = stored;
-    state.mdDirty = false;
-    syncNoteCache(name, stored);
-    if (res && res.chapter) {
-      const i = (state.chapters || []).findIndex((c) => c.file === name);
-      if (i >= 0) state.chapters[i] = res.chapter;
+    state.headings = headingsFromMarkdown(content);
+    renderChapterPanel();
+    if (name === 'notes.md') {
+      syncNotesMdCache(content);
+      renderLeftPreview();
     }
-    if (state.previewFile === name || isChapterFileName(name)) renderLeftPreview();
     if (showStatus) {
       const t = new Date();
       setSaveStatus(`Saved ${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`);
@@ -2250,29 +2151,27 @@ async function saveNotebook() {
       await apiJson(`/api/projects/${slug}/notes/${encodeURIComponent(state.activeNoteName)}`,
         'PUT', { content: text });
     }
+    state.headings = headingsFromNotebook(state.activeNotebook);
+    renderChapterPanel();
     setSaveStatus('Saved');
   } catch (err) {
     setSaveStatus(`Save failed: ${err.message}`, 'error');
   }
 }
 
-/* ---------------- creating notes ---------------- */
+/* ---------------- creating notebooks ---------------- */
 
-async function createMdNote() {
-  const name = window.prompt('New note name (ends with .md):', 'notes-2.md');
-  if (!name) return;
-  const clean = name.trim().endsWith('.md') ? name.trim() : `${name.trim()}.md`;
+// One-click export of the master: the master IS a single file, so export
+// downloads the saved notes.md as `<slug>-notes.md`. (The editor may hold
+// unsaved typing — the export is the saved file, like a download.)
+async function exportNotesMaster() {
   try {
-    await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/${encodeURIComponent(clean)}`,
-      'PUT', { content: `# ${clean.replace(/\.md$/, '')}\n\n` });
-    state.notes.push({ name: clean, kind: 'md' });
-    await loadNote(clean);
-    renderNotebookPane();
-    renderChapterPanel();
-    const ta = $('#md-editor', view);
-    if (ta) ta.focus();
+    const data = await apiGet(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/notes.md`);
+    const text = typeof data === 'string' ? data : (data.content ?? '');
+    downloadBlob(text, `${state.project.slug}-notes.md`);
+    setSaveStatus('Exported notes.md.');
   } catch (err) {
-    window.alert(`Could not create the note: ${err.message}`);
+    setSaveStatus(`Export failed: ${err.message}`, 'error');
   }
 }
 
@@ -2598,25 +2497,19 @@ function notebookDisplayName() {
 
 /* The outline chapter the reader is on (null when none — e.g. a video
    project, or a heading-only nav). The AI request uses the outline title
-   verbatim so the server can match it against the stored outline.
-   Prefer a depth-0 entry: a chapter title can also appear as a subsection
-   elsewhere ("Supervised learning" is a subsection of the Introduction at
-   p.15 AND the chapter at p.31) — the subsection's page must never stand
-   in for the chapter's. */
+   verbatim so the server can match it against the stored outline. */
 function activeOutlineChapter() {
   if (!state.activeChapter) return null;
-  const list = state.outline || [];
-  return list.find((ch) => ch.depth === 0 && normalizeHeading(ch.title) === state.activeChapter)
-    || list.find((ch) => normalizeHeading(ch.title) === state.activeChapter) || null;
+  return (state.outline || []).find((ch) => normalizeHeading(ch.title) === state.activeChapter) || null;
 }
 
-/* Display title for the context line: the outline chapter, else the
-   current chapter file's title, else null. */
+/* Display title for the context line: the outline chapter, else the active
+   note heading, else null. */
 function activeChapterTitle() {
   const ch = activeOutlineChapter();
   if (ch) return ch.title;
-  const entry = currentChapterEntry();
-  return entry ? entry.title : null;
+  const h = (state.headings || []).find((hh) => hh.norm === state.activeChapter);
+  return h ? h.text : null;
 }
 
 /* One context sentence for the AI panel, from the material currently being
@@ -2659,48 +2552,40 @@ function updateAiContext() {
   }
 }
 
-/* Port of stripLabsBlock / appendToChapter in src/chapterNotes.js — the
-   same rule on both sides: a block goes into a chapter file BEFORE the
-   generated ### Labs block (the block is generated, never hand-edited);
-   a second insert of the exact same block is a no-op (inserted: false).
-   The server re-applies the same rule on PUT, so a stale client copy
-   still lands in the right place. */
-const LABS_BLOCK_START = '<!-- labs:start -->';
-const LABS_BLOCK_END = '<!-- labs:end -->';
-
-function stripLabsBlock(text) {
-  const src = String(text ?? '');
-  const start = src.indexOf(`\n${LABS_BLOCK_START}`);
-  if (start === -1) return src;
-  const endMarker = src.indexOf(LABS_BLOCK_END, start);
-  if (endMarker === -1) return src;
-  let end = endMarker + LABS_BLOCK_END.length;
-  if (src[end] === '\n') end += 1;
-  return src.slice(0, start) + src.slice(end);
-}
-
-function appendToChapterFile(content, block) {
-  const b = String(block ?? '').trim();
-  if (!b) return { text: String(content ?? ''), inserted: false };
-  const src = String(content ?? '');
-  if (stripLabsBlock(src).includes(b)) return { text: src, inserted: false };
-  const marker = src.indexOf(LABS_BLOCK_START);
-  if (marker === -1) {
-    const base = src && !src.endsWith('\n') ? `${src}\n` : src;
-    const sep = src && !src.endsWith('\n\n') ? '\n' : '';
-    return { text: `${base}${sep}${b}\n`, inserted: true };
+/* Port of insertMarkdownUnderHeading in src/aiNote.js — the same rule on
+   both sides: insert at the end of the section under the ## heading
+   matching headingTitle; append a new ## section when it is missing (with
+   headingAnchor, e.g. `<!-- p. 31 -->`, under it when given); a
+   second insert of the exact same block is a no-op (inserted: false). */
+function insertMarkdownUnderHeading(notesText, headingTitle, markdown, headingAnchor = null) {
+  const block = String(markdown || '').trim();
+  if (!block) return { text: String(notesText ?? ''), inserted: false };
+  const lines = String(notesText ?? '').split('\n');
+  const headings = headingsFromMarkdown(notesText);
+  const hit = matchHeading(headingTitle, headings);
+  if (!hit) {
+    const base = String(notesText ?? '');
+    const sep = base && !base.endsWith('\n') ? '\n' : '';
+    const gap = base && !base.endsWith('\n\n') ? '\n' : '';
+    const anchorLine = headingAnchor ? `${String(headingAnchor).trim()}\n\n` : '';
+    return { text: `${base}${sep}${gap}## ${headingTitle}\n\n${anchorLine}${block}\n`, inserted: true };
   }
-  // Insert before the Labs block: keep everything up to the last
-  // non-blank line before it, then the block, then the block.
-  const before = src.slice(0, marker).replace(/\s+$/, '');
-  const after = src.slice(marker);
-  const sep = before ? '\n\n' : '';
-  return { text: `${before}${sep}${b}\n\n${after}`, inserted: true };
+  const start = hit.line + 1;
+  let end = lines.length;
+  for (let i = start; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i])) { end = i; break; }
+  }
+  const section = lines.slice(start, end).join('\n');
+  if (section.includes(block)) return { text: String(notesText ?? ''), inserted: false };
+  const before = lines.slice(0, end);
+  while (before.length && before[before.length - 1].trim() === '') before.pop();
+  const after = lines.slice(end);
+  return { text: [...before, '', block, '', ...after].join('\n'), inserted: true };
 }
 
 /* Page anchors — verbatim port of src/pageAnchor.js (same format, same
    rules on both sides). A note block anchored to a page of the book PDF or
-   a slide of a deck carries `<!-- @page N · source: <id> -->` in the chapter file;
+   a slide of a deck carries `<!-- @page N · source: <id> -->` in notes.md;
    'book' is the main PDF, anything else is a material id. */
 const PAGE_ANCHOR_SOURCE_BOOK = 'book';
 
@@ -2727,18 +2612,37 @@ function anchorChipLabel(anchor, materialLabel) {
   return `${materialLabel || anchor.sourceId} · p. ${anchor.page}`;
 }
 
+/* Chapter number from a note heading's text: "12. Transformers" -> 12.
+   The seeded notes.md numbers its ## headings; an unnumbered heading has
+   no number and maps to no deck/lab group. */
+function chapterNumberFromHeading(headingText) {
+  const m = String(headingText ?? '').match(/^\s*(\d+)\s*[.)]\s/);
+  return m ? Number(m[1]) : null;
+}
+
+/* The ## headings of notes.md — the chapter list the deck/lab follow
+   resolves against. The active note's headings are notes.md's when
+   notes.md is open; otherwise parse the cached notes.md text (kept fresh
+   by every notes.md write path). Falls back to the active note's headings
+   when notes.md has never been loaded (e.g. no notes file yet). */
+function notesMdHeadings() {
+  if (state.activeTabKind === 'note' && state.activeNoteName === 'notes.md') return state.headings || [];
+  if (state.notesMdContent != null) return headingsFromMarkdown(state.notesMdContent);
+  return state.headings || [];
+}
+
 /* The slide deck for a chapter. Two rules, in order:
    1. By number: the seeded decks are slides-introduction / slides-chapN,
-      numbered like the chapter files ("12. Transformers" -> slides-chap12).
+      numbered like the ## headings ("12. Transformers" -> slides-chap12).
       This is the primary rule because deck labels do NOT match chapter
       titles: chap 12's deck is labelled "Image Generation" and chap 13's
       "Transformers and LLMs" (the UDL site's deck titles).
-   2. By label, with the same normalized matching as chapter resolution.
+   2. By label, with the same normalized matching as chapterMap.
    Returns the material or null. */
 function deckForChapter(chapterTitle) {
   if (!chapterTitle) return null;
-  const entry = resolvedChapter(chapterTitle);
-  const n = entry?.number;
+  const heading = matchHeading(chapterTitle, notesMdHeadings());
+  const n = chapterNumberFromHeading(heading?.text);
   if (n != null) {
     const id = n === 1 ? 'slides-introduction' : `slides-chap${n}`;
     const byId = (state.materials || []).find((m) => m.id === id);
@@ -2746,28 +2650,6 @@ function deckForChapter(chapterTitle) {
   }
   const norm = normalizeHeading(chapterTitle);
   return (state.materials || []).find((m) => normalizeHeading(m.label || m.id) === norm) || null;
-}
-
-/* One-click export: download all chapter notes as a single combined .md
-   (## headings + <!-- p. N --> comments + anchors — the old notes.md
-   shape). Standalone notes are excluded. */
-async function exportNotesCombined() {
-  const slug = encodeURIComponent(state.project.slug);
-  try {
-    const res = await fetch(`/api/projects/${slug}/notes/export`);
-    if (!res.ok) throw new Error(`Export failed (${res.status})`);
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${state.project.slug}-notes.md`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  } catch (err) {
-    setSaveStatus(`Export failed: ${err.message}`, 'error');
-  }
 }
 
 function downloadBlob(content, fileName, mime = 'text/markdown') {
@@ -2782,52 +2664,45 @@ function downloadBlob(content, fileName, mime = 'text/markdown') {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-/* Insert markdown into a chapter file through the existing notes PUT
-   path (before the generated ### Labs block, idempotent). `entry` is the
-   chapter entry (or null — then the current chapter's entry). A chapter
-   with no file yet gets one created on demand. Returns {inserted, file}. */
-async function insertIntoChapterFile(entry, markdown) {
+/* The `<!-- p. N -->` anchor for a chapter's `##` heading, from its
+   outline start page — the same anchor the seeded master carries. Null
+   when there is no chapter (or no page), so the heading is created bare. */
+function chapterPageAnchor(chapter) {
+  return chapter && chapter.page != null ? `<!-- p. ${chapter.page} -->` : null;
+}
+
+/* Insert markdown under a ## heading in notes.md through the existing
+   notes PUT path. Creates notes.md (from the project title) when it does
+   not exist yet. Returns {inserted, headingTitle}. */
+async function insertIntoNotesMd(headingTitle, markdown, headingAnchor = null) {
   const slug = encodeURIComponent(state.project.slug);
-  let target = entry || currentChapterEntry();
-  if (!target) {
-    // No chapter anywhere: create one from the current outline chapter
-    // (or a plain "Notes" chapter) so the block has a file to land in.
-    const ch = activeOutlineChapter();
-    const created = await apiJson(`/api/projects/${slug}/chapters`, 'POST',
-      { title: ch ? ch.title : 'Notes', page: ch?.page ?? null });
-    if (Array.isArray(created.chapters)) state.chapters = created.chapters;
-    target = created.chapter || null;
-    if (!target) throw new Error('Could not create a chapter file');
-  }
   let current = '';
-  let exists = false;
+  let exists = true;
   try {
-    const data = await apiGet(`/api/projects/${slug}/notes/${encodeURIComponent(target.file)}`);
+    const data = await apiGet(`/api/projects/${slug}/notes/notes.md`);
     current = typeof data === 'string' ? data : (data.content ?? '');
-    exists = true;
   } catch (err) {
-    if (!/note not found/.test(err.message || '')) throw err;
+    if (/note not found/.test(err.message || '')) {
+      current = `# ${state.project.title}\n`;
+      exists = false;
+    } else throw err;
   }
-  const { text, inserted } = appendToChapterFile(current, markdown);
-  if (!inserted) return { inserted: false, file: target.file };
-  const res = await apiJson(`/api/projects/${slug}/notes/${encodeURIComponent(target.file)}`,
-    'PUT', { content: text });
-  const stored = res && typeof res.content === 'string' ? res.content : text;
-  syncNoteCache(target.file, stored);
-  if (res && res.chapter) {
-    const i = (state.chapters || []).findIndex((c) => c.file === target.file);
-    if (i >= 0) state.chapters[i] = res.chapter;
-  }
-  if (!exists && !state.notes.some((n) => n.name === target.file)) {
-    state.notes.push({ name: target.file, kind: 'md' });
+  const { text, inserted } = insertMarkdownUnderHeading(current, headingTitle, markdown, headingAnchor);
+  if (!inserted) return { inserted: false, headingTitle };
+  await apiJson(`/api/projects/${slug}/notes/notes.md`, 'PUT', { content: text });
+  syncNotesMdCache(text);
+  renderLeftPreview();
+  if (!exists && !state.notes.some((n) => n.name === 'notes.md')) {
+    state.notes.push({ name: 'notes.md', kind: 'md' });
     renderNotebookPane();
   }
-  if (state.activeTabKind === 'note' && state.activeNoteName === target.file) {
-    state.activeNoteContent = stored;
-    const ta = $('#md-editor', view); if (ta) ta.value = stored;
+  if (state.activeTabKind === 'note' && state.activeNoteName === 'notes.md') {
+    state.activeNoteContent = text;
+    state.headings = headingsFromMarkdown(text);
+    renderChapterPanel();
+    const ta = $('#md-editor', view); if (ta) ta.value = text;
   }
-  renderLeftPreview();
-  return { inserted: true, file: target.file };
+  return { inserted: true, headingTitle };
 }
 
 /* ---------------- Ask AI panel ---------------- */
@@ -3093,8 +2968,8 @@ async function applyAiCode(i) {
     return;
   }
   // No cell-selection UI exists in v1, so Apply appends a new code cell at
-  // the end of the notebook (never edits an existing cell). The note files
-  // are untouched — this writes the notebook only.
+  // the end of the notebook (never edits an existing cell). notes.md is
+  // untouched — this writes the notebook only.
   state.activeNotebook.cells.push({
     cell_type: 'code', execution_count: null, metadata: {}, outputs: [], source: msg.code,
   });
@@ -3115,7 +2990,7 @@ function renderAiThread() {
   if (!thread) return;
   const { messages } = aiThread();
   if (!messages.length) {
-    thread.innerHTML = '<p class="hint">Ask in plain language — the AI drafts a note proposal from the current chapter. Apply inserts it into that chapter’s file.</p>';
+    thread.innerHTML = '<p class="hint">Ask in plain language — the AI drafts a note proposal from the current chapter. Apply inserts it under that chapter’s heading in notes.md.</p>';
     return;
   }
   thread.innerHTML = '';
@@ -3203,15 +3078,16 @@ async function applyAiNote(i) {
   const thread = aiThread();
   const msg = thread.messages[i];
   if (!msg || msg.role !== 'assistant' || msg.applied) return;
-  const entry = currentChapterEntry();
+  const ch = activeOutlineChapter();
+  const heading = ch ? ch.title : 'AI notes';
   const statusEl = $('#ai-status', view);
   try {
-    const { inserted, file } = await insertIntoChapterFile(entry, msg.markdown);
+    const { inserted } = await insertIntoNotesMd(heading, msg.markdown, chapterPageAnchor(ch));
     msg.applied = true;
     if (statusEl) {
       statusEl.textContent = inserted
-        ? `Inserted into ${file}.`
-        : `Already in ${file} — nothing added.`;
+        ? `Inserted under “${heading}” in notes.md.`
+        : 'Already in notes.md — nothing added.';
     }
   } catch (err) {
     if (statusEl) {
@@ -3277,10 +3153,10 @@ function closeCellExportModal() {
   if (existing) existing.remove();
 }
 
-/* Preview what the export produces, before anything is written to the
-   chapter file. Two targets from one preview: [Insert into note] appends
-   to the current chapter's file; [Download .md] saves the file (links
-   resolve when it lives in notes/). */
+/* Preview what the export produces, before anything is written to notes.md.
+   Two targets from one preview: [Insert into note] appends under the
+   current chapter's ## heading in notes.md; [Download .md] saves the file
+   (links resolve when it lives in notes/). */
 function openCellExportModal(markdown, name, images) {
   closeCellExportModal();
   const base = String(name || 'notebook').replace(/\.ipynb$/i, '');
@@ -3329,12 +3205,13 @@ function openCellExportModal(markdown, name, images) {
     const errBox = $('#cell-export-error', overlay);
     const btn = e.currentTarget;
     errBox.textContent = '';
-    const entry = currentChapterEntry();
+    const ch = activeOutlineChapter();
+    const heading = ch ? ch.title : notebookDisplayName();
     btn.disabled = true;
     btn.textContent = 'Inserting…';
     try {
-      const { inserted, file } = await insertIntoChapterFile(entry, markdown);
-      btn.textContent = inserted ? `Inserted into ${file} ✓` : 'Already inserted ✓';
+      const { inserted } = await insertIntoNotesMd(heading, markdown, chapterPageAnchor(ch));
+      btn.textContent = inserted ? 'Inserted ✓' : 'Already inserted ✓';
     } catch (err) {
       errBox.textContent = err.message;
       btn.disabled = false;

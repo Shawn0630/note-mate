@@ -1,14 +1,15 @@
 // Seed script: creates the example project "Understanding Deep Learning".
 //   npm run seed [-- --force]
 // Downloads the UDL book PDF (v5.0.3, 2026-02-09), extracts the real chapter
-// outline from the PDF with pdfjs-dist, and writes per-chapter note files
-// (notes/chapter-NN-slug.md) + project.json notesHeader. Also downloads
-// the 13 lecture-slide decks (PPTX + LibreOffice-converted PDF) and the
-// 69 Python lab notebooks from the udlbook repo.
+// outline from the PDF with pdfjs-dist, and writes notes.md (title header
+// only — chapter headings are created on demand when a note lands under a
+// chapter, never pre-written).
+// Also downloads the 13 lecture-slide decks (PPTX + LibreOffice-converted
+// PDF) and the 69 Python lab notebooks from the udlbook repo.
 // Idempotent: re-running tops up missing pieces, never re-downloads files
-// that already exist, and never overwrites existing chapter files or
+// that already exist, and never overwrites an existing notes.md or
 // project.json's user edits (only missing `materials[]` entries are added).
-// --force re-downloads source files; chapter files / project.json are still
+// --force re-downloads source files; notes.md / project.json are still
 // preserved (only the seed-owned "68 notebooks" header line is fixed to 69).
 //
 // Scratch lives under ~/workspace/nm-seed-tmp/ (LibreOffice profile +
@@ -22,10 +23,6 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { normalizeHeading } from '../src/util.js';
-import {
-  chapterFileName, buildChapterFile, refreshLabsBlock,
-} from '../src/chapterNotes.js';
 import { convertDeck } from '../src/convertDeck.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -275,6 +272,20 @@ async function downloadLabs(labsDir) {
   return { total: labPaths.length, downloaded, skipped, failed, counts };
 }
 
+async function writeIfAbsent(file, content) {
+  try {
+    await fsp.stat(file);
+    if (!FORCE) {
+      console.log(`exists, skipping: ${path.relative(ROOT, file)}`);
+      return false;
+    }
+  } catch { /* absent — write */ }
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  await fsp.writeFile(file, content, 'utf8');
+  console.log(`wrote: ${path.relative(ROOT, file)}`);
+  return true;
+}
+
 /** Build the materials[] entries for project.json from deck results. */
 function buildMaterials(deckResults) {
   return DECKS.map((deck) => {
@@ -343,17 +354,6 @@ async function main() {
   } catch { /* already gone */ }
 
   // --- project.json: never overwrite user edits; only top up materials[] ---
-  // The notes header block (title + byline) is the per-chapter layout's
-  // `notesHeader`: the server stores it verbatim so the single-file export
-  // reconstructs the old notes.md shape.
-  const headerBlock = [
-    '# Understanding Deep Learning\n',
-    '\n',
-    'Simon J.D. Prince, MIT Press (free PDF, CC-BY-NC-ND). ',
-    'Book site with 69 Python notebook exercises, video lectures and slides: ',
-    `${BOOK_SITE}\n`,
-    '\n',
-  ].join('');
   const now = new Date().toISOString();
   const projectFile = path.join(dir, 'project.json');
   let existing = null;
@@ -372,15 +372,6 @@ async function main() {
     } else {
       console.log('project.json: materials[] already complete — untouched');
     }
-    if (!existing.notesHeader) {
-      // A project seeded before the per-chapter layout: the header is the
-      // seed's own text unless a legacy notes.md exists, in which case the
-      // server's migration overwrites this with the file's own header.
-      existing.notesHeader = headerBlock;
-      existing.updatedAt = now;
-      await fsp.writeFile(projectFile, JSON.stringify(existing, null, 2) + '\n', 'utf8');
-      console.log('project.json: notesHeader added');
-    }
   } else {
     const project = {
       slug: SLUG,
@@ -391,12 +382,13 @@ async function main() {
       file: 'source.pdf',
       cover: null,
       materials,
-      // Canonical chapterMap scheme (shared with the frontend):
-      // normalized outline title -> index of its `##` heading in notes.md
-      // (0-based). Manual overrides POST the same shape to /chapter-map.
-      // Kept for compatibility; chapter resolution now uses files.
-      chapterMap: Object.fromEntries(chapters.map((c, i) => [normalizeHeading(c.title), i])),
-      notesHeader: headerBlock,
+      // chapterMap is the MANUAL override scheme (shared with the
+      // frontend): normalized outline title -> index of its `##` heading
+      // in notes.md (0-based). It starts EMPTY — headings are created on
+      // demand when a note lands under a chapter, so there is nothing to
+      // pre-map; the chapter panel's "Link to a note heading…" select (or
+      // POST /chapter-map) fills it when the user links one by hand.
+      chapterMap: {},
       links: [
         { label: 'Book site & Python notebooks', url: BOOK_SITE },
         { label: 'Video lectures (YouTube, Tamer Elsayed)', url: VIDEOS_URL },
@@ -411,71 +403,35 @@ async function main() {
     console.log('wrote: project.json (new)');
   }
 
-  // --- Per-chapter note files: one file per chapter (## heading + page
-  // comment, empty body) — the headings-only skeleton, split by file.
-  // Written only when absent, NEVER overwritten (not even with --force:
-  // chapter files hold the user's own notes). When a legacy notes.md
-  // exists it stays the source of truth — the server splits it on first
-  // load — so the seed never writes chapter files over it.
-  // The one seed-owned fix on re-run: the header line said "68 Python
-  // notebook exercises"; the repo actually has 69. Only that phrase is
-  // touched — user-written note content is never overwritten.
+  // --- notes.md: title header only, written only if absent. ---
+  // The master starts EMPTY of chapters: headings are created on demand
+  // when the user adds a note under a chapter (filed by the page he was
+  // on), never pre-written. The one seed-owned fix on re-run: the header
+  // line said "68 Python notebook exercises"; the repo actually has 69.
+  // Only that phrase is touched — user-written note content is never
+  // overwritten.
   const notesMdPath = path.join(notesDir, 'notes.md');
-  const writeChapterIfAbsent = async (file, content) => {
-    try {
-      await fsp.stat(file);
-      console.log(`exists, skipping: ${path.relative(ROOT, file)}`);
-      return false;
-    } catch { /* absent — write */ }
-    await fsp.mkdir(path.dirname(file), { recursive: true });
-    await fsp.writeFile(file, content, 'utf8');
-    console.log(`wrote: ${path.relative(ROOT, file)}`);
-    return true;
-  };
-  // Labs on disk per chapter dir (downloaded above), for the generated
-  // `### Labs` block in each chapter file.
-  const labsByChapter = new Map();
   try {
-    for (const group of await fsp.readdir(labsDir, { withFileTypes: true })) {
-      if (!group.isDirectory()) continue;
-      const files = (await fsp.readdir(path.join(labsDir, group.name)))
-        .filter((n) => n.toLowerCase().endsWith('.ipynb'))
-        .sort()
-        .map((name) => ({ name, path: `labs/${group.name}/${name}` }));
-      labsByChapter.set(group.name, files);
-    }
-  } catch { /* no labs yet */ }
-  let legacyExists = false;
-  try {
-    await fsp.stat(notesMdPath);
-    legacyExists = true;
-  } catch { /* absent */ }
-  if (legacyExists) {
-    try {
-      const current = await fsp.readFile(notesMdPath, 'utf8');
-      if (current.includes('68 Python notebook exercises')) {
-        await fsp.writeFile(
-          notesMdPath,
-          current.replace('68 Python notebook exercises', '69 Python notebook exercises'),
-          'utf8',
-        );
-        console.log('notes.md: header line fixed 68 -> 69 notebooks (content otherwise untouched)');
-      } else {
-        console.log('exists, skipping: notes.md (legacy — migration splits it on first load)');
-      }
-    } catch {
+    const current = await fsp.readFile(notesMdPath, 'utf8');
+    if (current.includes('68 Python notebook exercises')) {
+      await fsp.writeFile(
+        notesMdPath,
+        current.replace('68 Python notebook exercises', '69 Python notebook exercises'),
+        'utf8',
+      );
+      console.log('notes.md: header line fixed 68 -> 69 notebooks (content otherwise untouched)');
+    } else {
       console.log('exists, skipping: notes.md');
     }
-  } else {
-    for (const c of chapters) {
-      const file = chapterFileName({ number: c.num, title: c.title });
-      const groupLabs = labsByChapter.get(`Chap${String(c.num).padStart(2, '0')}`) ?? [];
-      const content = refreshLabsBlock(
-        buildChapterFile({ heading: `${c.num}. ${c.title}`, page: c.page, body: '' }),
-        groupLabs, c.num,
-      );
-      await writeChapterIfAbsent(path.join(notesDir, file), content);
-    }
+  } catch {
+    const notesMd = [
+      '# Understanding Deep Learning\n',
+      '\n',
+      'Simon J.D. Prince, MIT Press (free PDF, CC-BY-NC-ND). ',
+      'Book site with 69 Python notebook exercises, video lectures and slides: ',
+      `${BOOK_SITE}\n`,
+    ].join('');
+    await writeIfAbsent(notesMdPath, notesMd);
   }
 
   // --- Summary ---

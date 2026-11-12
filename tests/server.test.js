@@ -73,38 +73,22 @@ test('projects: empty list, URL create, slug collision, get, notes CRUD', async 
   });
   assert.equal(r.res.status, 400);
 
-  // GET migrates the legacy notes.md starter (# title + ## Notes) into a
-  // per-chapter file: notes.md -> notes.md.migrated, chapter-01-notes.md
-  // created, index.md generated, chapters listed.
   r = await req('/api/projects/my-test-book');
   assert.equal(r.res.status, 200);
   assert.equal(r.json.title, 'My Test Book');
-  assert.deepEqual(r.json.noteFiles, ['chapter-01-notes.md']);
-  assert.deepEqual(r.json.chapters, [
-    { number: 1, title: 'Notes', page: null, file: 'chapter-01-notes.md', labs: [] },
-  ]);
-  assert.ok(fs.existsSync(path.join(tmpData, 'projects', 'my-test-book', 'notes', 'notes.md.migrated')));
-  assert.ok(fs.existsSync(path.join(tmpData, 'projects', 'my-test-book', 'notes', 'index.md')));
-  assert.equal(r.json.notesHeader, '# My Test Book\n\n');
+  assert.deepEqual(r.json.noteFiles, ['notes.md']);
 
   // URL project file endpoint redirects.
   r = await req('/api/projects/my-test-book/file', { redirect: 'manual' });
   assert.equal(r.res.status, 302);
   assert.match(r.res.headers.get('location'), /youtube/);
 
-  // Notes list + read + write + traversal rejection. The legacy notes.md
-  // is never a tab; the chapter file is.
+  // Notes list + read + write + traversal rejection.
   r = await req('/api/projects/my-test-book/notes');
-  assert.deepEqual(r.json, [{ name: 'chapter-01-notes.md', kind: 'md' }]);
-
-  r = await req('/api/projects/my-test-book/notes/chapter-01-notes.md');
-  assert.match(r.json.content, /^## Notes/);
+  assert.deepEqual(r.json, [{ name: 'notes.md', kind: 'md' }]);
 
   r = await req('/api/projects/my-test-book/notes/notes.md');
-  assert.equal(r.res.status, 404);
-
-  r = await req('/api/projects/my-test-book/notes/index.md');
-  assert.match(r.json.content, /\[Notes\]\(chapter-01-notes\.md\)/);
+  assert.match(r.json.content, /^# My Test Book/);
 
   r = await req('/api/projects/my-test-book/notes/new-note.ipynb', {
     method: 'PUT',
@@ -245,4 +229,90 @@ test('POST /api/execute: python, javascript, java, validation', async () => {
     body: JSON.stringify({ language: 'python', code: '   ' }),
   });
   assert.equal(r.res.status, 400);
+});
+
+async function createVideoProject(title) {
+  const r = await req('/api/projects', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title, url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' }),
+  });
+  assert.equal(r.res.status, 201);
+  return r.json.slug;
+}
+
+const LEGACY_MASTER = '# Fold Test\n\nByline here.\n\n'
+  + '## 1. Introduction\n<!-- p. 15 -->\n\n'
+  + '## 2. Supervised learning\n<!-- p. 31 -->\n\n'
+  + '## 3. Shallow neural networks\n<!-- p. 39 -->\n';
+
+test('notes migrate: per-chapter files fold back into the master, backup kept', async () => {
+  const slug = await createVideoProject('Fold Test');
+  const notesDir = path.join(tmpData, 'projects', slug, 'notes');
+  // The 55d1761 state: no notes.md, only notes.md.migrated + chapter files + index.md.
+  await fsp.rm(path.join(notesDir, 'notes.md'));
+  await fsp.writeFile(path.join(notesDir, 'notes.md.migrated'), LEGACY_MASTER, 'utf8');
+  await fsp.writeFile(path.join(notesDir, 'chapter-02-supervised-learning.md'),
+    '## 2. Supervised learning\n<!-- p. 31 -->\n\n- my supervised note\n\n<!-- labs:start -->\n### Labs\n\n- [2.1 Supervised Learning](labs/Chap02/2_1_Supervised_Learning.ipynb)\n<!-- labs:end -->\n', 'utf8');
+  await fsp.writeFile(path.join(notesDir, 'chapter-06-fitting-models.md'),
+    '## 6. Fitting models\n<!-- p. 91 -->\n\n- my fitting note\n\n<!-- labs:start -->\n### Labs\n\n- [6.1 Line Search](labs/Chap06/6_1_Line_Search.ipynb)\n<!-- labs:end -->\n', 'utf8');
+  await fsp.writeFile(path.join(notesDir, 'chapter-03-shallow-neural-networks.md'),
+    '## 3. Shallow neural networks\n<!-- p. 39 -->\n\n<!-- labs:start -->\n### Labs\n\n- [3.1 Shallow Networks I](labs/Chap03/3_1_Shallow_Networks_I.ipynb)\n<!-- labs:end -->\n', 'utf8');
+  await fsp.writeFile(path.join(notesDir, 'index.md'), '# Index\n\n- [2. Supervised learning](chapter-02-supervised-learning.md)\n', 'utf8');
+
+  const r = await req(`/api/projects/${slug}/notes/migrate`, { method: 'POST' });
+  assert.equal(r.res.status, 200);
+  assert.equal(r.json.migrated, 'folded');
+  assert.equal(r.json.chapters, 3);
+  assert.equal(r.json.droppedEmpty, 1); // ch3 had no user content
+  assert.equal(r.json.backupDir, '.chapter-backup');
+
+  const master = await fsp.readFile(path.join(notesDir, 'notes.md'), 'utf8');
+  assert.equal(master, '# Fold Test\n\nByline here.\n\n'
+    + '## 2. Supervised learning\n<!-- p. 31 -->\n\n- my supervised note\n\n'
+    + '## 6. Fitting models\n<!-- p. 91 -->\n\n- my fitting note\n');
+  // Old files are moved to the backup dir, not deleted; the index is gone.
+  const backup = await fsp.readdir(path.join(notesDir, '.chapter-backup'));
+  assert.deepEqual(backup.sort(), [
+    'chapter-02-supervised-learning.md',
+    'chapter-03-shallow-neural-networks.md',
+    'chapter-06-fitting-models.md',
+    'index.md',
+    'notes.md.migrated',
+  ]);
+  assert.equal(fs.existsSync(path.join(notesDir, 'chapter-02-supervised-learning.md')), false);
+  assert.equal(fs.existsSync(path.join(notesDir, 'index.md')), false);
+  // The notes list shows only the master (the backup dir is not listed).
+  const list = await req(`/api/projects/${slug}/notes`);
+  assert.deepEqual(list.json, [{ name: 'notes.md', kind: 'md' }]);
+  // Second run is a no-op.
+  const again = await req(`/api/projects/${slug}/notes/migrate`, { method: 'POST' });
+  assert.equal(again.json.migrated, 'none');
+});
+
+test('notes migrate: legacy single notes.md drops empty skeleton headings', async () => {
+  const slug = await createVideoProject('Prune Test');
+  const notesDir = path.join(tmpData, 'projects', slug, 'notes');
+  await fsp.writeFile(path.join(notesDir, 'notes.md'), LEGACY_MASTER, 'utf8');
+  const r = await req(`/api/projects/${slug}/notes/migrate`, { method: 'POST' });
+  assert.equal(r.res.status, 200);
+  assert.equal(r.json.migrated, 'pruned');
+  assert.equal(r.json.droppedEmpty, 3);
+  assert.equal(await fsp.readFile(path.join(notesDir, 'notes.md'), 'utf8'),
+    '# Fold Test\n\nByline here.\n');
+  const again = await req(`/api/projects/${slug}/notes/migrate`, { method: 'POST' });
+  assert.equal(again.json.migrated, 'none');
+});
+
+test('notes migrate: lazy on project GET', async () => {
+  const slug = await createVideoProject('Lazy Test');
+  const notesDir = path.join(tmpData, 'projects', slug, 'notes');
+  await fsp.rm(path.join(notesDir, 'notes.md'));
+  await fsp.writeFile(path.join(notesDir, 'notes.md.migrated'), LEGACY_MASTER, 'utf8');
+  await fsp.writeFile(path.join(notesDir, 'chapter-02-supervised-learning.md'),
+    '## 2. Supervised learning\n<!-- p. 31 -->\n\n- lazy note\n', 'utf8');
+  const r = await req(`/api/projects/${slug}`);
+  assert.equal(r.res.status, 200);
+  assert.deepEqual(r.json.noteFiles, ['notes.md']);
+  assert.match(await fsp.readFile(path.join(notesDir, 'notes.md'), 'utf8'), /- lazy note/);
 });

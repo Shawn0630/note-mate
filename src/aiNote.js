@@ -114,13 +114,15 @@ export function extractChapterSection(notesText, headingTitle) {
 /**
  * Insert `markdown` at the end of the section under the ## heading matching
  * `headingTitle` (the shared chapter <-> heading rule). When the heading
- * does not exist, append a new `## <headingTitle>` section at the end.
- * Returns `{text, inserted}` — `inserted` is false when the exact block is
- * already present in that section, so applying the same proposal twice
- * never duplicates it. The frontend ports this function verbatim (see
+ * does not exist, append a new `## <headingTitle>` section at the end —
+ * with `headingAnchor` (e.g. `<!-- p. 31 -->`) right under it when given,
+ * so a heading created on demand carries its page anchor like the seeded
+ * ones do. Returns `{text, inserted}` — `inserted` is false when the exact
+ * block is already present in that section, so applying the same proposal
+ * twice never duplicates it. The frontend ports this function verbatim (see
  * public/app.js insertMarkdownUnderHeading).
  */
-export function insertMarkdownUnderHeading(notesText, headingTitle, markdown) {
+export function insertMarkdownUnderHeading(notesText, headingTitle, markdown, headingAnchor = null) {
   const block = String(markdown || '').trim();
   if (!block) return { text: String(notesText ?? ''), inserted: false };
   const lines = String(notesText ?? '').split('\n');
@@ -130,8 +132,9 @@ export function insertMarkdownUnderHeading(notesText, headingTitle, markdown) {
     const base = String(notesText ?? '');
     const sep = base && !base.endsWith('\n') ? '\n' : '';
     const gap = base && !base.endsWith('\n\n') ? '\n' : '';
+    const anchorLine = headingAnchor ? `${String(headingAnchor).trim()}\n\n` : '';
     return {
-      text: `${base}${sep}${gap}## ${headingTitle}\n\n${block}\n`,
+      text: `${base}${sep}${gap}## ${headingTitle}\n\n${anchorLine}${block}\n`,
       inserted: true,
     };
   }
