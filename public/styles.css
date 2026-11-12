@@ -706,6 +706,27 @@ body.reader-open .reader {
 .deck-page-indicator { color: #bbb; font-size: 12.5px; }
 /* The Markdown preview tab renders on paper, not on the dark reader bg. */
 #panel-preview .reading-scroll { background: var(--paper); }
+/* Crumb above the Preview tab: "Index › Chapter title". The Index link
+   shows the app-maintained master index instead of the chapter file. */
+.preview-crumb {
+  flex: none;
+  padding: 8px 22px;
+  font-size: 13px;
+  color: var(--muted);
+  background: var(--paper);
+  border-bottom: 1px solid var(--line);
+}
+.preview-crumb:empty { display: none; }
+.preview-crumb-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.preview-crumb-sep { margin: 0 2px; }
 
 /* ---------- v1.1: source switcher ---------- */
 

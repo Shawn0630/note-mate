@@ -201,9 +201,28 @@ test('ai/apply: creates a project from a validated proposal; 409 on collision; 4
   assert.deepEqual(json.project.outline, STUB_PROPOSAL.outline);
   assert.deepEqual(json.project.chapterMap, STUB_PROPOSAL.chapterMap);
   assert.equal(
-    fs.readFileSync(path.join(tmpData, 'projects', 'ai-test-book', 'notes', 'notes.md'), 'utf8'),
-    STUB_PROPOSAL.noteSkeleton,
+    fs.readFileSync(path.join(tmpData, 'projects', 'ai-test-book', 'notes', 'chapter-01-introduction.md'), 'utf8'),
+    '## 1. Introduction\n\n',
   );
+  assert.equal(
+    fs.readFileSync(path.join(tmpData, 'projects', 'ai-test-book', 'notes', 'chapter-02-methods.md'), 'utf8'),
+    '## 2. Methods\n\n',
+  );
+  // The skeleton's header lives in project.json notesHeader, and the
+  // master index links both chapter files.
+  const appliedProject = JSON.parse(
+    fs.readFileSync(path.join(tmpData, 'projects', 'ai-test-book', 'project.json'), 'utf8'),
+  );
+  assert.equal(appliedProject.notesHeader, '# Stub Book\n\n');
+  assert.match(
+    fs.readFileSync(path.join(tmpData, 'projects', 'ai-test-book', 'notes', 'index.md'), 'utf8'),
+    /\[1\. Introduction\]\(chapter-01-introduction\.md\)/,
+  );
+  assert.match(
+    fs.readFileSync(path.join(tmpData, 'projects', 'ai-test-book', 'notes', 'index.md'), 'utf8'),
+    /\[2\. Methods\]\(chapter-02-methods\.md\)/,
+  );
+  assert.deepEqual(json.project.noteFiles, ['chapter-01-introduction.md', 'chapter-02-methods.md']);
   assert.ok(fs.existsSync(path.join(tmpData, 'projects', 'ai-test-book', 'source.pdf')));
 
   // Same title again -> 409 slug collision.

@@ -73,22 +73,38 @@ test('projects: empty list, URL create, slug collision, get, notes CRUD', async 
   });
   assert.equal(r.res.status, 400);
 
+  // GET migrates the legacy notes.md starter (# title + ## Notes) into a
+  // per-chapter file: notes.md -> notes.md.migrated, chapter-01-notes.md
+  // created, index.md generated, chapters listed.
   r = await req('/api/projects/my-test-book');
   assert.equal(r.res.status, 200);
   assert.equal(r.json.title, 'My Test Book');
-  assert.deepEqual(r.json.noteFiles, ['notes.md']);
+  assert.deepEqual(r.json.noteFiles, ['chapter-01-notes.md']);
+  assert.deepEqual(r.json.chapters, [
+    { number: 1, title: 'Notes', page: null, file: 'chapter-01-notes.md', labs: [] },
+  ]);
+  assert.ok(fs.existsSync(path.join(tmpData, 'projects', 'my-test-book', 'notes', 'notes.md.migrated')));
+  assert.ok(fs.existsSync(path.join(tmpData, 'projects', 'my-test-book', 'notes', 'index.md')));
+  assert.equal(r.json.notesHeader, '# My Test Book\n\n');
 
   // URL project file endpoint redirects.
   r = await req('/api/projects/my-test-book/file', { redirect: 'manual' });
   assert.equal(r.res.status, 302);
   assert.match(r.res.headers.get('location'), /youtube/);
 
-  // Notes list + read + write + traversal rejection.
+  // Notes list + read + write + traversal rejection. The legacy notes.md
+  // is never a tab; the chapter file is.
   r = await req('/api/projects/my-test-book/notes');
-  assert.deepEqual(r.json, [{ name: 'notes.md', kind: 'md' }]);
+  assert.deepEqual(r.json, [{ name: 'chapter-01-notes.md', kind: 'md' }]);
+
+  r = await req('/api/projects/my-test-book/notes/chapter-01-notes.md');
+  assert.match(r.json.content, /^## Notes/);
 
   r = await req('/api/projects/my-test-book/notes/notes.md');
-  assert.match(r.json.content, /^# My Test Book/);
+  assert.equal(r.res.status, 404);
+
+  r = await req('/api/projects/my-test-book/notes/index.md');
+  assert.match(r.json.content, /\[Notes\]\(chapter-01-notes\.md\)/);
 
   r = await req('/api/projects/my-test-book/notes/new-note.ipynb', {
     method: 'PUT',
