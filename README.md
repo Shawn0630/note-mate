@@ -503,8 +503,20 @@ chapter files or other `project.json` fields. Pass `--force` to re-download
 source files; notes/project user edits are still preserved. All seed
 downloads and LibreOffice scratch live under `~/workspace/nm-seed-tmp/`
 (never `/tmp` — the payload is ~150–300MB and `/tmp` is a 512MB tmpfs).
-LibreOffice must be installed for the PPTX→PDF conversion
-(`soffice --headless --convert-to pdf`); the Dockerfile installs it.
+
+The PPTX→PDF conversion needs LibreOffice, in three tiers (see
+`src/convertDeck.js`): (1) host `soffice` when it is on PATH; (2) a one-off
+container from the app's own image (`docker compose run --rm`, base
+`docker-compose.yml` only) when Docker is available — the image already
+ships `libreoffice-impress`, so no host install is needed; (3) when neither
+is available, seed asks once in the terminal — "LibreOffice is not
+installed. Install it now via Homebrew (~500MB+, a few minutes)? [y/N]"
+(default No; a piped/non-interactive run answers No without hanging) — and
+on yes runs `brew install --cask libreoffice`, then retries the conversion
+with the fresh host install. Pass `--install-libreoffice` to pre-answer yes
+for non-interactive runs. If Homebrew itself is missing, seed says so and
+fails the deck with the manual command; seed never installs Homebrew and
+never installs anything without the user's yes (or the flag).
 
 ## Tests
 

@@ -13,23 +13,26 @@
 //
 // Scratch lives under ~/workspace/nm-seed-tmp/ (LibreOffice profile +
 // TMPDIR) — NEVER /tmp (512MB tmpfs; the seed payload is ~150-300MB).
+// Deck conversion uses host `soffice` when present, else a one-off
+// container from the app's own image (see src/convertDeck.js) — no host
+// LibreOffice install is needed. When neither is available, seed ASKS
+// whether to install LibreOffice via Homebrew (never silently;
+// `--install-libreoffice` pre-answers yes for non-interactive runs).
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { normalizeHeading } from '../src/util.js';
 import {
   chapterFileName, buildChapterFile, refreshLabsBlock,
 } from '../src/chapterNotes.js';
-
-const execFileAsync = promisify(execFile);
+import { convertDeck } from '../src/convertDeck.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(ROOT, 'data'));
 const FORCE = process.argv.includes('--force');
+const INSTALL_LIBREOFFICE = process.argv.includes('--install-libreoffice');
 const SCRATCH = path.resolve(process.env.HOME || '~', 'workspace', 'nm-seed-tmp');
 
 const SLUG = 'understanding-deep-learning';
@@ -88,7 +91,6 @@ const FALLBACK_CHAPTERS = [
 ];
 
 const PPTX_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04]); // PK\x03\x04
-const PDF_MAGIC = Buffer.from('%PDF-');
 
 function isPptx(buf) {
   return buf.length > 4 && buf.subarray(0, 4).equals(PPTX_MAGIC);
@@ -218,48 +220,6 @@ async function fetchDeck(deck) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-/** Convert one PPTX to PDF with LibreOffice headless; returns {ok, bytes}. */
-async function convertDeck(deck, slidesDir) {
-  const pptx = path.join(slidesDir, deck.file);
-  const pdfName = deck.file.replace(/\.pptx$/i, '.pdf');
-  const pdfPath = path.join(slidesDir, pdfName);
-  if (!FORCE && await fileExistsOk(pdfPath, PDF_MAGIC)) {
-    const { size } = await fsp.stat(pdfPath);
-    console.log(`  ${pdfName} already present (${size} bytes) — skipping conversion`);
-    return { ok: true, bytes: size, skipped: true };
-  }
-  try {
-    const loProfile = path.join(SCRATCH, 'lo-profile');
-    await fsp.mkdir(loProfile, { recursive: true });
-    await execFileAsync('soffice', [
-      '--headless', '--convert-to', 'pdf', '--outdir', slidesDir, pptx,
-    ], {
-      env: {
-        ...process.env,
-        TMPDIR: SCRATCH,
-        // Keep LibreOffice's user profile in our scratch dir, not /tmp.
-        // (soffice reads this via the -env:UserInstallation arg form.)
-      },
-      timeout: 300_000,
-    }).catch(async (err) => {
-      // Retry once with an explicit UserInstallation in scratch: the first
-      // attempt can fail if a stale lock/profile exists in the default home.
-      console.log(`  ${deck.file}: conversion retry with scratch profile (${String(err.message).slice(0, 120)})`);
-      await execFileAsync('soffice', [
-        `--env:UserInstallation=file://${loProfile}`,
-        '--headless', '--convert-to', 'pdf', '--outdir', slidesDir, pptx,
-      ], { env: { ...process.env, TMPDIR: SCRATCH }, timeout: 300_000 });
-    });
-    const { size } = await fsp.stat(pdfPath);
-    if (size === 0) throw new Error('converted PDF is empty');
-    console.log(`  converted ${pdfName} (${size} bytes)`);
-    return { ok: true, bytes: size };
-  } catch (err) {
-    console.log(`  FAILED conversion ${deck.file}: ${err.message}`);
-    return { ok: false, error: err.message };
-  }
-}
-
 /** Full repo tree (cached at /tmp/udl-tree.json when present, else GitHub API). */
 async function fetchRepoTree() {
   const cached = '/tmp/udl-tree.json';
@@ -353,10 +313,13 @@ async function main() {
   // --- Slides: 13 decks (PPTX kept as source, LO-converted PDF renderable) ---
   console.log('Slides:');
   const deckResults = {};
+  // One ctx per seed run: the container image is built at most once, and
+  // the Homebrew-install prompt is asked at most once.
+  const convertCtx = { imageBuilt: false, installAsked: false, installDeclined: false, installAttempted: false };
   for (const deck of DECKS) {
     const dl = await downloadDeck(deck, slidesDir);
     let conv = { ok: false };
-    if (dl.ok) conv = await convertDeck(deck, slidesDir);
+    if (dl.ok) conv = await convertDeck(deck, slidesDir, { root: ROOT, dataDir: DATA_DIR, scratch: SCRATCH, force: FORCE, autoInstall: INSTALL_LIBREOFFICE, ctx: convertCtx });
     deckResults[deck.id] = {
       pptxOk: dl.ok, pptxBytes: dl.bytes ?? 0,
       pdfOk: conv.ok, pdfBytes: conv.bytes ?? 0,
