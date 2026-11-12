@@ -1,6 +1,8 @@
 FROM node:22-bookworm-slim
 
-# Runtimes for /api/execute: python3 + matplotlib (plots), JDK 21 (javac/java).
+# Runtimes for /api/execute: python3 + matplotlib (plots), JDK 17 (javac/java).
+# Bookworm ships OpenJDK 17 only — openjdk-21 does not exist in bookworm
+# (it is a trixie package); 17 is enough for notebook Java cells.
 # LibreOffice (impress) converts PPTX slide decks to PDF for the reader —
 # the seed script uses `soffice --headless --convert-to pdf`, and the
 # container needs it too for any future in-app conversion. Cost: roughly
@@ -9,7 +11,7 @@ FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 \
       python3-matplotlib \
-      openjdk-21-jdk-headless \
+      openjdk-17-jdk-headless \
       libreoffice-impress \
     && rm -rf /var/lib/apt/lists/*
 
