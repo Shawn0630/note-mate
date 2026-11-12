@@ -160,9 +160,74 @@ via `src/pdftext.js`; video: transcript text). The deterministic import path
 is unchanged: `POST /api/projects` with a file upload uses the PDF's own
 outline when present, an empty skeleton otherwise.
 
+## Reader layout
+
+The reader fills the viewport edge-to-edge (the app header hides while a
+project is open). Three layout modes, switched in the top bar — per-session,
+no persistence; switching modes never changes the chapter, page, active
+tabs, or selection:
+
+| Mode | Layout |
+| ---- | ------ |
+| **Navigation** | Chapters nav + the reading pane (notebook and AI hidden) — for navigating and reading. |
+| **Focus** (default) | Nav hidden; left reading tabs + right notebook tabs, 50/50 — for working side by side. |
+| **AI** | Focus + the AI panel as the rightmost column (340px); left/right split the rest 50/50. |
+
+The **Chapters** button is a manual nav toggle inside the current mode (it
+does not change the mode label); the mode buttons set the canonical
+arrangement. The **✨ Ask AI** toggle (top bar, and in the notebook toolbar)
+and the **AI** mode button are the same action: opening AI switches to AI
+mode, closing the panel (its ×) returns to Focus — the panel lives in AI
+mode only.
+
+- **LEFT pane (reading, tabbed — PDF projects)**: **PDF** (the book at the
+  current chapter/page), **Slides** (the current chapter's slide deck — the
+  deck picker inside the tab defaults to the chapter's deck; decks are
+  matched to chapters by label), **Markdown preview** (the rendered
+  `notes.md`, following the current chapter like note-follow). The book and
+  the deck live in separate containers, so each tab keeps its scroll
+  position. The old top-bar source switcher is gone for PDF projects — the
+  left tabs are the switcher now (other project kinds keep it).
+- **RIGHT pane (working, tabbed)**: the runnable notebooks (Python/Java
+  labs for the current chapter — the Labs section auto-expands the
+  chapter's group) and the markdown **editor** tab (`notes.md` in Edit
+  mode; the preview lives on the left). Editing on the right updates the
+  left preview live. "+ Note" / "+ Notebook" and the page-anchored-note
+  action live here.
+- **Chapter ↔ labs / slides correspondence**: clicking a chapter shows that
+  chapter's PDF location, its slide deck, its labs, and its markdown
+  section — on both sides. The mapping comes from the seeded data (deck
+  labels, `ChapNN` lab groups, numbered `##` headings), never invented.
+
+### Page-anchored notes
+
+Notes attach to chapters by default, but a note can be added at **any**
+PDF page or slide: the **+ Note here** button in the notebook toolbar
+inserts an anchor comment under the current chapter's `##` heading in
+`notes.md` (end of the section; the heading is created if missing — the
+same rule as Ask AI Apply) and opens the editor at the line after it:
+
+```
+<!-- @page 100 · source: book -->
+<!-- @page 12 · source: slides-chap2 -->
+```
+
+The anchor lives **in `notes.md` itself** — the single source of truth,
+never a second copy in `project.json`. In any rendered preview (left
+Preview tab or the right pane's Preview) the anchor shows as a chip
+("p. 100" / "Supervised Learning · p. 12"); clicking it jumps the left
+pane to that page/slide in the correct source tab. Anchors survive reload.
+Page-based sources only (book PDF + slide decks) — on a video/YouTube
+source the button is disabled with a note why. Pure helpers in
+`src/pageAnchor.js`.
+
 ## On-demand AI notes (Ask AI)
 
-The **✨ Ask AI** button in the notebook pane opens a conversation panel
+The AI panel is the **rightmost column** of the reader (AI mode), with two
+tabs. Both share one rule: the model returns a **proposal**; nothing is
+written until you press **Apply**.
+
+- **Note AI** — the **✨ Ask AI** button in the notebook pane opens a conversation panel
 (one thread per notebook, kept in memory for the session — it resets on
 reload, the same v1 limit as Finance Mate's Refine panel). This is the
 **other** AI surface, and it works the opposite way from AI import:
@@ -173,17 +238,22 @@ reload, the same v1 limit as Finance Mate's Refine panel). This is the
 | The AI writes | Structure only: outline + headings-only skeleton + chapter map | Content: markdown notes, as a **proposal** |
 | Writes to your files | The skeleton, on Apply | Nothing — until you press **Apply** on a proposal |
 
-- **Context**: the text of the **current chapter** — the page range comes
-  from the project's outline, extracted server-side from the source PDF
-  (`src/pdftext.js`, capped at 40 pages per chapter and 30,000
-  characters sent to the model). The outline is the stored one when the
-  project has it (AI import); otherwise the server reads the PDF's own
-  outline (`src/pdfOutline.js`) — seeded and file-uploaded projects store
-  none, and the reader reads the same outline client-side. An "Include my
-  notes for this chapter" checkbox adds the current chapter's section from
-  `notes.md` (up to 4,000 characters). With no chapter selected the AI
-  works from your request only. The prompt is capped at 2,000 characters;
-  the last 6 thread messages are included as conversation context.
+- **Context**: the material currently being read — the request carries the
+  active left-pane source + page. Book PDF → the **current chapter**'s
+  text (the page range comes from the project's outline, extracted
+  server-side from the source PDF (`src/pdftext.js`, capped at 40 pages
+  per chapter and 30,000 characters sent to the model). The outline is the
+  stored one when the project has it (AI import); otherwise the server
+  reads the PDF's own outline (`src/pdfOutline.js`) — seeded and
+  file-uploaded projects store none, and the reader reads the same outline
+  client-side. Slides tab → the **deck's text around the current slide**
+  (the deck outline's section containing the slide, or a small window
+  around it when the deck has no outline; same 30,000-character cap). An
+  "Include my notes for this chapter" checkbox adds the current chapter's
+  section from `notes.md` (up to 4,000 characters; book chapters only).
+  With no chapter selected the AI works from your request only. The prompt
+  is capped at 2,000 characters; the last 6 thread messages are included
+  as conversation context.
 - **Honesty rules** (same as import): the prompt forbids inventing page
   numbers, quotes, formulas, or facts not in the chapter text — if the
   chapter does not cover what you asked, the model says so instead.
@@ -198,10 +268,30 @@ reload, the same v1 limit as Finance Mate's Refine panel). This is the
   `{chapter?, prompt, includeNote?, history?}` →
   `{markdown, chapter: {title, startPage, endPage} | null, contextChars}`.
   `chapter` is the outline title (matched with the same normalization as
-  the chapter map); omit it for a prompt-only note. 400 on an unknown
-  chapter, a chapter with no page, or a non-PDF project. 503
+  the chapter map); omit it for a prompt-only note. `source` is a deck id
+  (context then comes from the deck around `page`); omit both for the book
+  chapter. 400 on an unknown chapter, a chapter with no page, an unknown
+  source, or a non-PDF project. 503
   `{error: 'LLM not configured', hint: ...}` when the LLM is off, same as
   import. Pure helpers live in `src/aiNote.js`.
+
+- **Code AI** (second tab) — writes Python code for the notebook you have
+  open. Same proposal rule: prompt → a fenced `python` block plus a
+  one-line explanation → **Apply** appends it as a **new code cell at the
+  end** of the current notebook (there is no cell-selection UI in v1, so
+  "after the selected cell" is always the end; existing cells are never
+  edited, and `notes.md` is untouched). **Python notebooks only** — the
+  tab explains itself when the active notebook is not Python (Java and
+  JavaScript are out of scope for now). Context: the same reading material
+  as Note AI, plus the current notebook's code cells (capped at 8,000
+  characters) so the model writes code that fits. **API**:
+  `POST /api/projects/:slug/ai-code`
+  `{chapter?, prompt, notebook, source?, page?, cells?, history?}` →
+  `{code, language: 'python', explanation?, chapter, source, page,
+  contextChars}`. `notebook` is the current `.ipynb` path; `cells` is the
+  array of code-cell sources (capped server-side). 400 on a missing
+  prompt/notebook, a bad page, an unknown source, or non-string cells. 503
+  when the LLM is off. Pure helpers in `src/aiCode.js`.
 
 ## Export cells to Markdown
 
@@ -256,7 +346,8 @@ the selected cells — deterministic, no LLM:
 | POST | `/api/projects/:slug/chapter-map` | `{mapping}` merged into `project.json` `chapterMap` |
 | POST | `/api/import/ai/propose` | Multipart (`file` = PDF, `title?`) → structure-only proposal; 503 when the LLM is not configured, 400 on a bad PDF or unparseable model output |
 | POST | `/api/import/ai/apply` | Multipart (`file` = PDF, `proposal` = JSON string, `title`) → creates the project; 201 `{project}`, 409 on slug collision |
-| POST | `/api/projects/:slug/ai-note` | `{chapter?, prompt, includeNote?, history?}` → `{markdown, chapter, contextChars}` — on-demand AI note proposal; 503 when the LLM is not configured (see "On-demand AI notes") |
+| POST | `/api/projects/:slug/ai-note` | `{chapter?, prompt, includeNote?, history?, source?, page?}` → `{markdown, chapter, source, page, contextChars}` — on-demand AI note proposal; 503 when the LLM is not configured (see "On-demand AI notes") |
+| POST | `/api/projects/:slug/ai-code` | `{chapter?, prompt, notebook, source?, page?, cells?, history?}` → `{code, language: 'python', explanation, chapter, source, page, contextChars}` — on-demand Code AI proposal (Python notebooks only); 503 when the LLM is not configured (see "On-demand AI notes") |
 | POST | `/api/projects/:slug/export-cells` | `{notebook, name, cells: [indexes]}` → `{markdown, images, cells}` — deterministic cell export; writes deduped PNGs under `notes/assets/` (see "Export cells to Markdown") |
 | GET | `/api/projects/:slug/assets/:file` | Serves an exported plot PNG from `notes/assets/` (`.png` file names only) |
 | POST | `/api/execute` | `{language: python\|java\|javascript, code}` → `{stdout, stderr, exitCode, images:[{data, mime:"image/png"}]}` |

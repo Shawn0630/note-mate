@@ -15,10 +15,13 @@ import { extractPdfOutline } from './pdfOutline.js';
 import { proposeProjectData, LLM_NOT_CONFIGURED } from './llm.js';
 import { validateProposal } from './aiImport.js';
 import {
-  generateAiNote, resolveChapterRange, extractChapterSection,
+  generateAiNote, resolveChapterRange, resolvePageRange, extractChapterSection,
   MAX_AI_NOTE_PROMPT_CHARS, MAX_AI_NOTE_HISTORY_MESSAGES,
   MAX_AI_NOTE_HISTORY_CHARS, MAX_AI_NOTE_NOTE_CHARS, MAX_CHAPTER_PAGES,
 } from './aiNote.js';
+import {
+  generateAiCode, MAX_AI_CODE_PROMPT_CHARS, MAX_AI_CODE_CELLS_CHARS,
+} from './aiCode.js';
 import { cellsToMarkdown } from './cellExport.js';
 
 const execFileAsync = promisify(execFile);
@@ -625,6 +628,126 @@ app.post('/api/projects/:slug/chapter-map', async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// Shared reading context for the two on-demand AI endpoints (Note AI and
+// Code AI): the material currently being read. `source` is null (the book
+// PDF) or a material id (a slide deck); `page` is the current page/slide
+// (1-based); `chapter` is the current chapter title. Book + chapter title
+// -> the chapter's page range (the original ai-note behavior); a deck, or a
+// page without a chapter -> the outline section around that page
+// (resolvePageRange, which falls back to a small window when the PDF has no
+// outline). Returns {text, range, sourceId, sourceLabel, page}, or
+// {error: {status, message}} for the route to answer with. Reads no files
+// at all when neither a chapter nor a page is given.
+// ---------------------------------------------------------------------------
+
+async function buildReadingContext(slug, project, { source, chapter, page }) {
+  const sourceId = typeof source === 'string' && source.trim() ? source.trim() : null;
+  const chapterTitle = typeof chapter === 'string' ? chapter.trim() : '';
+  const pageNum = Number.isInteger(page) && page >= 1 ? page : null;
+  if (!chapterTitle && pageNum === null) {
+    return { text: '', range: null, sourceId, sourceLabel: project.title, page: null };
+  }
+  let buf;
+  let sourceLabel;
+  if (!sourceId) {
+    if (String(project.kind).toLowerCase() !== 'pdf' || project.sourceType !== 'file' || !project.file) {
+      return { error: { status: 400, message: 'chapter context needs a PDF project with a downloaded file' } };
+    }
+    try {
+      buf = await fsp.readFile(resolveProjectPath(DATA_DIR, slug, project.file));
+    } catch (err) {
+      return { error: { status: err.status || 400, message: err.message } };
+    }
+    sourceLabel = project.title;
+  } else {
+    const material = (project.materials ?? []).find((m) => m.id === sourceId);
+    if (!material) return { error: { status: 400, message: `unknown source: ${sourceId}` } };
+    if (!material.file) return { error: { status: 400, message: `source ${sourceId} has no file` } };
+    try {
+      buf = await fsp.readFile(resolveProjectPath(DATA_DIR, slug, material.file));
+    } catch (err) {
+      return { error: { status: err.status || 400, message: err.message } };
+    }
+    sourceLabel = material.label || material.id;
+  }
+  // The chapter's page range comes from an outline — the stored one when
+  // the project has it (AI import), otherwise the PDF's own outline
+  // (seeded / file-uploaded projects store none; the reader reads the
+  // same outline client-side). A page range does not need an outline at
+  // all (resolvePageRange falls back to a window), so a missing outline
+  // only fails the chapter path.
+  let outline = [];
+  if (!sourceId && chapterTitle) {
+    outline = Array.isArray(project.outline) && project.outline.length ? project.outline : null;
+    if (!outline) outline = await extractPdfOutline(buf);
+    if (!outline.length) {
+      return { error: { status: 400, message: 'this project has no chapter outline — ask without a chapter' } };
+    }
+  } else if (!sourceId && Array.isArray(project.outline) && project.outline.length) {
+    outline = project.outline;
+  } else {
+    outline = await extractPdfOutline(buf);
+  }
+  let range = null;
+  if (!sourceId && chapterTitle) {
+    range = resolveChapterRange(outline, chapterTitle, null);
+    if (!range) {
+      return { error: { status: 400, message: `chapter not found in the outline: ${chapterTitle}` } };
+    }
+  } else if (pageNum !== null) {
+    range = resolvePageRange(outline, pageNum, null);
+  }
+  if (!range) {
+    return { text: '', range: null, sourceId, sourceLabel, page: pageNum };
+  }
+  let extracted;
+  try {
+    extracted = await extractPdfText(buf, {
+      startPage: range.startPage,
+      endPage: range.endPage ?? Infinity,
+      maxPages: MAX_CHAPTER_PAGES,
+    });
+  } catch (err) {
+    return { error: { status: err.status || 400, message: err.message } };
+  }
+  return {
+    text: extracted.text || '',
+    range: {
+      title: range.title,
+      startPage: range.startPage,
+      endPage: extracted.pages.length
+        ? extracted.pages[extracted.pages.length - 1].page : range.startPage,
+    },
+    sourceId,
+    sourceLabel,
+    page: pageNum,
+  };
+}
+
+// Validate the shared `history` field of the on-demand AI endpoints.
+// Returns the cleaned history (each message capped) or throws an Error
+// with `status = 400`.
+function parseAiHistory(history) {
+  if (history === undefined) return [];
+  const fail = (msg) => {
+    const err = new Error(msg);
+    err.status = 400;
+    throw err;
+  };
+  if (!Array.isArray(history)) fail('history must be an array of {role, content}');
+  if (history.length > MAX_AI_NOTE_HISTORY_MESSAGES) {
+    fail(`history holds at most ${MAX_AI_NOTE_HISTORY_MESSAGES} messages`);
+  }
+  return history.map((m) => {
+    if (!m || typeof m !== 'object' || !['user', 'assistant'].includes(m.role)
+      || typeof m.content !== 'string') {
+      fail('history entries must be {role: "user"|"assistant", content: string}');
+    }
+    return { role: m.role, content: m.content.slice(0, MAX_AI_NOTE_HISTORY_CHARS) };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // On-demand AI notes — the user asks in plain language for markdown notes
 // based on the CURRENT chapter; the model returns a PROPOSAL and nothing is
 // written until the user presses Apply in the notebook pane (client-side,
@@ -632,87 +755,37 @@ app.post('/api/projects/:slug/chapter-map', async (req, res, next) => {
 // generates STRUCTURE ONLY and never note content — see src/aiNote.js.
 // Context: the chapter's page range from the project's stored outline,
 // extracted server-side from the source PDF (never sent by the client).
+// The request may also carry `source` (a deck id — context then comes from
+// the deck around `page`) and `page` (the current page/slide).
 // ---------------------------------------------------------------------------
 
 app.post('/api/projects/:slug/ai-note', async (req, res, next) => {
   try {
-    const { chapter, prompt, includeNote, history } = req.body ?? {};
+    const { chapter, prompt, includeNote, history, source, page } = req.body ?? {};
     if (typeof prompt !== 'string' || !prompt.trim()) {
       return res.status(400).json({ error: 'prompt (string) is required' });
     }
     if (prompt.length > MAX_AI_NOTE_PROMPT_CHARS) {
       return res.status(400).json({ error: `prompt exceeds the ${MAX_AI_NOTE_PROMPT_CHARS}-character limit` });
     }
-    let cleanHistory = [];
-    if (history !== undefined) {
-      if (!Array.isArray(history)) {
-        return res.status(400).json({ error: 'history must be an array of {role, content}' });
-      }
-      if (history.length > MAX_AI_NOTE_HISTORY_MESSAGES) {
-        return res.status(400).json({ error: `history holds at most ${MAX_AI_NOTE_HISTORY_MESSAGES} messages` });
-      }
-      for (const m of history) {
-        if (!m || typeof m !== 'object' || !['user', 'assistant'].includes(m.role)
-          || typeof m.content !== 'string') {
-          return res.status(400).json({ error: 'history entries must be {role: "user"|"assistant", content: string}' });
-        }
-        cleanHistory.push({ role: m.role, content: m.content.slice(0, MAX_AI_NOTE_HISTORY_CHARS) });
-      }
+    let cleanHistory;
+    try {
+      cleanHistory = parseAiHistory(history);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
     }
 
     const project = await readProject(req.params.slug);
-    const chapterTitle = typeof chapter === 'string' ? chapter.trim() : '';
-    let range = null;
-    let chapterText = '';
+    const ctx = await buildReadingContext(req.params.slug, project, { source, chapter, page });
+    if (ctx.error) return res.status(ctx.error.status).json({ error: ctx.error.message });
     let noteSection = '';
-    if (chapterTitle) {
-      if (String(project.kind).toLowerCase() !== 'pdf' || project.sourceType !== 'file' || !project.file) {
-        return res.status(400).json({ error: 'chapter context needs a PDF project with a downloaded file' });
-      }
-      let buf;
+    if (includeNote && ctx.range?.title) {
       try {
-        buf = await fsp.readFile(resolveProjectPath(DATA_DIR, req.params.slug, project.file));
-      } catch (err) {
-        return res.status(err.status || 400).json({ error: err.message });
-      }
-      // The chapter's page range comes from an outline — the stored one when
-      // the project has it (AI import), otherwise the PDF's own outline
-      // (seeded / file-uploaded projects store none; the reader reads the
-      // same outline client-side).
-      let outline = Array.isArray(project.outline) && project.outline.length ? project.outline : null;
-      if (!outline) outline = await extractPdfOutline(buf);
-      if (!outline.length) {
-        return res.status(400).json({ error: 'this project has no chapter outline — ask without a chapter' });
-      }
-      range = resolveChapterRange(outline, chapterTitle, null);
-      if (!range) {
-        return res.status(400).json({ error: `chapter not found in the outline: ${chapterTitle}` });
-      }
-      let extracted;
-      try {
-        extracted = await extractPdfText(buf, {
-          startPage: range.startPage,
-          endPage: range.endPage ?? Infinity,
-          maxPages: MAX_CHAPTER_PAGES,
-        });
-      } catch (err) {
-        return res.status(err.status || 400).json({ error: err.message });
-      }
-      chapterText = extracted.text || '';
-      range = {
-        title: range.title,
-        startPage: range.startPage,
-        endPage: extracted.pages.length
-          ? extracted.pages[extracted.pages.length - 1].page : range.startPage,
-      };
-      if (includeNote) {
-        try {
-          const notes = await fsp.readFile(
-            resolveProjectPath(DATA_DIR, req.params.slug, 'notes', 'notes.md'), 'utf8');
-          noteSection = extractChapterSection(notes, range.title).slice(0, MAX_AI_NOTE_NOTE_CHARS);
-        } catch {
-          noteSection = ''; // No notes.md yet — the AI works from the chapter alone.
-        }
+        const notes = await fsp.readFile(
+          resolveProjectPath(DATA_DIR, req.params.slug, 'notes', 'notes.md'), 'utf8');
+        noteSection = extractChapterSection(notes, ctx.range.title).slice(0, MAX_AI_NOTE_NOTE_CHARS);
+      } catch {
+        noteSection = ''; // No notes.md yet — the AI works from the chapter alone.
       }
     }
 
@@ -720,8 +793,8 @@ app.post('/api/projects/:slug/ai-note', async (req, res, next) => {
     try {
       markdown = await generateAiNote({
         bookTitle: project.title,
-        chapter: range,
-        chapterText,
+        chapter: ctx.range,
+        chapterText: ctx.text,
         noteSection,
         prompt: prompt.trim(),
         history: cleanHistory,
@@ -736,7 +809,82 @@ app.post('/api/projects/:slug/ai-note', async (req, res, next) => {
       if (err.status === 400) return res.status(400).json({ error: err.message });
       throw err;
     }
-    res.json({ markdown, chapter: range, contextChars: chapterText.length });
+    res.json({ markdown, chapter: ctx.range, source: ctx.sourceId, page: ctx.page, contextChars: ctx.text.length });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// On-demand Code AI — the second tab of the AI panel. Same proposal-only
+// rule as ai-note, but the model returns Python code for the notebook the
+// user is working in; Apply inserts it as a new code cell (client-side,
+// through the notebook PUT path). Python notebooks only. The request
+// carries the active reading source + page (same context rules as ai-note)
+// plus the current notebook's code cell sources (`cells`, capped server-side
+// at MAX_AI_CODE_CELLS_CHARS) so the model writes code that fits.
+// ---------------------------------------------------------------------------
+
+app.post('/api/projects/:slug/ai-code', async (req, res, next) => {
+  try {
+    const { chapter, prompt, notebook, source, page, cells, history } = req.body ?? {};
+    if (typeof prompt !== 'string' || !prompt.trim()) {
+      return res.status(400).json({ error: 'prompt (string) is required' });
+    }
+    if (prompt.length > MAX_AI_CODE_PROMPT_CHARS) {
+      return res.status(400).json({ error: `prompt exceeds the ${MAX_AI_CODE_PROMPT_CHARS}-character limit` });
+    }
+    if (typeof notebook !== 'string' || !notebook.trim() || !/\.ipynb$/i.test(notebook.trim())) {
+      return res.status(400).json({ error: 'notebook (an .ipynb path) is required' });
+    }
+    if (notebook.includes('..')) {
+      return res.status(400).json({ error: 'notebook must stay inside the project' });
+    }
+    if (page !== undefined && page !== null && (!Number.isInteger(page) || page < 1)) {
+      return res.status(400).json({ error: 'page must be a positive integer' });
+    }
+    let cleanHistory;
+    try {
+      cleanHistory = parseAiHistory(history);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    let notebookCells = '';
+    if (cells !== undefined) {
+      if (!Array.isArray(cells) || cells.some((c) => typeof c !== 'string')) {
+        return res.status(400).json({ error: 'cells must be an array of strings' });
+      }
+      notebookCells = cells.join('\n\n').slice(0, MAX_AI_CODE_CELLS_CHARS);
+    }
+
+    const project = await readProject(req.params.slug);
+    const ctx = await buildReadingContext(req.params.slug, project, { source, chapter, page });
+    if (ctx.error) return res.status(ctx.error.status).json({ error: ctx.error.message });
+
+    let result;
+    try {
+      result = await generateAiCode({
+        bookTitle: project.title,
+        chapter: ctx.range,
+        sourceLabel: ctx.sourceLabel,
+        page: ctx.page,
+        readingText: ctx.text,
+        notebookCells,
+        prompt: prompt.trim(),
+        history: cleanHistory,
+      });
+    } catch (err) {
+      if (err.code === LLM_NOT_CONFIGURED) {
+        return res.status(503).json({ error: 'LLM not configured', hint: err.hint });
+      }
+      if (err.code === 'LLM_BAD_RESPONSE') {
+        return res.status(err.status || 502).json({ error: err.message });
+      }
+      if (err.status === 400) return res.status(400).json({ error: err.message });
+      throw err;
+    }
+    res.json({ ...result, chapter: ctx.range, source: ctx.sourceId, page: ctx.page, contextChars: ctx.text.length });
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
     next(err);

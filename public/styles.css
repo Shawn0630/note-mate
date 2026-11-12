@@ -267,8 +267,9 @@ h1, h2, h3, .serif { font-family: Georgia, "Times New Roman", serif; }
 /* ---------- Reader layout ---------- */
 
 .reader {
+  --nav-w: 248px;
   display: grid;
-  grid-template-columns: 248px minmax(0, 1fr) 430px;
+  grid-template-columns: 0 minmax(0, 1fr) minmax(0, 1fr) 0;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 0;
   height: calc(100vh - 118px);
@@ -279,15 +280,47 @@ h1, h2, h3, .serif { font-family: Georgia, "Times New Roman", serif; }
   overflow: hidden;
   box-shadow: 0 6px 20px rgba(43, 33, 24, .15);
 }
-.reader.chapters-hidden { grid-template-columns: 0 minmax(0, 1fr) 430px; }
-.reader.chapters-hidden .chapter-panel { display: none; }
+/* Layout modes (four columns: nav | reading | notebook | AI). Navigation =
+   nav + reading, notebook and AI hidden; Focus = reading + notebook 50/50;
+   AI = reading + notebook + a 340px AI column. The manual Chapters toggle
+   adds/removes the nav column inside any mode. */
+.reader.layout-navigation { grid-template-columns: var(--nav-w) minmax(0, 1fr) 0 0; }
+.reader.layout-navigation.nav-hidden { grid-template-columns: 0 minmax(0, 1fr) 0 0; }
+.reader.layout-focus { grid-template-columns: 0 minmax(0, 1fr) minmax(0, 1fr) 0; }
+.reader.layout-focus.nav-visible { grid-template-columns: var(--nav-w) minmax(0, 1fr) minmax(0, 1fr) 0; }
+.reader.layout-ai { grid-template-columns: 0 minmax(0, 1fr) minmax(0, 1fr) 340px; }
+.reader.layout-ai.nav-visible { grid-template-columns: var(--nav-w) minmax(0, 1fr) minmax(0, 1fr) 340px; }
+.reader.nav-hidden .chapter-panel { display: none; }
+.reader.layout-navigation .notebook-pane,
+.reader.layout-navigation .ai-column { display: none; }
+.reader.layout-focus .ai-column { display: none; }
+/* Explicit columns for the four panes: without them, hiding the nav with
+   display:none drops it from auto-placement and the reading pane slides
+   into the 0px nav column — Focus/AI showed a 0px reading pane and the AI
+   column stretched to a full 1fr. The topbar already spans 1 / -1. */
+.reader .chapter-panel { grid-column: 1; }
+.reader .reading-pane { grid-column: 2; }
+.reader .notebook-pane { grid-column: 3; }
+.reader .ai-column { grid-column: 4; }
+
+/* Edge-to-edge reader: while a project is open the app header hides and
+   the view padding drops, so the reader fills the viewport. */
+body.reader-open .app-header { display: none; }
+body.reader-open .view { padding: 0; }
+body.reader-open .reader {
+  height: 100vh;
+  min-height: 0;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
 
 .topbar {
   grid-column: 1 / -1;
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 10px 16px;
+  gap: 10px;
+  padding: 8px 12px;
   background: var(--wood-dark);
   color: #f3e7d3;
 }
@@ -316,6 +349,22 @@ h1, h2, h3, .serif { font-family: Georgia, "Times New Roman", serif; }
 }
 .topbar button:hover { background: rgba(255, 255, 255, .22); }
 .topbar button[aria-pressed="true"] { background: rgba(255, 255, 255, .3); }
+.layout-switcher {
+  display: flex;
+  border: 1px solid rgba(255, 255, 255, .25);
+  border-radius: 8px;
+  overflow: hidden;
+  flex: none;
+}
+.layout-switcher button {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 5px 10px;
+  font-size: 13px;
+}
+.layout-switcher button.active { background: rgba(255, 255, 255, .3); font-weight: 700; }
+#ai-toggle-top.active { background: rgba(255, 255, 255, .3); font-weight: 700; }
 
 /* ---------- Chapter panel ---------- */
 
@@ -617,9 +666,46 @@ h1, h2, h3, .serif { font-family: Georgia, "Times New Roman", serif; }
 .nb-add-row button { font-size: 12.5px; }
 
 @media (max-width: 1100px) {
-  .reader { grid-template-columns: 210px minmax(0, 1fr) 360px; }
-  .reader.chapters-hidden { grid-template-columns: 0 minmax(0, 1fr) 360px; }
+  .reader { --nav-w: 210px; }
 }
+
+/* ---------- Left (reading) pane tabs ---------- */
+
+.reading-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 8px 10px 0;
+  background: var(--reading-bg);
+  flex: none;
+}
+.reading-tab {
+  border: 1px solid transparent;
+  border-bottom: none;
+  background: transparent;
+  border-radius: 8px 8px 0 0;
+  padding: 6px 14px;
+  font-size: 13.5px;
+  color: #cfcfd2;
+  white-space: nowrap;
+}
+.reading-tab.active { background: #2f2f31; color: #fff; font-weight: 700; }
+.reading-tab-panels { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.reading-tab-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.reading-tab-panel[hidden] { display: none; }
+.deck-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: #2f2f31;
+  color: #ddd;
+  font-size: 13px;
+  flex: none;
+}
+.deck-picker-row select { font-size: 13px; padding: 4px 6px; background: #fff; }
+.deck-page-indicator { color: #bbb; font-size: 12.5px; }
+/* The Markdown preview tab renders on paper, not on the dark reader bg. */
+#panel-preview .reading-scroll { background: var(--paper); }
 
 /* ---------- v1.1: source switcher ---------- */
 
@@ -752,18 +838,79 @@ h1, h2, h3, .serif { font-family: Georgia, "Times New Roman", serif; }
 .ai-map-list { margin: 6px 0; padding-left: 22px; font-size: 13.5px; color: var(--ink-soft); }
 .ai-map-list li { margin: 3px 0; }
 
-/* ---------------- Ask AI panel (notebook pane) ---------------- */
+/* ---------------- AI column (rightmost, AI mode only) ---------------- */
 #ai-toggle.active { background: var(--accent-soft); font-weight: 700; }
-.ai-panel {
+.ai-column {
+  border-left: 1px solid var(--line);
+  background: var(--paper);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.ai-column-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
   border-bottom: 1px solid var(--line);
-  background: var(--paper-dim);
-  padding: 12px 14px;
   flex: none;
 }
-.ai-panel-head { display: flex; align-items: baseline; gap: 10px; }
-.ai-panel-head .spacer { flex: 1; }
-.ai-panel-sub { font-size: 12.5px; color: var(--ink-soft); }
-.ai-panel-head button { font-size: 12.5px; padding: 3px 10px; }
+.ai-tabs { display: flex; gap: 4px; flex: 1; min-width: 0; }
+.ai-tab {
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 7px;
+  padding: 6px 12px;
+  font-size: 13.5px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+.ai-tab.active { background: var(--accent-soft); color: var(--ink); font-weight: 700; }
+#ai-close { border: none; background: transparent; font-size: 16px; padding: 4px 8px; color: var(--ink-soft); }
+.ai-column-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+}
+#ai-panel { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.ai-panel-sub { font-size: 12.5px; color: var(--ink-soft); margin: 0 0 4px; }
+.ai-code-proposal {
+  background: #2b2620;
+  color: #f3ead7;
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 0 0 8px;
+}
+.ai-code-proposal code { background: transparent; color: inherit; font-size: 13px; }
+.ai-code-explanation { font-size: 13px; color: var(--ink-soft); margin: 0; }
+.ai-clear { align-self: flex-start; margin-top: 10px; font-size: 12.5px; padding: 4px 10px; }
+/* In the column the thread takes the free space and scrolls; the input
+   row stays pinned at the bottom. */
+.ai-column-body .ai-thread { flex: 1; max-height: none; min-height: 120px; }
+
+/* Page-anchor chips: a `<!-- @page N · source: <id> -->` comment in the
+   markdown renders as a chip; clicking it jumps the left pane there. */
+.page-anchor-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+  margin: 2px 0;
+  vertical-align: middle;
+}
+.page-anchor-chip:hover { background: #f0dfc0; }
 .ai-context { font-size: 13px; color: var(--ink-soft); margin: 8px 0 4px; }
 .ai-include {
   display: inline-flex;

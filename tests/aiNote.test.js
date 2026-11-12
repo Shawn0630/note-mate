@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  resolveChapterRange, extractChapterSection, insertMarkdownUnderHeading,
+  resolveChapterRange, resolvePageRange, extractChapterSection, insertMarkdownUnderHeading,
   stripMarkdownFences, demoteHeadings, validateAiNoteMarkdown,
   buildAiNotePrompt, generateAiNote,
   MAX_AI_NOTE_PROMPT_CHARS, MAX_AI_NOTE_RESPONSE_CHARS,
@@ -54,6 +54,30 @@ test('resolveChapterRange: title matching is normalized; no match / null page / 
   assert.equal(resolveChapterRange(
     [{ title: 'No Page', page: null }], 'No Page', 10), null);
   assert.equal(resolveChapterRange([], 'Introduction', 10), null);
+});
+
+test('resolvePageRange: the outline section containing the page, through the next entry', () => {
+  const outline = [
+    { title: 'Title', page: 1, depth: 0 },
+    { title: 'Motivation', page: 4, depth: 0 },
+    { title: 'Details', page: 9, depth: 1 },
+    { title: 'Summary', page: 12, depth: 0 },
+  ];
+  assert.deepEqual(resolvePageRange(outline, 1, 20), { title: 'Title', startPage: 1, endPage: 3 });
+  assert.deepEqual(resolvePageRange(outline, 6, 20), { title: 'Motivation', startPage: 4, endPage: 8 });
+  // A subsection (depth 1) still bounds the section: page 10 is in Details.
+  assert.deepEqual(resolvePageRange(outline, 10, 20), { title: 'Details', startPage: 9, endPage: 11 });
+  // Last section runs to numPages; null numPages stays open.
+  assert.deepEqual(resolvePageRange(outline, 15, 20), { title: 'Summary', startPage: 12, endPage: 20 });
+  assert.deepEqual(resolvePageRange(outline, 15, null), { title: 'Summary', startPage: 12, endPage: null });
+});
+
+test('resolvePageRange: no outline entry at/before the page falls back to a window', () => {
+  assert.deepEqual(resolvePageRange([], 10, 20), { title: null, startPage: 8, endPage: 15 });
+  assert.deepEqual(resolvePageRange([], 1, 20), { title: null, startPage: 1, endPage: 6 });
+  assert.deepEqual(resolvePageRange([{ title: 'Late', page: 30 }], 5, 20), { title: null, startPage: 3, endPage: 10 });
+  assert.equal(resolvePageRange([], 0, 20), null);
+  assert.equal(resolvePageRange([], 'abc', 20), null);
 });
 
 const NOTES = [

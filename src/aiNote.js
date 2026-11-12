@@ -63,6 +63,38 @@ export function resolveChapterRange(outline, chapterTitle, numPages) {
 }
 
 /**
+ * Range around a single page of a PDF — the slide-deck case: the outline
+ * section containing the page (the greatest entry at or before it) through
+ * the next entry's page minus one. When the outline has no entry at or
+ * before the page (e.g. a title page ahead of the first bookmark), falls
+ * back to a small window around the page. numPages is optional; when it is
+ * unknown and there is no next entry, endPage is null (open-ended — the
+ * extractor caps the page count itself).
+ */
+export function resolvePageRange(outline, page, numPages, { before = 2, after = 5 } = {}) {
+  const p = Number(page);
+  if (!Number.isInteger(p) || p < 1) return null;
+  const entries = (Array.isArray(outline) ? outline : [])
+    .filter((e) => Number.isInteger(e?.page) && e.page >= 1);
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i].page <= p) {
+      const startPage = entries[i].page;
+      let endPage = null;
+      if (i + 1 < entries.length && Number.isInteger(entries[i + 1].page)) {
+        endPage = entries[i + 1].page - 1;
+      } else if (Number.isInteger(numPages)) {
+        endPage = numPages;
+      }
+      if (endPage !== null) endPage = Math.max(startPage, endPage);
+      return { title: entries[i].title ?? null, startPage, endPage };
+    }
+  }
+  const startPage = Math.max(1, p - before);
+  const endPage = Number.isInteger(numPages) ? Math.max(startPage, Math.min(numPages, p + after)) : p + after;
+  return { title: null, startPage, endPage };
+}
+
+/**
  * Extract the text under a ## heading in a markdown note (up to the next
  * ## heading or EOF). Returns '' when the heading is not found.
  */
