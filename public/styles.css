@@ -20,7 +20,32 @@
   --reading-bg: #3a3a3c;
   --ok: #2e7d4f;
   --bad: #b3261e;
+  --on-accent: #fff;
   --radius: 10px;
+}
+
+/* Dark theme — same tokens, dark values. The top bar, reading pane and
+   code-proposal cards are already dark surfaces and do not change; PDF
+   pages and plot images stay white (they are the reading material). */
+:root[data-theme="dark"] {
+  --wood: #5d4128;
+  --wood-dark: #2e2013;
+  --wood-light: #8a6742;
+  --shelf-board: #3d2a18;
+  --shelf-edge: #241708;
+  --cream: #16110d;
+  --paper: #221c15;
+  --paper-dim: #2c241b;
+  --ink: #ece1cd;
+  --ink-soft: #c8b99e;
+  --ink-faint: #97876c;
+  --accent: #d9a05b;
+  --accent-soft: #3a2b1a;
+  --line: #463729;
+  --reading-bg: #0e0e10;
+  --ok: #63b77f;
+  --bad: #e57373;
+  --on-accent: #241708;
 }
 
 * { box-sizing: border-box; }
@@ -41,7 +66,7 @@ button {
   font: inherit;
   cursor: pointer;
   border: 1px solid var(--line);
-  background: #fff;
+  background: var(--paper);
   color: var(--ink);
   border-radius: 7px;
   padding: 6px 12px;
@@ -50,7 +75,7 @@ button:hover { background: var(--paper-dim); }
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 button.primary:hover { background: var(--wood); }
 button.ghost { border-color: transparent; background: transparent; }
@@ -59,7 +84,7 @@ button:disabled { opacity: .5; cursor: default; }
 input[type="text"], input[type="url"], textarea, select {
   font: inherit;
   color: var(--ink);
-  background: #fff;
+  background: var(--paper);
   border: 1px solid var(--line);
   border-radius: 7px;
   padding: 8px 10px;
@@ -94,6 +119,18 @@ h1, h2, h3, .serif { font-family: Georgia, "Times New Roman", serif; }
   letter-spacing: .5px;
 }
 .brand-sub { font-size: 13px; color: #d9c3a3; }
+
+/* Theme toggle in the very top bar (home header + reader topbar). */
+.theme-toggle { margin-left: auto; }
+.app-header .theme-toggle {
+  background: transparent;
+  border-color: transparent;
+  color: #f3e7d3;
+  font-size: 16px;
+  line-height: 1;
+  padding: 4px 8px;
+}
+.app-header .theme-toggle:hover { background: rgba(255, 255, 255, .14); }
 
 .view { flex: 1; padding: 24px 28px 40px; }
 
@@ -527,7 +564,36 @@ body.reader-open .reader {
   font-size: 13px;
   white-space: nowrap;
   color: var(--ink-soft);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
+/* Inline rename (AV-style): the active markdown tab is an input. */
+.note-tab-input {
+  font: inherit;
+  font-weight: 700;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 0 4px;
+  width: 12ch;
+  min-width: 8ch;
+  max-width: 180px;
+  flex: none;
+  outline: none;
+}
+/* Delete × on note tabs (AV-style two-click confirm). */
+.note-tab .tab-close {
+  font-size: 11px;
+  color: var(--ink-faint);
+  border-radius: 50%;
+  padding: 0 4px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.note-tab .tab-close:hover { background: var(--accent-soft); color: var(--ink); }
+.note-tab .tab-close.armed { color: var(--bad); font-weight: 700; background: none; padding: 0 2px; }
 .note-tab.active {
   background: var(--paper);
   border-color: var(--line);
@@ -551,6 +617,21 @@ body.reader-open .reader {
 .save-status.error { color: var(--bad); }
 
 .notebook-body { flex: 1; overflow-y: auto; min-height: 0; }
+.notebook-body.has-quick-actions { display: flex; flex-direction: column; }
+.notebook-body.has-quick-actions textarea.md-editor { flex: 1; min-height: 0; height: auto; }
+/* Quick actions above the markdown editor: one slim row, small buttons. */
+.md-quick-actions {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  padding: 6px 8px; border-bottom: 1px solid var(--line);
+  background: var(--paper); flex: none;
+}
+.md-quick-actions button {
+  font-size: 12px; line-height: 1.2; padding: 3px 8px;
+  border: 1px solid var(--line); border-radius: 6px;
+  background: transparent; color: var(--ink); cursor: pointer; white-space: nowrap;
+}
+.md-quick-actions button:hover { background: var(--paper-dim); }
+.md-quick-actions button:active { background: var(--accent-soft); }
 .notebook-body textarea.md-editor {
   width: 100%;
   height: 100%;
@@ -603,7 +684,7 @@ body.reader-open .reader {
   padding: 4px 10px;
   background: var(--accent);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 .run-btn:hover { background: var(--wood); }
 .run-output {
@@ -628,7 +709,7 @@ body.reader-open .reader {
   border: 1px solid var(--line);
   border-radius: 8px;
   overflow: hidden;
-  background: #fff;
+  background: var(--paper);
 }
 .nb-cell-head {
   display: flex;
@@ -668,7 +749,7 @@ body.reader-open .reader {
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
-  background: #faf6ec;
+  background: var(--paper-dim);
 }
 .nb-output img { max-width: 100%; display: block; margin-top: 8px; background: #fff; }
 .nb-output:empty { display: none; }
@@ -712,7 +793,7 @@ body.reader-open .reader {
   font-size: 12.5px;
   flex: none;
 }
-.deck-picker-row select { font-size: 13px; padding: 4px 6px; background: #fff; }
+.deck-picker-row select { font-size: 13px; padding: 4px 6px; background: var(--paper); }
 .deck-page-indicator { color: #bbb; font-size: 12.5px; }
 /* The Markdown preview tab renders on paper, not on the dark reader bg. */
 #panel-preview .reading-scroll { background: var(--paper); }
@@ -730,7 +811,7 @@ body.reader-open .reader {
   flex: none;
 }
 .source-switcher:focus { outline: 2px solid rgba(255, 255, 255, .4); border-color: transparent; }
-.source-switcher option { color: var(--ink); background: #fff; }
+.source-switcher option { color: var(--ink); background: var(--paper); }
 
 .chapter-source {
   font-size: 12px;
@@ -858,23 +939,24 @@ body.reader-open .reader {
    row stays pinned at the bottom. */
 .ai-column-body .ai-thread { flex: 1; max-height: none; min-height: 120px; }
 
-/* Page-anchor chips: a `<!-- @page N · source: <id> -->` comment in the
-   markdown renders as a chip; clicking it jumps the left pane there. */
+/* Page-anchor links: a `<!-- @page N · source: <id> -->` comment in the
+   markdown renders as a link ("p. N" for the book, "Slide N" for a deck);
+   clicking it jumps the left pane there. The file itself still holds the
+   plain HTML comment, so external editors see nothing. */
 .page-anchor-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-  padding: 2px 9px;
-  border-radius: 999px;
-  border: 1px solid var(--accent);
-  background: var(--accent-soft);
+  display: inline;
+  padding: 0;
+  border: none;
+  background: none;
   color: var(--accent);
+  font-size: inherit;
   font-weight: 600;
-  margin: 2px 0;
-  vertical-align: middle;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  vertical-align: baseline;
 }
-.page-anchor-chip:hover { background: #f0dfc0; }
+.page-anchor-chip:hover { color: var(--accent); }
 .ai-context { font-size: 13px; color: var(--ink-soft); margin: 8px 0 4px; }
 .ai-include {
   display: inline-flex;
@@ -890,7 +972,7 @@ body.reader-open .reader {
 .ai-thread .hint { margin: 0; }
 .ai-msg { border-radius: 8px; padding: 8px 12px; font-size: 13px; }
 .ai-msg-user { background: var(--accent-soft); align-self: flex-end; max-width: 85%; white-space: pre-wrap; }
-.ai-msg-assistant { background: #fff; border: 1px solid var(--line); align-self: stretch; }
+.ai-msg-assistant { background: var(--paper); border: 1px solid var(--line); align-self: stretch; }
 .ai-msg-body { overflow-x: auto; }
 .ai-msg-body pre { background: var(--paper-dim); border-radius: 6px; padding: 8px 10px; overflow-x: auto; }
 .ai-msg-body code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
@@ -904,7 +986,7 @@ body.reader-open .reader {
   padding: 4px 10px;
   border: 1px solid var(--line);
   border-radius: 999px;
-  background: #fff;
+  background: var(--paper);
   color: var(--ink-soft);
 }
 .ai-chip:hover { background: var(--accent-soft); color: var(--ink); }
@@ -915,7 +997,7 @@ body.reader-open .reader {
   border-radius: 8px;
   padding: 8px 10px;
   font-size: 14px;
-  background: #fff;
+  background: var(--paper);
 }
 .ai-status { font-size: 12.5px; color: var(--ink-faint); margin-top: 6px; min-height: 16px; }
 .ai-status.error { color: var(--bad); }
@@ -955,7 +1037,7 @@ body.reader-open .reader {
 .picker-row select {
   font-size: 12.5px;
   padding: 3px 5px;
-  background: #fff;
+  background: var(--paper);
   border: 1px solid var(--line);
   border-radius: 6px;
   max-width: 220px;
@@ -1063,7 +1145,7 @@ body.reader-open .reader {
 .annot-editor {
   position: absolute;
   z-index: 5;
-  background: #fff;
+  background: var(--paper);
   border: 1px solid var(--line);
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(43, 33, 24, .3);
@@ -1098,7 +1180,7 @@ body.reader-open .reader {
   max-width: 320px;
   max-height: min(70vh, 560px);
   overflow-y: auto;
-  background: #fff;
+  background: var(--paper);
   border: 1px solid var(--line);
   border-radius: 10px;
   box-shadow: 0 10px 32px rgba(43, 33, 24, .28);
@@ -1168,7 +1250,7 @@ body.reader-open .reader {
   padding: 2px;
   background: var(--paper-dim);
 }
-.layout-cell { background: #fff; border: 1px solid var(--line); border-radius: 2px; flex: 1 1 0; min-width: 0; }
+.layout-cell { background: var(--paper); border: 1px solid var(--line); border-radius: 2px; flex: 1 1 0; min-width: 0; }
 .layout-cell.nav { flex: 0 0 22px; background: var(--paper-dim); }
 .layout-cell.ai { flex: 0 0 30px; background: var(--accent-soft); }
 .layout-panel-row {
@@ -1202,7 +1284,7 @@ body.reader-open .reader {
   padding: 3px 5px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: #fff;
+  background: var(--paper);
   min-width: 0;
   flex: 1;
 }

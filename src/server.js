@@ -718,6 +718,71 @@ app.put('/api/projects/:slug/notes/:name', async (req, res, next) => {
   }
 });
 
+// Rename a note file on disk. notes.md is the master filing home (+ Note
+// here, AI Apply default) and cannot be renamed; the target must not
+// already exist. Filing is by content, not filename, so no chapterMap
+// change is needed.
+app.post('/api/projects/:slug/notes/:name/rename', async (req, res, next) => {
+  try {
+    validateNoteName(req.params.name);
+    const { name } = req.body ?? {};
+    if (typeof name !== 'string') {
+      return res.status(400).json({ error: 'name (string) is required' });
+    }
+    validateNoteName(name);
+    if (req.params.name === LEGACY_NOTES_FILE) {
+      return res.status(400).json({ error: 'notes.md cannot be renamed' });
+    }
+    const from = resolveProjectPath(DATA_DIR, req.params.slug, 'notes', req.params.name);
+    const to = resolveProjectPath(DATA_DIR, req.params.slug, 'notes', name);
+    try {
+      await fsp.lstat(from);
+    } catch (err) {
+      if (err.code === 'ENOENT') return res.status(404).json({ error: 'note not found' });
+      throw err;
+    }
+    try {
+      await fsp.lstat(to);
+      return res.status(409).json({ error: 'a note with that name already exists' });
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+    await fsp.rename(from, to);
+    const project = await readProject(req.params.slug);
+    await writeProject(req.params.slug, project); // bump updatedAt
+    res.json({ name });
+  } catch (err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// Delete a note file. notes.md is the master filing home and cannot be
+// deleted.
+app.delete('/api/projects/:slug/notes/:name', async (req, res, next) => {
+  try {
+    validateNoteName(req.params.name);
+    if (req.params.name === LEGACY_NOTES_FILE) {
+      return res.status(400).json({ error: 'notes.md cannot be deleted' });
+    }
+    const file = resolveProjectPath(DATA_DIR, req.params.slug, 'notes', req.params.name);
+    try {
+      await fsp.unlink(file);
+    } catch (err) {
+      if (err.code === 'ENOENT') return res.status(404).json({ error: 'note not found' });
+      throw err;
+    }
+    const project = await readProject(req.params.slug);
+    await writeProject(req.params.slug, project); // bump updatedAt
+    res.json({ deleted: req.params.name });
+  } catch (err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
 // PDF annotations (highlight + note pin) — one per-project file,
 // `annotations.json` beside `notes/`. Separate from notes.md, so the
 // master-notes migration never touches them. Rendering is an overlay on

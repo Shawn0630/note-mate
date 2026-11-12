@@ -34,6 +34,7 @@ import {
   clampZoom, zoomStep, zoomFromWheel, zoomFromGesture, zoomPercent,
   fitScale, firstFreeName, PANE_DEFAULTS, LAYOUT_PRESETS,
 } from './readerLayout.js';
+import { MD_QUICK_ACTIONS, mdQuickSnippet } from './mdQuickActions.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdfjs/pdf.worker.mjs';
 
@@ -861,6 +862,8 @@ function renderReaderShell() {
         ${switcher}
         <button type="button" id="ai-toggle-top" class="${state.panels.ai ? 'active' : ''}"
                 title="Ask the AI — opens the AI panel">✨ Ask AI</button>
+        <button type="button" id="theme-toggle-top" class="theme-toggle"
+                title="Switch to dark theme" aria-label="Switch to dark theme">🌙</button>
       </header>
       <aside class="chapter-panel" id="chapter-panel" aria-label="Chapters"></aside>
       <div class="reader-divider" id="divider-nav" data-divider="nav" title="Drag to resize the chapter panel" aria-hidden="true"></div>
@@ -882,6 +885,8 @@ function renderReaderShell() {
     openLayoutMenu(e.currentTarget);
   });
   $('#ai-toggle-top', view).addEventListener('click', toggleAiPanel);
+  $('#theme-toggle-top', view).addEventListener('click', toggleTheme);
+  syncThemeToggle();
   $('#chapter-toggle', view).addEventListener('click', () => {
     updatePanels({ ...state.panels, nav: !state.panels.nav });
   });
@@ -2595,6 +2600,103 @@ function resetExecCounter() {
   });
 }
 
+/* Note rename/delete (AV TabContainer style). Rename is commit-based:
+   the active markdown tab is an input; Enter/blur commits, Escape
+   cancels. Delete is two-click: the first click arms the tab's × for
+   2s, the second confirms. notes.md — the master filing home — has
+   neither: it cannot be renamed or deleted. */
+let armedNoteDelete = null;
+let armedNoteDeleteTimer = 0;
+let noteRenameSuppressed = false;
+
+function suppressNoteRenameCommit() {
+  // Clicking the tab's own × blurs the rename input; the delete intent
+  // wins and the half-typed rename is dropped. The blur runs
+  // synchronously inside this mousedown, so clear the flag next tick.
+  noteRenameSuppressed = true;
+  setTimeout(() => { noteRenameSuppressed = false; }, 0);
+}
+
+function cancelNoteRename(input) {
+  input.dataset.done = '1';
+  input.blur();
+  renderNotebookPane();
+}
+
+async function commitNoteRename(oldName, input) {
+  if (input.dataset.done) return;
+  input.dataset.done = '1';
+  if (noteRenameSuppressed) return; // the delete click owns the next render
+  const name = input.value.trim();
+  if (!name || name === oldName) { renderNotebookPane(); return; }
+  if (!name.toLowerCase().endsWith('.md')) {
+    renderNotebookPane();
+    setSaveStatus('Rename failed: the name must end with .md.', 'error');
+    return;
+  }
+  if (state.notes.some((n) => n.name === name)) {
+    renderNotebookPane();
+    setSaveStatus(`Rename failed: ${name} already exists.`, 'error');
+    return;
+  }
+  if (state.saveTimer) { clearTimeout(state.saveTimer); state.saveTimer = null; }
+  try {
+    await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/${encodeURIComponent(oldName)}/rename`, 'POST', { name });
+  } catch (err) {
+    renderNotebookPane();
+    setSaveStatus(`Rename failed: ${err.message}`, 'error');
+    return;
+  }
+  const entry = state.notes.find((n) => n.name === oldName);
+  if (entry) entry.name = name;
+  if (state.activeNoteName === oldName) state.activeNoteName = name;
+  if (state.previewNoteName === oldName) state.previewNoteName = name;
+  // Status last: renderNotebookPane rebuilds the tab bar (and with it
+  // #save-status), so a message set before the render would be wiped.
+  renderNotebookPane();
+  renderChapterPanel();
+  renderLeftPreview();
+  setSaveStatus(`Renamed to ${name}.`);
+}
+
+function armNoteDelete(name) {
+  if (armedNoteDelete !== name) {
+    if (armedNoteDeleteTimer) window.clearTimeout(armedNoteDeleteTimer);
+    armedNoteDelete = name;
+    armedNoteDeleteTimer = window.setTimeout(() => {
+      armedNoteDelete = null;
+      renderNotebookPane();
+    }, 2000);
+    renderNotebookPane();
+    return;
+  }
+  if (armedNoteDeleteTimer) window.clearTimeout(armedNoteDeleteTimer);
+  armedNoteDelete = null;
+  deleteNote(name);
+}
+
+async function deleteNote(name) {
+  if (state.saveTimer) { clearTimeout(state.saveTimer); state.saveTimer = null; }
+  try {
+    await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/${encodeURIComponent(name)}`, 'DELETE');
+  } catch (err) {
+    renderNotebookPane();
+    setSaveStatus(`Delete failed: ${err.message}`, 'error');
+    return;
+  }
+  state.notes = state.notes.filter((n) => n.name !== name);
+  if (state.previewNoteName === name) state.previewNoteName = null;
+  if (state.activeTabKind === 'note' && state.activeNoteName === name) {
+    try { await loadNote('notes.md'); } catch { /* master missing — pane renders empty */ }
+  }
+  // Status last: renderNotebookPane rebuilds the tab bar (and with it
+  // #save-status), so a message set before the render would be wiped.
+  renderNotebookPane();
+  renderChapterPanel();
+  renderLeftPreview();
+  setSaveStatus(`Deleted ${name}.`);
+}
+
 function renderNotebookPane() {
   const pane = $('#notebook-pane', view);
   if (!pane) return;
@@ -2609,12 +2711,40 @@ function renderNotebookPane() {
 
   const tabs = $('#notebook-tabs', pane);
   state.notes.forEach((n) => {
+    const isActive = state.activeTabKind === 'note' && n.name === state.activeNoteName;
     const tab = document.createElement('button');
     tab.type = 'button';
-    tab.className = `note-tab${state.activeTabKind === 'note' && n.name === state.activeNoteName ? ' active' : ''}`;
-    tab.textContent = n.name;
+    tab.className = `note-tab${isActive ? ' active' : ''}`;
+    if (isActive && n.kind === 'md') {
+      // AV-style inline rename: the active markdown tab is an input;
+      // Enter/blur commits, Escape cancels.
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'note-tab-input';
+      input.value = n.name;
+      input.title = 'Rename this note (Enter to confirm, Esc to cancel)';
+      input.addEventListener('click', (e) => e.stopPropagation());
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+        if (e.key === 'Escape') { e.preventDefault(); cancelNoteRename(input); }
+      });
+      input.addEventListener('blur', () => commitNoteRename(n.name, input));
+      tab.appendChild(input);
+    } else {
+      tab.textContent = n.name;
+    }
+    if (n.kind === 'md' && n.name !== 'notes.md') {
+      // AV-style two-click delete: first click arms, second confirms.
+      const del = document.createElement('span');
+      del.className = `tab-close${armedNoteDelete === n.name ? ' armed' : ''}`;
+      del.textContent = armedNoteDelete === n.name ? 'Sure?' : '✕';
+      del.title = armedNoteDelete === n.name ? 'Click again to confirm delete' : 'Delete this note';
+      del.addEventListener('mousedown', () => suppressNoteRenameCommit());
+      del.addEventListener('click', (e) => { e.stopPropagation(); armNoteDelete(n.name); });
+      tab.appendChild(del);
+    }
     tab.addEventListener('click', async () => {
-      if (state.activeTabKind === 'note' && n.name === state.activeNoteName) return;
+      if (isActive) return;
       await loadNote(n.name);
       renderNotebookPane();
       renderChapterPanel();
@@ -2874,17 +3004,72 @@ function setSaveStatus(text, cls = '') {
   if (el) { el.textContent = text; el.className = `save-status ${cls}`.trim(); }
 }
 
+/* Today's date as YYYY-MM-DD on the Vancouver day. */
+function vancouverDateStr(d = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(d);
+}
+
+/* Insert a quick-action snippet at the editor cursor (see
+   mdQuickActions.js). document.execCommand('insertText') keeps the
+   insertion as one native undo step, so Ctrl/Cmd+Z takes it back; the
+   input event it fires drives the autosave + live preview like typing. */
+function insertMdQuickAction(ta, action) {
+  if (!ta) return;
+  const start = ta.selectionStart ?? 0;
+  const end = ta.selectionEnd ?? start;
+  const opts = {};
+  if (action === 'date') opts.date = vancouverDateStr();
+  if (action === 'anchor') {
+    const reading = currentReadingPage();
+    if (!reading) {
+      setSaveStatus('No page to anchor to — open the book or a deck first.');
+      return;
+    }
+    opts.anchor = formatPageAnchor(reading);
+  }
+  let snip;
+  try {
+    snip = mdQuickSnippet(action, ta.value.slice(0, start), ta.value.slice(end), opts);
+  } catch (err) {
+    setSaveStatus(err.message, 'error');
+    return;
+  }
+  ta.focus();
+  ta.setSelectionRange(start, end);
+  const done = document.execCommand('insertText', false, snip.text);
+  if (!done) {
+    ta.setRangeText(snip.text, start, end, 'end');
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  ta.setSelectionRange(start + snip.selStart, start + snip.selEnd);
+  ta.focus();
+}
+
 function renderNotebookBody() {
   const body = $('#notebook-body', view);
   if (!body) return;
+  body.classList.remove('has-quick-actions'); // re-added below for md notes
   if (state.activeNoteKind === 'ipynb') {
     renderIpynbBody(body);
     return;
   }
   // Markdown notes are always edited here; the rendered preview lives in
-  // the LEFT pane's Preview tab (pick the note there).
-  body.innerHTML = `<textarea class="md-editor" id="md-editor" spellcheck="false"></textarea>`;
+  // the LEFT pane's Preview tab (pick the note there). One slim row of
+  // quick actions sits above the editor — labels only, no prose.
+  body.classList.add('has-quick-actions');
+  body.innerHTML = `<div class="md-quick-actions" role="toolbar" aria-label="Quick actions">${MD_QUICK_ACTIONS.map((a) => `<button type="button" data-md-action="${a.id}" title="${esc(a.title)}">${esc(a.label)}</button>`).join('')}</div><textarea class="md-editor" id="md-editor" spellcheck="false"></textarea>`;
   const ta = $('#md-editor', body);
+  // mousedown preventDefault keeps focus (and the selection) in the
+  // editor while a quick-action button is clicked.
+  $('.md-quick-actions', body).addEventListener('mousedown', (e) => {
+    if (e.target.closest('button')) e.preventDefault();
+  });
+  $('.md-quick-actions', body).addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-md-action]');
+    if (btn) insertMdQuickAction(ta, btn.dataset.mdAction);
+  });
   ta.value = state.activeNoteContent;
   ta.addEventListener('focus', () => { state.editorFocused = true; });
   ta.addEventListener('blur', () => {
@@ -2934,7 +3119,7 @@ function renderMdPreview(el, text) {
     chip.className = 'page-anchor-chip';
     chip.dataset.anchorSource = anchor.sourceId;
     chip.dataset.anchorPage = String(anchor.page);
-    chip.textContent = `📍 ${anchorChipLabel(anchor, label)}`;
+    chip.textContent = anchorChipLabel(anchor, label);
     chip.title = `Jump to ${anchor.sourceId === PAGE_ANCHOR_SOURCE_BOOK ? `p. ${anchor.page} of the book` : `slide ${anchor.page} of ${label || anchor.sourceId}`}`;
     chip.addEventListener('click', () => jumpToAnchor(anchor.sourceId, anchor.page));
     comment.replaceWith(chip);
@@ -3522,7 +3707,7 @@ function parsePageAnchors(text) {
 function anchorChipLabel(anchor, materialLabel) {
   if (!anchor) return '';
   if (anchor.sourceId === PAGE_ANCHOR_SOURCE_BOOK) return `p. ${anchor.page}`;
-  return `${materialLabel || anchor.sourceId} · p. ${anchor.page}`;
+  return `Slide ${anchor.page}`;
 }
 
 /* Chapter number from a note heading's text: "12. Transformers" -> 12.
@@ -4214,6 +4399,36 @@ function openCellExportModal(markdown, name, images) {
   });
 }
 
+/* ---------------- theme: dark / light ---------------- */
+
+// Manual toggle only (no system-follow): the choice persists in
+// localStorage, default is the current light look. The inline script in
+// index.html applies the saved theme before first paint.
+const THEME_KEY = 'nm-theme';
+function currentTheme() {
+  return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+}
+function syncThemeToggle() {
+  const dark = currentTheme() === 'dark';
+  $$('.theme-toggle').forEach((btn) => {
+    btn.textContent = dark ? '☀️' : '🌙';
+    btn.title = dark ? 'Switch to light theme' : 'Switch to dark theme';
+    btn.setAttribute('aria-label', btn.title);
+  });
+}
+function setTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem(THEME_KEY, theme); } catch { /* private mode */ }
+  syncThemeToggle();
+}
+function toggleTheme() {
+  setTheme(currentTheme() === 'dark' ? 'light' : 'dark');
+}
+function initThemeToggle() {
+  $$('.theme-toggle').forEach((btn) => btn.addEventListener('click', toggleTheme));
+  syncThemeToggle();
+}
+
 /* ---------------- boot ---------------- */
 
 // Ctrl/Cmd+S saves the markdown note whenever its editor is open,
@@ -4226,4 +4441,5 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+initThemeToggle();
 route();
