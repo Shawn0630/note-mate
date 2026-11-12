@@ -632,6 +632,24 @@ body.reader-open .reader {
 }
 .md-quick-actions button:hover { background: var(--paper-dim); }
 .md-quick-actions button:active { background: var(--accent-soft); }
+/* The Page anchor split button: main button + chevron, joined. */
+.md-action-split { display: inline-flex; }
+.md-action-split button[data-md-action="anchor"] { border-radius: 6px 0 0 6px; }
+.md-action-split .md-action-chevron {
+  border-radius: 0 6px 6px 0; border-left: none; padding: 3px 6px;
+}
+/* Recent-impressions dropdown (Page anchor chevron): label + time rows. */
+.impression-menu { min-width: 280px; }
+.impression-row {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  width: 100%; padding: 7px 8px; border: none; border-radius: 6px;
+  background: transparent; color: var(--ink); font-size: 13px; cursor: pointer;
+  text-align: left;
+}
+.impression-row:hover { background: var(--paper-dim); }
+.impression-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.impression-time { color: var(--ink-faint); font-size: 12px; white-space: nowrap; }
+.impression-empty { padding: 8px; color: var(--ink-soft); font-size: 13px; }
 .notebook-body textarea.md-editor {
   width: 100%;
   height: 100%;

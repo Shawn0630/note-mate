@@ -32,6 +32,7 @@ import {
   ANNOTATIONS_FILE, emptyAnnotationsDoc, parseAnnotationsDoc,
   newAnnotationId, validateAnnotationInput,
 } from './annotations.js';
+import { ensurePdf, isConvertibleDoc } from './convertDocument.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -236,6 +237,9 @@ function inferKindFromUrl(url) {
 function inferKindFromExt(ext) {
   switch (ext) {
     case '.pdf': return 'pdf';
+    // Word documents read as PDF projects: the file route converts them
+    // lazily (see readablePdfPath), so the reader needs no docx kind.
+    case '.docx': case '.doc': return 'pdf';
     case '.mp4': case '.mov': case '.webm': case '.mkv': return 'video';
     case '.ppt': case '.pptx': case '.key': return 'ppt';
     default: return 'pdf';
@@ -292,24 +296,86 @@ async function listLabs(slug) {
 async function listMaterials(slug, project) {
   const out = [];
   for (const m of project.materials ?? []) {
-    let hasFile = false;
-    if (m.file) {
-      try {
-        await fsp.stat(resolveProjectPath(DATA_DIR, slug, m.file));
-        hasFile = true;
-      } catch {
-        hasFile = false;
-      }
-    }
     out.push({
       id: m.id,
       label: m.label,
       kind: m.kind,
-      hasFile,
+      // Readable = a renderable PDF is there, or its source document can
+      // be converted on first read (a deck whose PDF was deleted
+      // re-converts from the PPTX; a Word doc converts on first read).
+      hasFile: await materialReadable(slug, m),
       ...(m.sourceUrl ? { sourceUrl: m.sourceUrl } : {}),
     });
   }
   return out;
+}
+
+// --- Readable PDFs: a stored .pdf is itself; a Word / PowerPoint
+// document converts to a cached PDF beside the source on first read (see
+// src/convertDocument.js). The reader, the AI context and the file routes
+// all go through here, so a converted document behaves like any PDF.
+function convertScratchDir() {
+  return path.join(os.tmpdir(), 'nm-convert');
+}
+
+async function fileExists(file) {
+  try { await fsp.stat(file); return true; } catch { return false; }
+}
+
+/** The readable PDF for a stored relative path inside a project. */
+async function readablePdfPath(slug, relPath) {
+  const input = resolveProjectPath(DATA_DIR, slug, relPath);
+  if (/\.pdf$/i.test(relPath)) {
+    await fsp.stat(input); // throws ENOENT when gone
+    return input;
+  }
+  if (!isConvertibleDoc(input)) {
+    const err = new Error(`not a readable document: ${relPath}`);
+    err.status = 422;
+    throw err;
+  }
+  const r = await ensurePdf(input, { scratch: convertScratchDir() });
+  if (!r.ok) {
+    const err = new Error(r.error);
+    err.status = 422;
+    if (r.code) err.code = r.code;
+    throw err;
+  }
+  return r.path;
+}
+
+/** A material is readable when its renderable file exists, or when its
+    source document can be converted (a deck whose PDF was deleted
+    re-converts from the PPTX; a Word doc converts on first read). */
+async function materialReadable(slug, material) {
+  if (material.file && await fileExists(resolveProjectPath(DATA_DIR, slug, material.file))) return true;
+  if (material.sourceFile && isConvertibleDoc(material.sourceFile)) {
+    return fileExists(resolveProjectPath(DATA_DIR, slug, material.sourceFile));
+  }
+  return false;
+}
+
+/** The readable PDF for a material: its `file` when that is a PDF, else a
+    conversion of its source document (the deck scheme: file = converted
+    PDF, sourceFile = original PPTX/DOCX — a missing PDF re-converts). */
+async function materialPdfPath(slug, material) {
+  if (material.file) {
+    if (/\.pdf$/i.test(material.file)) {
+      try {
+        return await readablePdfPath(slug, material.file);
+      } catch (err) {
+        if (err.code !== 'ENOENT' || !material.sourceFile) throw err;
+        // The converted PDF is gone but the source document is there:
+        // fall through and re-convert it.
+      }
+    } else {
+      return readablePdfPath(slug, material.file);
+    }
+  }
+  if (material.sourceFile) return readablePdfPath(slug, material.sourceFile);
+  const err = new Error('material has no readable file');
+  err.status = 404;
+  throw err;
 }
 
 function validateNoteName(name) {
@@ -466,8 +532,16 @@ app.get('/api/projects/:slug/file', async (req, res, next) => {
       return res.redirect(302, project.sourceUrl);
     }
     if (!project.file) return res.status(404).json({ error: 'no source file' });
-    const filePath = resolveProjectPath(DATA_DIR, req.params.slug, project.file);
-    await fsp.stat(filePath); // 404 when the file is gone
+    // A Word document as the main source converts lazily to a cached PDF
+    // beside it, so it reads like any PDF project.
+    let filePath;
+    try {
+      filePath = await readablePdfPath(req.params.slug, project.file);
+    } catch (err) {
+      if (err.code === 'ENOENT') return res.status(404).json({ error: 'project or file not found' });
+      if (err.status === 422) return res.status(422).json({ error: err.message });
+      throw err;
+    }
     // res.sendFile honours Range requests, which pdf.js needs.
     res.sendFile(filePath);
   } catch (err) {
@@ -497,13 +571,62 @@ app.get('/api/projects/:slug/materials/:id/file', async (req, res, next) => {
     const project = await readProject(req.params.slug);
     const material = (project.materials ?? []).find((m) => m.id === req.params.id);
     if (!material) return res.status(404).json({ error: 'material not found' });
-    if (!material.file) return res.status(404).json({ error: 'material has no file' });
-    const filePath = resolveProjectPath(DATA_DIR, req.params.slug, material.file);
-    await fsp.stat(filePath); // 404 when the file is gone
+    let filePath;
+    try {
+      filePath = await materialPdfPath(req.params.slug, material);
+    } catch (err) {
+      if (err.code === 'ENOENT') return res.status(404).json({ error: 'project or file not found' });
+      if (err.status === 404) return res.status(404).json({ error: err.message });
+      if (err.status === 422) return res.status(422).json({ error: err.message });
+      throw err;
+    }
     // Same Range-supporting pattern as the main file route.
     res.sendFile(filePath);
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'project or file not found' });
+    next(err);
+  }
+});
+
+// Add a material to a project: a PDF, Word document or PowerPoint file.
+// Word/PowerPoint convert lazily to a cached PDF beside the source (same
+// scheme as the seeded decks: file = converted PDF, sourceFile =
+// original), so the new material reads, anchors and jumps like any PDF.
+// Returns 201 with the material entry (same shape as GET /materials).
+app.post('/api/projects/:slug/materials', upload.single('file'), async (req, res, next) => {
+  try {
+    const project = await readProject(req.params.slug);
+    if (!req.file) return res.status(400).json({ error: 'file is required' });
+    const ext = path.extname(req.file.originalname || '').toLowerCase();
+    const isPdf = ext === '.pdf';
+    const isDoc = ext === '.docx' || ext === '.doc';
+    const isPpt = ext === '.pptx' || ext === '.ppt';
+    if (!isPdf && !isDoc && !isPpt) {
+      return res.status(400).json({ error: 'only PDF, Word (.docx/.doc) and PowerPoint (.pptx/.ppt) files can be added as materials' });
+    }
+    const label = (req.body.label || '').trim() || path.basename(req.file.originalname, ext) || 'Material';
+    const existing = new Set((project.materials ?? []).map((m) => m.id));
+    const base = slugify(label) || 'material';
+    let id = base;
+    for (let n = 2; existing.has(id); n++) id = `${base}-${n}`;
+    const dir = path.join(projectsDir(), req.params.slug, 'materials');
+    await fsp.mkdir(dir, { recursive: true });
+    const storedName = `${id}${ext}`;
+    await fsp.writeFile(path.join(dir, storedName), req.file.buffer);
+    const entry = {
+      id,
+      label,
+      kind: isPpt ? 'slides' : 'pdf',
+      ...(isPdf
+        ? { file: `materials/${storedName}` }
+        : { file: `materials/${id}.pdf`, sourceFile: `materials/${storedName}` }),
+    };
+    project.materials = [...(project.materials ?? []), entry];
+    await writeProject(req.params.slug, project);
+    const created = (await listMaterials(req.params.slug, project)).find((m) => m.id === id);
+    res.status(201).json(created);
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
     next(err);
   }
 });
@@ -952,7 +1075,7 @@ async function buildReadingContext(slug, project, { source, chapter, page }) {
       return { error: { status: 400, message: 'chapter context needs a PDF project with a downloaded file' } };
     }
     try {
-      buf = await fsp.readFile(resolveProjectPath(DATA_DIR, slug, project.file));
+      buf = await fsp.readFile(await readablePdfPath(slug, project.file));
     } catch (err) {
       return { error: { status: err.status || 400, message: err.message } };
     }
@@ -960,9 +1083,9 @@ async function buildReadingContext(slug, project, { source, chapter, page }) {
   } else {
     const material = (project.materials ?? []).find((m) => m.id === sourceId);
     if (!material) return { error: { status: 400, message: `unknown source: ${sourceId}` } };
-    if (!material.file) return { error: { status: 400, message: `source ${sourceId} has no file` } };
+    if (!material.file && !material.sourceFile) return { error: { status: 400, message: `source ${sourceId} has no file` } };
     try {
-      buf = await fsp.readFile(resolveProjectPath(DATA_DIR, slug, material.file));
+      buf = await fsp.readFile(await materialPdfPath(slug, material));
     } catch (err) {
       return { error: { status: err.status || 400, message: err.message } };
     }

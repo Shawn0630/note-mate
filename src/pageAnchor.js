@@ -35,10 +35,42 @@ export function parsePageAnchors(text) {
   return out;
 }
 
-// Chip label for an anchor. The material label (e.g. "Supervised Learning")
-// is the deck's display name; falls back to the raw id.
-export function anchorChipLabel(anchor, materialLabel) {
+// Chip label for an anchor. `material` is the material the anchor points
+// at ({label, kind}) or null for the book. A deck reads "Slide N", any other
+// PDF material reads "p. N · <label>" (the label disambiguates it from the
+// book), the book reads "p. N".
+export function anchorChipLabel(anchor, material) {
   if (!anchor) return '';
   if (anchor.sourceId === PAGE_ANCHOR_SOURCE_BOOK) return `p. ${anchor.page}`;
-  return `${materialLabel || anchor.sourceId} · p. ${anchor.page}`;
+  // With the material in hand the kind decides. Without it, fall back to
+  // the seed's naming convention: deck ids are `slides-*`.
+  const kind = material ? String(material.kind || '').toLowerCase() : null;
+  if (kind === 'slides' || (kind == null && String(anchor.sourceId).startsWith('slides-'))) {
+    return `Slide ${anchor.page}`;
+  }
+  const label = material?.label || anchor.sourceId;
+  return `p. ${anchor.page} · ${label}`;
+}
+
+// Where does an anchor jump? 'book' is the project's main PDF; anything
+// else is a material id. Returns {target:'book'}, {target:'material', id,
+// kind} (kind 'slides' = deck, 'pdf' = a PDF document), or
+// {target:'unknown'} when the id is not a readable material of this
+// project. The anchor FORMAT already names any material by id — this is
+// the resolution half that makes jumping work across all of them.
+export function resolveAnchorTarget(sourceId, materials) {
+  if (!sourceId || sourceId === PAGE_ANCHOR_SOURCE_BOOK) return { target: 'book' };
+  const mat = (materials || []).find((m) => String(m.id) === String(sourceId));
+  if (!mat || mat.hasFile === false) return { target: 'unknown' };
+  const kind = String(mat.kind || '').toLowerCase();
+  if (kind !== 'slides' && kind !== 'pdf') return { target: 'unknown' };
+  return { target: 'material', id: mat.id, kind };
+}
+
+/** The project's extra PDF documents (kind 'pdf'), i.e. the ones the PDF
+    tab's picker offers next to the book. Decks (kind 'slides') live in the
+    Slides tab instead. */
+export function pdfMaterials(materials) {
+  return (materials || []).filter((m) => String(m.kind || '').toLowerCase() === 'pdf'
+    && m.hasFile !== false);
 }

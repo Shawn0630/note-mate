@@ -35,6 +35,9 @@ import {
   fitScale, firstFreeName, PANE_DEFAULTS, LAYOUT_PRESETS,
 } from './readerLayout.js';
 import { MD_QUICK_ACTIONS, mdQuickSnippet } from './mdQuickActions.js';
+import {
+  recordImpression, recentImpressions, relativeTimeLabel, impressionLabel,
+} from './recentImpressions.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdfjs/pdf.worker.mjs';
 
@@ -147,6 +150,8 @@ function kindLabel(kind) {
 function kindFromExtension(name) {
   const ext = String(name || '').split('.').pop().toLowerCase();
   if (ext === 'pdf') return 'pdf';
+  // Word reads as a PDF project: the file route converts it lazily.
+  if (ext === 'docx' || ext === 'doc') return 'pdf';
   if (['mp4', 'webm', 'mov', 'mkv', 'm4v'].includes(ext)) return 'video';
   if (['ppt', 'pptx', 'key'].includes(ext)) return 'ppt';
   return null;
@@ -253,6 +258,13 @@ const state = {
   // source note and the AI context line keep working.
   materials: [],
   activeSourceId: null,
+  // The PDF the PDF tab is showing: 'book' or an extra PDF material id.
+  // The book is the default; the picker appears only when the project has
+  // extra PDFs (see syncPdfPicker).
+  pdfSourceId: 'book',
+  // Recent impressions: pages/slides looked at in the last 5 minutes,
+  // session-only. The Page anchor quick action offers them in a dropdown.
+  recentImpressions: [],
   // Labs (v1.1): chapters from GET .../labs; labTabs are labs opened as
   // notebook tabs. activeTabKind 'note' | 'lab' decides the save endpoint.
   // The Labs index lives behind the tab-bar + menu (no visible section).
@@ -328,6 +340,8 @@ function resetReaderState() {
   state.notesMdContent = null;
   state.materials = [];
   state.activeSourceId = null;
+  state.pdfSourceId = 'book';
+  state.recentImpressions = [];
   state.labs = [];
   state.labTabs = [];
   state.activeTabKind = 'note';
@@ -521,9 +535,9 @@ function openAddProjectModal() {
         <label for="ap-title">Title</label>
         <input type="text" id="ap-title" name="title" placeholder="e.g. Machine Learning — Lecture 1" required>
 
-        <label for="ap-file">File (PDF, video, or PowerPoint)</label>
+        <label for="ap-file">File (PDF, Word, video, or PowerPoint)</label>
         <input type="file" id="ap-file" name="file"
-               accept=".pdf,.mp4,.webm,.mov,.mkv,.m4v,.ppt,.pptx,.key">
+               accept=".pdf,.docx,.doc,.mp4,.webm,.mov,.mkv,.m4v,.ppt,.pptx,.key">
         <div class="hint" id="ap-file-hint"></div>
 
         <div class="ai-import-row" id="ap-ai-row" hidden>
@@ -1174,6 +1188,7 @@ async function switchSource(materialId) {
   await loadPdf(
     `/api/projects/${encodeURIComponent(state.project.slug)}/materials/${encodeURIComponent(materialId)}/file`,
     '',
+    materialId,
   );
 }
 
@@ -1200,6 +1215,10 @@ async function renderReadingPane() {
       </div>
       <div class="reading-tab-panels">
         <div class="reading-tab-panel" id="panel-pdf" ${state.leftTab === 'pdf' ? '' : 'hidden'}>
+          <div class="picker-row picker-row-dark" id="pdf-picker-row" hidden>
+            <label>PDF <select id="pdf-picker" aria-label="PDF document"></select></label>
+            <button type="button" id="pdf-add-material-btn" class="mini-btn" title="Add a PDF, Word or PowerPoint file to this project">＋ Add</button>
+          </div>
           <div class="picker-row picker-row-dark" id="pdf-zoom-row">
             ${zoomControlsHtml('pdf')}
             ${annotToolsHtml()}
@@ -1210,6 +1229,7 @@ async function renderReadingPane() {
           <div class="deck-picker-row">
             <label>Deck <select id="deck-picker" aria-label="Slide deck"></select></label>
             <span class="deck-page-indicator" id="deck-page-indicator"></span>
+            <button type="button" id="deck-add-material-btn" class="mini-btn" title="Add a PDF, Word or PowerPoint file to this project">＋ Add</button>
             ${zoomControlsHtml('deck')}
             ${annotToolsHtml()}
           </div>
@@ -1230,6 +1250,14 @@ async function renderReadingPane() {
     $('#deck-picker', pane).addEventListener('change', (e) => {
       if (e.target.value) ensureDeckLoaded(e.target.value);
     });
+    const deckAddBtn = $('#deck-add-material-btn', pane);
+    if (deckAddBtn) deckAddBtn.addEventListener('click', promptAddMaterial);
+    syncPdfPicker();
+    $('#pdf-picker', pane).addEventListener('change', (e) => {
+      ensurePdfSourceLoaded(e.target.value === 'book' ? PAGE_ANCHOR_SOURCE_BOOK : e.target.value);
+    });
+    const pdfAddBtn = $('#pdf-add-material-btn', pane);
+    if (pdfAddBtn) pdfAddBtn.addEventListener('click', promptAddMaterial);
     syncPreviewNotePicker();
     $('#preview-note-picker', pane).addEventListener('change', (e) => {
       state.previewNoteName = e.target.value || null;
@@ -1304,6 +1332,52 @@ function syncDeckPicker() {
   )).join('');
 }
 
+/* Fill the PDF picker (Book + extra PDF materials); the row shows only
+   when the project has extra PDFs — a single-book project looks exactly
+   as before. Called on pane render, on source change and after a material
+   is added. */
+function syncPdfPicker() {
+  const row = $('#pdf-picker-row', view);
+  const sel = $('#pdf-picker', view);
+  if (!row || !sel) return;
+  const extras = pdfMaterialsList();
+  row.hidden = extras.length === 0;
+  if (extras.length === 0) return;
+  const current = state.pdfSourceId || PAGE_ANCHOR_SOURCE_BOOK;
+  sel.innerHTML = `<option value="book"${current === PAGE_ANCHOR_SOURCE_BOOK ? ' selected' : ''}>Book (PDF)</option>`
+    + extras.map((m) => `<option value="${esc(m.id)}"${m.id === current ? ' selected' : ''}>${esc(m.label || m.id)}</option>`).join('');
+}
+
+/* Add a material to this project: a PDF, Word or PowerPoint file. The
+   file picker opens from the ＋ button in a picker row; the server stores
+   it (Word/PowerPoint convert lazily) and the pickers refresh. */
+function promptAddMaterial() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.pdf,.docx,.doc,.pptx,.ppt';
+  input.addEventListener('change', async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    await addMaterialFile(file);
+  });
+  input.click();
+}
+
+async function addMaterialFile(file) {
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const created = await api(`/api/projects/${encodeURIComponent(state.project.slug)}/materials`, { method: 'POST', body: form });
+    const materials = await apiGet(`/api/projects/${encodeURIComponent(state.project.slug)}/materials`);
+    state.materials = Array.isArray(materials) ? materials : [];
+    syncDeckPicker();
+    syncPdfPicker();
+    setSaveStatus(`Added “${created?.label || file.name}” — open it from the picker.`);
+  } catch (err) {
+    setSaveStatus(err.message, 'error');
+  }
+}
+
 /* Switch the left (reading) tab. The deck loads lazily on first Slides
    open; the preview renders on open. The tab also drives activeSourceId
    (pdf/preview -> the book, slides -> the deck) so the chapter panel's
@@ -1311,7 +1385,9 @@ function syncDeckPicker() {
 function setLeftTab(tab) {
   if (!['pdf', 'slides', 'preview'].includes(tab)) return;
   state.leftTab = tab;
-  state.activeSourceId = tab === 'slides' ? state.deckMaterialId : null;
+  state.activeSourceId = tab === 'slides'
+    ? state.deckMaterialId
+    : (tab === 'pdf' && state.pdfSourceId && state.pdfSourceId !== PAGE_ANCHOR_SOURCE_BOOK ? state.pdfSourceId : null);
   applyLeftTab();
   renderChapterPanel();
   updateAiContext();
@@ -1864,21 +1940,43 @@ function currentReadingPage() {
     return { sourceId: PAGE_ANCHOR_SOURCE_BOOK, page: ch.page };
   }
   if (!state.pdfDoc) return null; // the book has not loaded yet
-  return { sourceId: PAGE_ANCHOR_SOURCE_BOOK, page: currentPdfPage() };
+  return { sourceId: state.pdfSourceId || PAGE_ANCHOR_SOURCE_BOOK, page: currentPdfPage() };
 }
 
-/* Jump the LEFT pane to an anchored page/slide (chip click). Switches to
-   the right tab, loads the deck when needed, and scrolls there. */
+/* Jump the LEFT pane to an anchored page/slide (chip click). Resolves the
+   anchor's source — book, deck, or any extra PDF material — switches to
+   the right tab, loads the material when needed, and scrolls there. A
+   missing or unreadable source reports instead of failing silently. */
 async function jumpToAnchor(sourceId, page) {
   if (String(state.project?.kind || '').toLowerCase() !== 'pdf') return;
-  if (!sourceId || sourceId === PAGE_ANCHOR_SOURCE_BOOK) {
+  const target = resolveAnchorTarget(sourceId);
+  if (target.target === 'book') {
     setLeftTab('pdf');
+    await ensurePdfSourceLoaded(PAGE_ANCHOR_SOURCE_BOOK);
     scrollBookToPage(page);
     return;
   }
-  setLeftTab('slides');
-  await ensureDeckLoaded(sourceId);
-  scrollDeckToPage(page);
+  if (target.target === 'material' && target.kind === 'slides') {
+    setLeftTab('slides');
+    await ensureDeckLoaded(target.id);
+    if (!state.deckDoc || state.deckMaterialId !== target.id) {
+      setSaveStatus('Can’t open that deck — its file is not in this project.', 'error');
+      return;
+    }
+    scrollDeckToPage(page);
+    return;
+  }
+  if (target.target === 'material' && target.kind === 'pdf') {
+    setLeftTab('pdf');
+    await ensurePdfSourceLoaded(target.id);
+    if (!state.pdfDoc || state.pdfSourceId !== target.id) {
+      setSaveStatus('Can’t open that document — its file is not in this project.', 'error');
+      return;
+    }
+    scrollBookToPage(page);
+    return;
+  }
+  setSaveStatus(`Can’t jump — “${sourceId}” is not in this project.`, 'error');
 }
 
 /* Scroll the book container to a page, with the same scroll-spy
@@ -1907,10 +2005,11 @@ function scrollDeckToPage(page) {
 
 /* ---------------- PDF ---------------- */
 
-async function loadPdf(fileUrl, sourceUrl) {
+async function loadPdf(fileUrl, sourceUrl, sourceId = 'book') {
   const container = $('#pdf-scroll', view);
   if (!container) return;
   state.pdfContainer = container;
+  state.pdfSourceId = sourceId;
   // Source switches reload into the same viewer: drop the previous document
   // and any in-flight chapter-click suppression (its target page belongs to
   // the old document). The race fix itself is unchanged — setActiveChapter
@@ -1943,7 +2042,13 @@ async function loadPdf(fileUrl, sourceUrl) {
   }
   renderChapterPanel();
 
-  await mountPdfViewer(container, pdf, { measure: measurePdfPages, onScroll: onPdfScroll, zoomKey: 'pdf', sourceId: 'book' });
+  await mountPdfViewer(container, pdf, { measure: measurePdfPages, onScroll: onPdfScroll, zoomKey: 'pdf', sourceId });
+
+  // A source switch reloads the container: the old document's scroll offset
+  // must not carry over numerically into the new one (it would land on
+  // whatever page sits at that offset — e.g. p. 2 of the book after leaving
+  // a 3-page memo at p. 2). A fresh load always starts at the top.
+  container.scrollTop = 0;
 
   // Lazy cover: first page rendered small, posted once per open.
   if (!state.project.cover && !state.coverGenerated) {
@@ -1951,6 +2056,55 @@ async function loadPdf(fileUrl, sourceUrl) {
     generateCover(pdf);
   }
   onPdfScroll();
+}
+
+/* Load a PDF into the PDF tab: the book, or an extra PDF material.
+   Mirrors ensureDeckLoaded (one in-flight load, skip when already loaded).
+   Switching PDFs reloads the container, so the scroll position of the
+   previous PDF is not kept — the book and the decks keep theirs because
+   they live in separate containers. */
+let pdfLoadPromise = null; // {sourceId, promise} — one in-flight PDF load
+
+async function ensurePdfSourceLoaded(sourceId) {
+  const id = sourceId || PAGE_ANCHOR_SOURCE_BOOK;
+  if (state.pdfDoc && state.pdfSourceId === id) return;
+  if (pdfLoadPromise && pdfLoadPromise.sourceId === id) {
+    await pdfLoadPromise.promise;
+    return;
+  }
+  pdfLoadPromise = { sourceId: id, promise: loadPdfSource(id) };
+  try {
+    await pdfLoadPromise.promise;
+  } finally {
+    if (pdfLoadPromise?.sourceId === id) pdfLoadPromise = null;
+  }
+}
+
+async function loadPdfSource(sourceId) {
+  if (sourceId === PAGE_ANCHOR_SOURCE_BOOK) {
+    await loadPdf(
+      `/api/projects/${encodeURIComponent(state.project.slug)}/file`,
+      state.project.url || state.project.sourceUrl || '',
+      PAGE_ANCHOR_SOURCE_BOOK,
+    );
+  } else {
+    const mat = state.materials.find((m) => String(m.id) === String(sourceId));
+    if (!mat || mat.hasFile === false) {
+      setSaveStatus(`Can’t open “${mat?.label || sourceId}” — its file is not in this project.`, 'error');
+      return;
+    }
+    await loadPdf(
+      `/api/projects/${encodeURIComponent(state.project.slug)}/materials/${encodeURIComponent(sourceId)}/file`,
+      '',
+      sourceId,
+    );
+  }
+  // The chapter panel's source note and the AI context line follow the
+  // newly loaded PDF (same as loadDeckPdf for decks).
+  state.activeSourceId = sourceId === PAGE_ANCHOR_SOURCE_BOOK ? null : sourceId;
+  syncPdfPicker();
+  renderChapterPanel();
+  updateAiContext();
 }
 
 /* Shared PDF viewer mounting: one placeholder per page, canvases render
@@ -2246,6 +2400,9 @@ function chapterForPage(pageNum) {
 }
 
 function onPdfScroll() {
+  // Record the page even when the outline is empty (an outline-less PDF
+  // still has pages worth anchoring to) — the spy below needs the outline.
+  noteReadingImpression();
   if (!state.pdfDoc || !state.outline.length) return;
   if (Date.now() < state.suppressSpyUntil) {
     // A programmatic chapter-click scroll is still in flight: ignore the spy
@@ -2822,8 +2979,11 @@ function labDisplayName(name) {
    same lab twice focuses the existing tab. */
 function openAddMenu(anchorBtn) {
   const reading = currentReadingPage();
+  const readingKind = reading && reading.sourceId !== PAGE_ANCHOR_SOURCE_BOOK
+    ? String((state.materials || []).find((m) => m.id === reading.sourceId)?.kind || '').toLowerCase()
+    : null;
   const pageLabel = reading
-    ? `Note here — at ${reading.sourceId === PAGE_ANCHOR_SOURCE_BOOK ? `p. ${reading.page}` : `slide ${reading.page}`}`
+    ? `Note here — at ${readingKind === 'slides' ? `slide ${reading.page}` : `p. ${reading.page}`}`
     : 'Note here — at current page';
   const menu = document.createElement('div');
   menu.className = 'floating-menu add-menu';
@@ -2996,7 +3156,10 @@ async function addNoteAtCurrentPage() {
       ta.setSelectionRange(pos, pos);
     }
   }
-  setSaveStatus(`Note anchored at ${anchorChipLabel(reading, activeSourceLabel())} in notes.md.`);
+  const material = reading.sourceId === PAGE_ANCHOR_SOURCE_BOOK
+    ? null
+    : (state.materials || []).find((m) => m.id === reading.sourceId) || null;
+  setSaveStatus(`Note anchored at ${anchorChipLabel(reading, material)} in notes.md.`);
 }
 
 function setSaveStatus(text, cls = '') {
@@ -3015,19 +3178,23 @@ function vancouverDateStr(d = new Date()) {
    mdQuickActions.js). document.execCommand('insertText') keeps the
    insertion as one native undo step, so Ctrl/Cmd+Z takes it back; the
    input event it fires drives the autosave + live preview like typing. */
-function insertMdQuickAction(ta, action) {
+function insertMdQuickAction(ta, action, override = {}) {
   if (!ta) return;
   const start = ta.selectionStart ?? 0;
   const end = ta.selectionEnd ?? start;
   const opts = {};
   if (action === 'date') opts.date = vancouverDateStr();
   if (action === 'anchor') {
-    const reading = currentReadingPage();
-    if (!reading) {
-      setSaveStatus('No page to anchor to — open the book or a deck first.');
-      return;
+    if (override.anchor) {
+      opts.anchor = override.anchor;
+    } else {
+      const reading = currentReadingPage();
+      if (!reading) {
+        setSaveStatus('No page to anchor to — open the book or a deck first.');
+        return;
+      }
+      opts.anchor = formatPageAnchor(reading);
     }
-    opts.anchor = formatPageAnchor(reading);
   }
   let snip;
   try {
@@ -3047,6 +3214,38 @@ function insertMdQuickAction(ta, action) {
   ta.focus();
 }
 
+/* The Page anchor dropdown: pages/slides looked at in the last 5 minutes,
+   most recent first. Clicking one inserts THAT anchor at the cursor; the
+   main Page anchor button still inserts the current page. With no recent
+   page at all, the menu says so instead of offering anything. */
+function openAnchorImpressionsMenu(anchorBtn, ta) {
+  if (floatingMenu?.anchor === anchorBtn) { closeFloatingMenu(); return; }
+  const now = Date.now();
+  const entries = recentImpressions(state.recentImpressions, now);
+  const el = document.createElement('div');
+  el.className = 'floating-menu impression-menu';
+  el.setAttribute('role', 'menu');
+  el.setAttribute('aria-label', 'Recent pages');
+  if (!entries.length) {
+    el.innerHTML = '<div class="impression-empty">No page to anchor to</div>';
+  } else {
+    el.innerHTML = entries.map((entry, i) => `
+      <button type="button" class="impression-row" data-impression="${i}" role="menuitem">
+        <span class="impression-label">${esc(impressionLabel(entry, impressionMeta(entry)))}</span>
+        <span class="impression-time">${esc(relativeTimeLabel(entry.at, now))}</span>
+      </button>`).join('');
+  }
+  el.addEventListener('click', (e) => {
+    const row = e.target.closest('[data-impression]');
+    if (!row) return;
+    const entry = entries[Number(row.dataset.impression)];
+    if (!entry) return;
+    closeFloatingMenu();
+    insertMdQuickAction(ta, 'anchor', { anchor: formatPageAnchor(entry) });
+  });
+  showFloatingMenu(anchorBtn, el);
+}
+
 function renderNotebookBody() {
   const body = $('#notebook-body', view);
   if (!body) return;
@@ -3059,7 +3258,13 @@ function renderNotebookBody() {
   // the LEFT pane's Preview tab (pick the note there). One slim row of
   // quick actions sits above the editor — labels only, no prose.
   body.classList.add('has-quick-actions');
-  body.innerHTML = `<div class="md-quick-actions" role="toolbar" aria-label="Quick actions">${MD_QUICK_ACTIONS.map((a) => `<button type="button" data-md-action="${a.id}" title="${esc(a.title)}">${esc(a.label)}</button>`).join('')}</div><textarea class="md-editor" id="md-editor" spellcheck="false"></textarea>`;
+  // The Page anchor action is a split button: the main button inserts the
+  // current page; the chevron opens the recent-impressions dropdown.
+  const actionsHtml = MD_QUICK_ACTIONS.map((a) => {
+    if (a.id !== 'anchor') return `<button type="button" data-md-action="${a.id}" title="${esc(a.title)}">${esc(a.label)}</button>`;
+    return `<span class="md-action-split"><button type="button" data-md-action="anchor" title="${esc(a.title)}">${esc(a.label)}</button><button type="button" class="md-action-chevron" data-md-action-menu="anchor" title="Anchor to a page you looked at recently" aria-label="Recent pages">▾</button></span>`;
+  }).join('');
+  body.innerHTML = `<div class="md-quick-actions" role="toolbar" aria-label="Quick actions">${actionsHtml}</div><textarea class="md-editor" id="md-editor" spellcheck="false"></textarea>`;
   const ta = $('#md-editor', body);
   // mousedown preventDefault keeps focus (and the selection) in the
   // editor while a quick-action button is clicked.
@@ -3067,6 +3272,8 @@ function renderNotebookBody() {
     if (e.target.closest('button')) e.preventDefault();
   });
   $('.md-quick-actions', body).addEventListener('click', (e) => {
+    const menuBtn = e.target.closest('button[data-md-action-menu]');
+    if (menuBtn) { openAnchorImpressionsMenu(menuBtn, ta); return; }
     const btn = e.target.closest('button[data-md-action]');
     if (btn) insertMdQuickAction(ta, btn.dataset.mdAction);
   });
@@ -3111,16 +3318,21 @@ function renderMdPreview(el, text) {
     const m = comment.textContent.match(/^\s*@page\s+(\d+)\s*·\s*source:\s*([^\s>]+)\s*$/);
     if (!m) return;
     const anchor = { page: Number(m[1]), sourceId: m[2] };
-    const label = anchor.sourceId === PAGE_ANCHOR_SOURCE_BOOK
+    const material = anchor.sourceId === PAGE_ANCHOR_SOURCE_BOOK
       ? null
-      : (state.materials || []).find((x) => x.id === anchor.sourceId)?.label;
+      : (state.materials || []).find((x) => x.id === anchor.sourceId) || null;
     const chip = document.createElement('button');
     chip.type = 'button';
     chip.className = 'page-anchor-chip';
     chip.dataset.anchorSource = anchor.sourceId;
     chip.dataset.anchorPage = String(anchor.page);
-    chip.textContent = anchorChipLabel(anchor, label);
-    chip.title = `Jump to ${anchor.sourceId === PAGE_ANCHOR_SOURCE_BOOK ? `p. ${anchor.page} of the book` : `slide ${anchor.page} of ${label || anchor.sourceId}`}`;
+    chip.textContent = anchorChipLabel(anchor, material);
+    const jumpWord = anchor.sourceId === PAGE_ANCHOR_SOURCE_BOOK
+      ? `p. ${anchor.page} of the book`
+      : material?.kind === 'slides'
+        ? `slide ${anchor.page} of ${material.label || anchor.sourceId}`
+        : `p. ${anchor.page} of ${material?.label || anchor.sourceId}`;
+    chip.title = `Jump to ${jumpWord}`;
     chip.addEventListener('click', () => jumpToAnchor(anchor.sourceId, anchor.page));
     comment.replaceWith(chip);
   });
@@ -3617,7 +3829,11 @@ function aiContextText() {
   const reading = currentReadingPage();
   const ch = activeOutlineChapter();
   if (reading && reading.sourceId !== PAGE_ANCHOR_SOURCE_BOOK) {
-    return `Context: ${activeSourceLabel()} (slide ${reading.page}) — the AI reads this deck around the current slide.`;
+    const mat = (state.materials || []).find((m) => String(m.id) === String(reading.sourceId));
+    if (String(mat?.kind || '').toLowerCase() === 'slides') {
+      return `Context: ${activeSourceLabel()} (slide ${reading.page}) — the AI reads this deck around the current slide.`;
+    }
+    return `Context: ${activeSourceLabel()} (p. ${reading.page}) — the AI reads this document around the current page.`;
   }
   if (ch) {
     return `Context: ${ch.title}${ch.page != null ? ` (p. ${ch.page})` : ''} — the AI reads this chapter's PDF text.`;
@@ -3627,6 +3843,30 @@ function aiContextText() {
     return `Context: ${title} — no PDF chapter text for it; the AI works from your request (and your notes, if included) only.`;
   }
   return 'Context: no chapter selected — the AI works from your request only.';
+}
+
+/* Record the page/slide being read as a recent impression (session-only,
+   last 5 minutes — see public/recentImpressions.js). The Page anchor
+   quick action offers these in a dropdown. */
+function noteReadingImpression() {
+  const reading = currentReadingPage();
+  if (!reading) return;
+  state.recentImpressions = recordImpression(state.recentImpressions, reading);
+}
+
+/* What an impression label needs: the chapter for a book page, the
+   material for a deck/PDF page. The chapter resolves against the book's
+   outline, so it is omitted while an extra PDF is showing (its outline
+   is loaded in place of the book's). */
+function impressionMeta(entry) {
+  if (!entry) return {};
+  if (entry.sourceId === PAGE_ANCHOR_SOURCE_BOOK) {
+    if (state.pdfSourceId && state.pdfSourceId !== PAGE_ANCHOR_SOURCE_BOOK) return {};
+    const ch = chapterForPage(entry.page);
+    return { chapterTitle: ch ? ch.title : null };
+  }
+  const material = (state.materials || []).find((m) => String(m.id) === String(entry.sourceId));
+  return { material: material || null };
 }
 
 /* Keep the AI panel's context lines live as the reader moves chapters.
@@ -3648,6 +3888,10 @@ function updateAiContext() {
     wrap.hidden = !activeOutlineChapter()
       || (reading != null && reading.sourceId !== PAGE_ANCHOR_SOURCE_BOOK);
   }
+  // The same events that move the context line also record the page as a
+  // recent impression for the Page anchor dropdown (onPdfScroll covers
+  // book page scrolls within a chapter).
+  noteReadingImpression();
 }
 
 /* Port of insertMarkdownUnderHeading in src/aiNote.js — the same rule on
@@ -3704,10 +3948,37 @@ function parsePageAnchors(text) {
   return out;
 }
 
-function anchorChipLabel(anchor, materialLabel) {
+function anchorChipLabel(anchor, material) {
   if (!anchor) return '';
   if (anchor.sourceId === PAGE_ANCHOR_SOURCE_BOOK) return `p. ${anchor.page}`;
-  return `Slide ${anchor.page}`;
+  // With the material in hand the kind decides. Without it, fall back to
+  // the seed's naming convention: deck ids are `slides-*`.
+  const kind = material ? String(material.kind || '').toLowerCase() : null;
+  if (kind === 'slides' || (kind == null && String(anchor.sourceId).startsWith('slides-'))) {
+    return `Slide ${anchor.page}`;
+  }
+  const label = material?.label || anchor.sourceId;
+  return `p. ${anchor.page} · ${label}`;
+}
+
+/* Port of resolveAnchorTarget in src/pageAnchor.js (same rules on both
+   sides): where does an anchor jump — the book, a material (deck or extra
+   PDF), or nowhere (unknown id / unreadable / not page-addressable). */
+function resolveAnchorTarget(sourceId) {
+  if (!sourceId || sourceId === PAGE_ANCHOR_SOURCE_BOOK) return { target: 'book' };
+  const mat = (state.materials || []).find((m) => String(m.id) === String(sourceId));
+  if (!mat || mat.hasFile === false) return { target: 'unknown' };
+  const kind = String(mat.kind || '').toLowerCase();
+  if (kind !== 'slides' && kind !== 'pdf') return { target: 'unknown' };
+  return { target: 'material', id: mat.id, kind };
+}
+
+/* Port of pdfMaterials in src/pageAnchor.js: the project's extra PDF
+   documents (kind 'pdf') — the ones the PDF tab's picker offers next to
+   the book. Decks (kind 'slides') live in the Slides tab instead. */
+function pdfMaterialsList() {
+  return (state.materials || []).filter((m) => String(m.kind || '').toLowerCase() === 'pdf'
+    && m.hasFile !== false);
 }
 
 /* Chapter number from a note heading's text: "12. Transformers" -> 12.
