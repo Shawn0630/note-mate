@@ -2092,6 +2092,11 @@ async function loadDeckPdf(materialId) {
   container.replaceWith(fresh);
   state.deckContainer = fresh;
   state.deckMaterialId = materialId;
+  // The context line (and the chapter panel's source note) follow the
+  // newly chosen deck at once — the label resolves from state.materials,
+  // so this does not wait for the async PDF load below.
+  state.activeSourceId = materialId;
+  updateAiContext();
   // The deck was chosen while viewing this chapter: opening the Slides tab
   // later keeps it until the chapter changes. A manual picker choice made
   // while viewing a chapter therefore survives tab toggles, while a chapter
@@ -3579,38 +3584,48 @@ function chapterPageAnchor(chapter) {
   return chapter && chapter.page != null ? `<!-- p. ${chapter.page} -->` : null;
 }
 
-/* Insert markdown under a ## heading in notes.md through the existing
-   notes PUT path. Creates notes.md (from the project title) when it does
-   not exist yet. Returns {inserted, headingTitle}. */
-async function insertIntoNotesMd(headingTitle, markdown, headingAnchor = null) {
+/* Insert markdown under a ## heading in any markdown note through the
+   existing notes PUT path. A missing note is created (notes.md from the
+   project title, like the seed's header; any other note from its own name,
+   like the + menu's create). The filing rule is the same everywhere: under
+   the chapter's ## heading, created on demand with the page anchor.
+   Returns {inserted, headingTitle, noteName}. */
+async function insertIntoNote(noteName, headingTitle, markdown, headingAnchor = null) {
   const slug = encodeURIComponent(state.project.slug);
   let current = '';
   let exists = true;
   try {
-    const data = await apiGet(`/api/projects/${slug}/notes/notes.md`);
+    const data = await apiGet(`/api/projects/${slug}/notes/${encodeURIComponent(noteName)}`);
     current = typeof data === 'string' ? data : (data.content ?? '');
   } catch (err) {
     if (/note not found/.test(err.message || '')) {
-      current = `# ${state.project.title}\n`;
+      current = noteName === 'notes.md'
+        ? `# ${state.project.title}\n`
+        : `# ${noteName.replace(/\.md$/, '')}\n`;
       exists = false;
     } else throw err;
   }
   const { text, inserted } = insertMarkdownUnderHeading(current, headingTitle, markdown, headingAnchor);
-  if (!inserted) return { inserted: false, headingTitle };
-  await apiJson(`/api/projects/${slug}/notes/notes.md`, 'PUT', { content: text });
-  syncNotesMdCache(text);
+  if (!inserted) return { inserted: false, headingTitle, noteName };
+  await apiJson(`/api/projects/${slug}/notes/${encodeURIComponent(noteName)}`, 'PUT', { content: text });
+  if (noteName === 'notes.md') syncNotesMdCache(text);
   renderLeftPreview();
-  if (!exists && !state.notes.some((n) => n.name === 'notes.md')) {
-    state.notes.push({ name: 'notes.md', kind: 'md' });
+  if (!exists && !state.notes.some((n) => n.name === noteName)) {
+    state.notes.push({ name: noteName, kind: 'md' });
     renderNotebookPane();
   }
-  if (state.activeTabKind === 'note' && state.activeNoteName === 'notes.md') {
+  if (state.activeTabKind === 'note' && state.activeNoteName === noteName) {
     state.activeNoteContent = text;
     state.headings = headingsFromMarkdown(text);
     renderChapterPanel();
     const ta = $('#md-editor', view); if (ta) ta.value = text;
   }
-  return { inserted: true, headingTitle };
+  return { inserted: true, headingTitle, noteName };
+}
+
+/* The notes.md case of insertIntoNote (+ Note here, cell-export Insert). */
+async function insertIntoNotesMd(headingTitle, markdown, headingAnchor = null) {
+  return insertIntoNote('notes.md', headingTitle, markdown, headingAnchor);
 }
 
 /* ---------------- Ask AI panel ---------------- */
@@ -3642,7 +3657,7 @@ function renderAiColumn() {
       <div class="ai-column-head">
         <div class="ai-tabs" role="tablist" aria-label="AI">
           <button type="button" class="ai-tab" data-ai-tab="note" role="tab">✨ Note AI</button>
-          <button type="button" class="ai-tab" data-ai-tab="code" role="tab">Code AI</button>
+          <button type="button" class="ai-tab" data-ai-tab="code" role="tab">&lt;/&gt; Code AI</button>
         </div>
         <button type="button" id="ai-close" title="Close the AI panel (back to Notetaking)">✕</button>
       </div>
@@ -3716,7 +3731,6 @@ function renderAiPanel() {
     panel.dataset.key = key;
     if (state.aiTab === 'code') {
       panel.innerHTML = `
-        <p class="ai-panel-sub">Writes Python code for the current notebook — a proposal only. Nothing is written until you press Apply.</p>
         <p class="ai-context" id="ai-code-context"></p>
         <div class="ai-thread" id="ai-code-thread"></div>
         <div class="ai-input-row">
@@ -3731,7 +3745,6 @@ function renderAiPanel() {
       renderAiCodeThread();
     } else {
       panel.innerHTML = `
-        <p class="ai-panel-sub">Drafts markdown notes from the current chapter — a proposal only. Nothing is written until you press Apply.</p>
         <p class="ai-context" id="ai-context"></p>
         <label class="ai-include" id="ai-include-wrap">
           <input type="checkbox" id="ai-include-note"> Include my notes for this chapter
@@ -3795,11 +3808,10 @@ function renderAiCodeThread() {
   const thread = $('#ai-code-thread', view);
   if (!thread) return;
   const { messages } = aiCodeThread();
+  // Empty thread stays empty: the input + chips are self-evident, and
+  // asking with no Python notebook open reports it as a status message.
   if (!messages.length) {
-    const ready = state.activeNotebook && notebookLanguage() === 'python';
-    thread.innerHTML = ready
-      ? '<p class="hint">Ask in plain language — the AI writes Python for the notebook you have open, from the material you are reading and the cells so far. Apply appends it as a new code cell at the end.</p>'
-      : '<p class="hint">Code AI writes Python for the current notebook. Open a Python notebook (a lab, or a .ipynb note) to use it — Java and JavaScript notebooks are not supported yet.</p>';
+    thread.innerHTML = '';
     return;
   }
   thread.innerHTML = '';
@@ -3944,8 +3956,9 @@ function renderAiThread() {
   const thread = $('#ai-thread', view);
   if (!thread) return;
   const { messages } = aiThread();
+  // Empty thread stays empty: the input + chips are self-evident.
   if (!messages.length) {
-    thread.innerHTML = '<p class="hint">Ask in plain language — the AI drafts a note proposal from the current chapter. Apply inserts it under that chapter’s heading in notes.md.</p>';
+    thread.innerHTML = '';
     return;
   }
   thread.innerHTML = '';
@@ -3960,6 +3973,25 @@ function renderAiThread() {
       body.innerHTML = window.marked ? window.marked.parse(msg.markdown || '') : esc(msg.markdown || '');
       const actions = document.createElement('div');
       actions.className = 'ai-msg-actions';
+      // Destination picker: which markdown note Apply writes to. Default
+      // is the master notes.md (today's behaviour); shown only when the
+      // project has more than one markdown note, so a single-note project
+      // has no extra friction. The choice lives on the message, so each
+      // proposal can go to a different note.
+      const dests = mdNotes();
+      const dest = (msg.destNote && dests.some((n) => n.name === msg.destNote))
+        ? msg.destNote : 'notes.md';
+      if (dests.length > 1) {
+        const destSel = document.createElement('select');
+        destSel.className = 'ai-apply-dest';
+        destSel.setAttribute('aria-label', 'Note to apply to');
+        destSel.title = 'Apply to this note';
+        destSel.innerHTML = dests.map((n) => (
+          `<option value="${esc(n.name)}"${n.name === dest ? ' selected' : ''}>${esc(n.name)}</option>`
+        )).join('');
+        destSel.addEventListener('change', () => { msg.destNote = destSel.value; });
+        actions.append(destSel);
+      }
       const applyBtn = document.createElement('button');
       applyBtn.type = 'button';
       applyBtn.className = 'primary';
@@ -4037,13 +4069,19 @@ async function applyAiNote(i) {
   const ch = activeOutlineChapter();
   const heading = ch ? ch.title : 'AI notes';
   const statusEl = $('#ai-status', view);
+  // Destination: this proposal's picker choice, falling back to the master
+  // when the note is gone (or was never picked).
+  const dests = mdNotes();
+  const dest = (msg.destNote && dests.some((n) => n.name === msg.destNote))
+    ? msg.destNote : 'notes.md';
   try {
-    const { inserted } = await insertIntoNotesMd(heading, msg.markdown, chapterPageAnchor(ch));
+    const { inserted } = await insertIntoNote(dest, heading, msg.markdown, chapterPageAnchor(ch));
     msg.applied = true;
+    msg.destNote = dest;
     if (statusEl) {
       statusEl.textContent = inserted
-        ? `Inserted under “${heading}” in notes.md.`
-        : 'Already in notes.md — nothing added.';
+        ? `Inserted under “${heading}” in ${dest}.`
+        : `Already in ${dest} — nothing added.`;
     }
   } catch (err) {
     if (statusEl) {
