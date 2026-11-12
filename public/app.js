@@ -192,7 +192,6 @@ const state = {
   execCounter: 0,     // per-notebook execution counter (execution_count)
   // The right pane is the WORKING side: a markdown note opens in its editor
   // there (the rendered preview lives in the LEFT pane's Preview tab).
-  mdMode: 'edit',       // 'edit' | 'preview' for markdown notes (right pane)
   follow: true,         // scroll-spy follow toggle
   editorFocused: false,
   headings: [],         // headings of the active note
@@ -269,7 +268,6 @@ function resetReaderState() {
   state.activeNoteKind = null;
   state.activeNoteContent = '';
   state.activeNotebook = null;
-  state.mdMode = 'edit';
   state.headings = [];
   state.outline = [];
   state.chapterMap = {};
@@ -1647,7 +1645,7 @@ function scrollNotebookToHeading(heading, force = false) {
   const body = $('.notebook-body', view);
   if (!body) return;
 
-  if (state.mdMode === 'preview' || state.activeNoteKind === 'ipynb') {
+  if (state.activeNoteKind === 'ipynb') {
     const el = body.querySelector(`[data-h="${CSS.escape(heading.norm)}"]`);
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
     return;
@@ -1717,7 +1715,6 @@ function renderNotebookPane() {
     tab.addEventListener('click', async () => {
       if (state.activeTabKind === 'note' && n.name === state.activeNoteName) return;
       await loadNote(n.name);
-      state.mdMode = 'edit';
       renderNotebookPane();
       renderChapterPanel();
     });
@@ -1891,7 +1888,6 @@ async function closeLabTab(lab) {
     || state.notes[0];
   if (def) {
     try { await loadNote(def.name); } catch { /* pane renders empty */ }
-    state.mdMode = 'edit';
   } else {
     state.activeTabKind = 'note';
     state.activeLab = null;
@@ -1910,7 +1906,7 @@ function renderNotebookToolbar() {
   if (!bar) return;
   if (state.activeNoteKind === 'md') {
     bar.innerHTML = `
-      <button type="button" id="md-mode-toggle">${state.mdMode === 'edit' ? 'Preview' : 'Edit'}</button>
+      <button type="button" id="md-preview-btn" title="Open the rendered preview in the left pane">Preview</button>
       <button type="button" id="ai-toggle" class="${state.aiPanelOpen ? 'active' : ''}" title="Ask the AI to draft markdown notes from the current chapter — a proposal, never a silent write">✨ Ask AI</button>
       <button type="button" id="page-note-btn" title="Add a note anchored at the page being read">+ Note here</button>
       <label class="follow-toggle" title="Follow the reading pane: scroll the notebook to the current chapter">
@@ -1919,11 +1915,9 @@ function renderNotebookToolbar() {
       <span class="spacer"></span>
       <span class="save-status" id="save-status"></span>
       <button type="button" id="md-save-btn">Save</button>`;
-    $('#md-mode-toggle', bar).addEventListener('click', () => {
-      state.mdMode = state.mdMode === 'edit' ? 'preview' : 'edit';
-      renderNotebookToolbar();
-      renderNotebookBody();
-    });
+    // Preview opens the LEFT pane's Markdown preview tab (the one preview);
+    // the right pane stays in Edit mode.
+    $('#md-preview-btn', bar).addEventListener('click', () => setLeftTab('preview'));
     $('#follow-toggle', bar).addEventListener('change', (e) => { state.follow = e.target.checked; });
     $('#md-save-btn', bar).addEventListener('click', () => saveActiveMdNote(true));
   } else {
@@ -1984,7 +1978,6 @@ async function addNoteAtCurrentPage() {
   if (!(state.activeTabKind === 'note' && state.activeNoteName === 'notes.md')) {
     try { await loadNote('notes.md'); } catch { /* pane renders empty */ }
   }
-  state.mdMode = 'edit';
   renderNotebookPane();
   renderChapterPanel();
   renderLeftPreview();
@@ -2013,31 +2006,28 @@ function renderNotebookBody() {
     renderIpynbBody(body);
     return;
   }
-  if (state.mdMode === 'edit') {
-    body.innerHTML = `<textarea class="md-editor" id="md-editor" spellcheck="false"></textarea>`;
-    const ta = $('#md-editor', body);
-    ta.value = state.activeNoteContent;
-    ta.addEventListener('focus', () => { state.editorFocused = true; });
-    ta.addEventListener('blur', () => {
-      state.editorFocused = false;
-      // Autosave on blur (debounced): only PUT when the text changed.
-      if (state.saveTimer) clearTimeout(state.saveTimer);
-      state.saveTimer = setTimeout(() => saveActiveMdNote(false), 400);
-    });
-    ta.addEventListener('input', () => {
-      state.activeNoteContent = ta.value;
-      setSaveStatus('Unsaved changes', 'dirty');
-      // The left Preview tab shows the same notes.md — keep it live.
-      if (state.activeNoteName === 'notes.md') {
-        syncNotesMdCache(ta.value);
-        if (leftPreviewTimer) clearTimeout(leftPreviewTimer);
-        leftPreviewTimer = setTimeout(() => renderLeftPreview(), 400);
-      }
-    });
-  } else {
-    body.innerHTML = `<div class="md-preview" id="md-preview"></div>`;
-    renderMdPreview($('#md-preview', body), state.activeNoteContent);
-  }
+  // Markdown notes are always edited here; the rendered preview lives in
+  // the LEFT pane's Preview tab (opened by the Preview button).
+  body.innerHTML = `<textarea class="md-editor" id="md-editor" spellcheck="false"></textarea>`;
+  const ta = $('#md-editor', body);
+  ta.value = state.activeNoteContent;
+  ta.addEventListener('focus', () => { state.editorFocused = true; });
+  ta.addEventListener('blur', () => {
+    state.editorFocused = false;
+    // Autosave on blur (debounced): only PUT when the text changed.
+    if (state.saveTimer) clearTimeout(state.saveTimer);
+    state.saveTimer = setTimeout(() => saveActiveMdNote(false), 400);
+  });
+  ta.addEventListener('input', () => {
+    state.activeNoteContent = ta.value;
+    setSaveStatus('Unsaved changes', 'dirty');
+    // The left Preview tab shows the same notes.md — keep it live.
+    if (state.activeNoteName === 'notes.md') {
+      syncNotesMdCache(ta.value);
+      if (leftPreviewTimer) clearTimeout(leftPreviewTimer);
+      leftPreviewTimer = setTimeout(() => renderLeftPreview(), 400);
+    }
+  });
 }
 
 /* Render markdown into el; tag headings with data-h for scroll-spy and
@@ -2191,7 +2181,6 @@ async function createMdNote() {
       'PUT', { content: `# ${clean.replace(/\.md$/, '')}\n\n` });
     state.notes.push({ name: clean, kind: 'md' });
     await loadNote(clean);
-    state.mdMode = 'edit';
     renderNotebookPane();
     renderChapterPanel();
     const ta = $('#md-editor', view);
@@ -2723,8 +2712,7 @@ async function insertIntoNotesMd(headingTitle, markdown) {
     state.activeNoteContent = text;
     state.headings = headingsFromMarkdown(text);
     renderChapterPanel();
-    if (state.mdMode === 'preview') renderNotebookBody();
-    else { const ta = $('#md-editor', view); if (ta) ta.value = text; }
+    const ta = $('#md-editor', view); if (ta) ta.value = text;
   }
   return { inserted: true, headingTitle };
 }
@@ -3250,7 +3238,7 @@ function openCellExportModal(markdown, name, images) {
 // even if focus has moved off the textarea (e.g. to a toolbar button).
 document.addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's'
-    && state.activeNoteKind === 'md' && state.mdMode === 'edit' && state.project) {
+    && state.activeNoteKind === 'md' && state.project) {
     e.preventDefault();
     saveActiveMdNote(true);
   }
