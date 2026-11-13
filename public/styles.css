@@ -619,6 +619,8 @@ body.reader-open .reader {
 .notebook-body { flex: 1; overflow-y: auto; min-height: 0; }
 .notebook-body.has-quick-actions { display: flex; flex-direction: column; }
 .notebook-body.has-quick-actions textarea.md-editor { flex: 1; min-height: 0; height: auto; }
+/* Empty right pane: no editable note is open (notes.md never opens here). */
+.notebook-empty { padding: 32px 20px; text-align: center; color: var(--ink-faint); font-size: 13px; }
 /* Quick actions above the markdown editor: one slim row, small buttons. */
 .md-quick-actions {
   display: flex; flex-wrap: wrap; gap: 4px;

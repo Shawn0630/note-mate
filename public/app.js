@@ -833,13 +833,22 @@ async function openProject(slug) {
   }
   await loadAnnotations();
 
-  // Default note: notes.md if present, else the first note.
-  const def = state.notes.find((n) => n.name === 'notes.md')
-    || state.notes.find((n) => n.kind === 'md')
-    || state.notes[0];
+  // Default note: the first editable note — notes.md is read-only and
+  // never opens in the right pane (it lives in the left preview).
+  const def = defaultEditorNote();
   if (def) {
     try { await loadNote(def.name); }
     catch { /* notebook pane renders empty; tabs still work */ }
+  }
+
+  // notes.md never opens in the editor, but the chapter panel resolves
+  // chapters against its ## headings — keep the cache warm so the
+  // resolution works from the first render.
+  if (state.notes.some((n) => n.name === 'notes.md')) {
+    try {
+      const data = await apiGet(`/api/projects/${encodeURIComponent(slug)}/notes/notes.md`);
+      syncNotesMdCache(typeof data === 'string' ? data : (data.content ?? ''));
+    } catch { /* cache stays null; headings fall back */ }
   }
 
   renderReaderShell();
@@ -2458,7 +2467,9 @@ function resolvedChapterHeading(chapter) {
   // chapterMap[normalizeHeading(title)] (if in range) -> auto-match -> null.
   // The index counts ## headings only (h2Headings): ### sub-headings must
   // not shift it — see h2Headings.
-  const h2 = h2Headings(state.headings);
+  // Chapters resolve against notes.md's headings (the master), never the
+  // open note's — notes.md never opens in the editor.
+  const h2 = h2Headings(notesMdHeadings());
   const override = state.chapterMap[normalizeHeading(chapter.title)];
   if (typeof override === 'number' && h2[override]) {
     return h2[override];
@@ -2495,7 +2506,7 @@ function renderChapterPanel() {
       let row = `<button type="button" class="chapter-row${isActive ? ' active' : ''}"
           data-chapter="${i}"${indent}>${esc(ch.title)}${ch.page != null ? `<span class="chapter-page">p. ${ch.page}</span>` : ''}</button>`;
       if (editLinks) {
-        const h2 = h2Headings(state.headings);
+        const h2 = h2Headings(notesMdHeadings());
         const matchedIdx = matched ? h2.findIndex((h) => h.norm === matched.norm) : -1;
         row += `<div class="chapter-link">
           <select data-link-chapter="${i}" aria-label="Link chapter to a note heading">
@@ -2535,8 +2546,8 @@ function renderChapterPanel() {
     return;
   }
 
-  // No PDF outline (or not a PDF): the note's ## headings are the nav.
-  const headings = state.headings;
+  // No PDF outline (or not a PDF): the master note's ## headings are the nav.
+  const headings = notesMdHeadings();
   panel.innerHTML = `<h2>${kind === 'pdf' ? 'Headings' : 'Notes'}</h2>${sourceNote}` +
     (headings.length
       ? headings.map((h, i) => `
@@ -2546,7 +2557,7 @@ function renderChapterPanel() {
          to your note and it will show up here as navigation.</p>`);
   $$('.chapter-row', panel).forEach((btn) => {
     btn.addEventListener('click', () => {
-      const h = state.headings[Number(btn.dataset.heading)];
+      const h = headings[Number(btn.dataset.heading)];
       state.activeChapter = h.norm;
       $$('.chapter-row', panel).forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
@@ -2713,18 +2724,50 @@ function scrollNotebookToHeading(heading) {
     return;
   }
 
-  // Edit mode: scroll the textarea so the heading line is visible.
+  // Edit mode: scroll the textarea so the heading line is visible — but
+  // only when the open note actually has that heading (chapters resolve
+  // against notes.md, which never opens in the editor).
   const ta = $('.md-editor', body);
   if (!ta) return;
+  const match = (state.headings || []).find((hh) => hh.norm === heading.norm);
+  if (!match) return;
   const lines = ta.value.split('\n');
-  const idx = Math.min(heading.line ?? 0, lines.length - 1);
+  const idx = Math.min(match.line ?? 0, lines.length - 1);
   const lineHeight = 22; // 13.5px font * 1.65 line-height
   ta.scrollTop = Math.max(0, idx * lineHeight - 40);
 }
 
 /* ---------------- notebook ---------------- */
 
+/* The note the right pane opens by default: the first editable markdown
+   note, else the first other note — never notes.md (read-only, preview
+   only). Null when the project has no editable note. */
+function defaultEditorNote() {
+  return (state.notes || []).find((n) => n.kind === 'md' && n.name !== 'notes.md')
+    || (state.notes || []).find((n) => n.name !== 'notes.md')
+    || null;
+}
+
+/* No editable note is open: clear the editor state so the right pane
+   shows its empty state (notes.md never opens here). */
+function clearActiveNote() {
+  state.activeTabKind = 'note';
+  state.activeLab = null;
+  state.activeNoteName = null;
+  state.activeNoteKind = 'md';
+  state.activeNoteContent = '';
+  state.activeNotebook = null;
+  state.headings = [];
+}
+
 async function loadNote(name) {
+  // notes.md is read-only: it never opens in the right pane. Show it in
+  // the left preview instead and leave the editor alone.
+  if (name === 'notes.md') {
+    state.previewNoteName = 'notes.md';
+    renderLeftPreview();
+    return;
+  }
   const slug = state.project.slug;
   const data = await apiGet(`/api/projects/${encodeURIComponent(slug)}/notes/${encodeURIComponent(name)}`);
   const content = typeof data === 'string' ? data : (data.content ?? '');
@@ -2760,8 +2803,8 @@ function resetExecCounter() {
 /* Note rename/delete (AV TabContainer style). Rename is commit-based:
    the active markdown tab is an input; Enter/blur commits, Escape
    cancels. Delete is two-click: the first click arms the tab's × for
-   2s, the second confirms. notes.md — the master filing home — has
-   neither: it cannot be renamed or deleted. */
+   2s, the second confirms. notes.md — the master filing home — has no
+   tab at all, and the server refuses to rename or delete it. */
 let armedNoteDelete = null;
 let armedNoteDeleteTimer = 0;
 let noteRenameSuppressed = false;
@@ -2844,7 +2887,12 @@ async function deleteNote(name) {
   state.notes = state.notes.filter((n) => n.name !== name);
   if (state.previewNoteName === name) state.previewNoteName = null;
   if (state.activeTabKind === 'note' && state.activeNoteName === name) {
-    try { await loadNote('notes.md'); } catch { /* master missing — pane renders empty */ }
+    const def = defaultEditorNote();
+    if (def) {
+      try { await loadNote(def.name); } catch { /* pane renders empty */ }
+    } else {
+      clearActiveNote();
+    }
   }
   // Status last: renderNotebookPane rebuilds the tab bar (and with it
   // #save-status), so a message set before the render would be wiped.
@@ -2868,6 +2916,9 @@ function renderNotebookPane() {
 
   const tabs = $('#notebook-tabs', pane);
   state.notes.forEach((n) => {
+    // notes.md is read-only: it has no editor tab (browse + preview it
+    // from the left pane's Markdown preview picker).
+    if (n.name === 'notes.md') return;
     const isActive = state.activeTabKind === 'note' && n.name === state.activeNoteName;
     const tab = document.createElement('button');
     tab.type = 'button';
@@ -3106,19 +3157,11 @@ async function closeLabTab(lab) {
   const wasActive = state.activeTabKind === 'lab' && state.activeLab
     && state.activeLab.chapter === lab.chapter && state.activeLab.name === lab.name;
   if (!wasActive) { renderNotebookPane(); return; }
-  const def = state.notes.find((n) => n.name === 'notes.md')
-    || state.notes.find((n) => n.kind === 'md')
-    || state.notes[0];
+  const def = defaultEditorNote();
   if (def) {
     try { await loadNote(def.name); } catch { /* pane renders empty */ }
   } else {
-    state.activeTabKind = 'note';
-    state.activeLab = null;
-    state.activeNoteName = null;
-    state.activeNoteKind = 'md';
-    state.activeNoteContent = '';
-    state.activeNotebook = null;
-    state.headings = [];
+    clearActiveNote();
   }
   renderNotebookPane();
   renderChapterPanel();
@@ -3126,9 +3169,9 @@ async function closeLabTab(lab) {
 
 /* Add a note anchored at the page being read: insert the anchor comment
    under the current chapter's ## heading in notes.md (end of the section;
-   create the heading if missing — same rule as Ask AI Apply), then open
-   notes.md in the editor with the cursor on the line after the anchor so
-   the user can type the note right there. */
+   create the heading if missing — same rule as Ask AI Apply). notes.md is
+   read-only, so nothing opens in the editor: the anchor is filed by the
+   API and the left preview refreshes to show it. */
 async function addNoteAtCurrentPage() {
   const reading = currentReadingPage();
   if (!reading) return;
@@ -3140,22 +3183,8 @@ async function addNoteAtCurrentPage() {
     setSaveStatus('A note is already anchored here — nothing added.');
     return;
   }
-  if (!(state.activeTabKind === 'note' && state.activeNoteName === 'notes.md')) {
-    try { await loadNote('notes.md'); } catch { /* pane renders empty */ }
-  }
-  renderNotebookPane();
   renderChapterPanel();
   renderLeftPreview();
-  const ta = $('#md-editor', view);
-  if (ta) {
-    const lines = ta.value.split('\n');
-    const idx = lines.findIndex((l) => l.includes(anchor));
-    if (idx >= 0) {
-      ta.focus();
-      const pos = lines.slice(0, idx + 1).join('\n').length + 1;
-      ta.setSelectionRange(pos, pos);
-    }
-  }
   const material = reading.sourceId === PAGE_ANCHOR_SOURCE_BOOK
     ? null
     : (state.materials || []).find((m) => m.id === reading.sourceId) || null;
@@ -3250,6 +3279,12 @@ function renderNotebookBody() {
   const body = $('#notebook-body', view);
   if (!body) return;
   body.classList.remove('has-quick-actions'); // re-added below for md notes
+  if (state.activeTabKind === 'note' && !state.activeNoteName) {
+    // No editable note is open (notes.md never opens here): the empty
+    // state. The + menu in the tab bar is the way in.
+    body.innerHTML = `<div class="notebook-empty">No note open — pick a tab above, or press + to create one.</div>`;
+    return;
+  }
   if (state.activeNoteKind === 'ipynb') {
     renderIpynbBody(body);
     return;
@@ -3401,7 +3436,7 @@ function renderExecuteResult(result) {
 }
 
 async function saveActiveMdNote(showStatus) {
-  if (state.activeNoteKind !== 'md') return;
+  if (state.activeNoteKind !== 'md' || !state.activeNoteName) return;
   const name = state.activeNoteName;
   const content = state.activeNoteContent;
   if (showStatus) setSaveStatus('Saving…');
@@ -3818,7 +3853,8 @@ function activeOutlineChapter() {
 function activeChapterTitle() {
   const ch = activeOutlineChapter();
   if (ch) return ch.title;
-  const h = (state.headings || []).find((hh) => hh.norm === state.activeChapter);
+  const h = notesMdHeadings().find((hh) => hh.norm === state.activeChapter)
+    || (state.headings || []).find((hh) => hh.norm === state.activeChapter);
   return h ? h.text : null;
 }
 
