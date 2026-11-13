@@ -752,7 +752,10 @@ input[type="text"].note-tab-input {
   width: 100%;
   border: none;
   border-radius: 0;
-  resize: vertical;
+  /* No native grip: it is a ~12px texture that vanishes against the
+     dark code background, so the explicit .nb-cell-resize bar below
+     is the resize affordance. autoGrowCellEditor sets the height. */
+  resize: none;
   padding: 12px 14px;
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   font-size: 13px;
@@ -769,8 +772,32 @@ input[type="text"].note-tab-input {
 .nb-cell textarea.md-editor {
   height: auto;
   min-height: 104px;
-  resize: vertical;
+  /* No native grip here either — the .nb-cell-resize bar below it. */
+  resize: none;
 }
+/* Explicit drag handle under each cell editor: a thin full-width bar
+   with a visible grip, always in the flow (never clipped), theme vars
+   so it reads in light + dark. Dragging sets the editor's minimum
+   height for the session (see attachCellResize). */
+.nb-cell-resize {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 14px;
+  cursor: ns-resize;
+  touch-action: none;
+  user-select: none;
+  background: var(--paper-dim);
+  border-top: 1px solid var(--line);
+}
+.nb-cell-resize span {
+  color: var(--ink-faint);
+  font-size: 15px;
+  line-height: 1;
+  letter-spacing: 3px;
+}
+.nb-cell-resize:hover { background: rgba(138, 90, 43, .12); }
+.nb-cell-resize:hover span { color: var(--ink-soft); }
 .nb-code-source:focus { outline: none; }
 .nb-cell-foot { display: flex; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--line); }
 .nb-output {
@@ -1036,8 +1063,6 @@ input[type="text"].note-tab-input {
 .ai-status.error { color: var(--bad); }
 
 /* ---------------- export cells to Markdown ---------------- */
-.nb-export-row { display: flex; gap: 8px; align-items: center; padding: 0 2px 10px; }
-.nb-export-row button:disabled { opacity: .45; cursor: default; }
 .nb-export-check {
   display: inline-flex;
   align-items: center;
@@ -1247,6 +1272,33 @@ input[type="text"].note-tab-input {
 .menu-group-head:hover { background: rgba(138, 90, 43, .08); }
 .menu-item:disabled { opacity: .45; cursor: default; }
 .menu-ext { color: var(--ink-faint); font-size: 12px; }
+
+/* Paste-image popup: the pasted screenshot's markdown code (selectable,
+   click selects all) + Append to note / Copy markdown. Labels only. */
+.paste-image-menu { width: 320px; }
+.paste-image-code {
+  width: 100%;
+  box-sizing: border-box;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+}
+.paste-image-actions { display: flex; gap: 6px; align-items: center; }
+.paste-image-actions button {
+  border: 1px solid var(--line);
+  background: var(--paper);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 13px;
+  color: var(--ink);
+  cursor: pointer;
+}
+.paste-image-actions button:hover { background: rgba(138, 90, 43, .08); }
+.paste-image-close { margin-left: auto; padding: 5px 8px; }
 .menu-count {
   font-size: 11.5px;
   font-weight: 600;

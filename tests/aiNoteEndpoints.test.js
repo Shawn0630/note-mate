@@ -263,7 +263,11 @@ test('GET assets: serves an exported plot as PNG; 404s and 400s', async () => {
 
   const missing = await fetch(`${base}/api/projects/fixture-book/assets/nope-12345678.png`);
   assert.equal(missing.status, 404);
-  const bad = await fetch(`${base}/api/projects/fixture-book/assets/plot.jpg`);
+  // JPEG is a served asset type too (pasted screenshots) — a missing .jpg
+  // is a 404, while a non-image name is a 400.
+  const missingJpg = await fetch(`${base}/api/projects/fixture-book/assets/plot.jpg`);
+  assert.equal(missingJpg.status, 404);
+  const bad = await fetch(`${base}/api/projects/fixture-book/assets/plot.gif`);
   assert.equal(bad.status, 400);
   const noProject = await fetch(`${base}/api/projects/missing-project/assets/${fileName}`);
   assert.equal(noProject.status, 404);

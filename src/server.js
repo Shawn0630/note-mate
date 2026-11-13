@@ -2,6 +2,7 @@
 // No database. Serves the API the frontend builds against; see README.md.
 import express from 'express';
 import multer from 'multer';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
@@ -1397,20 +1398,61 @@ app.post('/api/projects/:slug/export-cells', async (req, res, next) => {
   }
 });
 
-// Serve a plot file written by the cell export (notes/assets/<file>).
-// PNG only; file names are content-hash suffixed by the export route, so a
-// name that exists is a file the export wrote. The markdown itself keeps
-// relative assets/... links (portable for download); the app's previews
-// rewrite those links to this route at render time.
+// Upload a pasted screenshot (or any PNG/JPEG image) into notes/assets/.
+// Body is JSON {dataUrl} — the same base64 pattern as the cover upload.
+// The file name is content-hash deduped (pasted-<hash8>.<ext>): pasting
+// the same screenshot twice reuses one file, and the name is server-chosen
+// so no client-supplied name can traverse. The client inserts the returned
+// `assets/<fileName>` reference into the note; previews resolve it through
+// the asset route below.
+const MAX_PASTED_IMAGE_BYTES = 10 * 1024 * 1024;
+app.post('/api/projects/:slug/assets', async (req, res, next) => {
+  try {
+    const { dataUrl } = req.body ?? {};
+    const m = typeof dataUrl === 'string'
+      && dataUrl.match(/^data:image\/(png|jpe?g);base64,([A-Za-z0-9+/=]+)$/);
+    if (!m) {
+      return res.status(400).json({ error: 'dataUrl must be a base64 data: URL for a PNG or JPEG image' });
+    }
+    const buf = Buffer.from(m[2], 'base64');
+    if (buf.length > MAX_PASTED_IMAGE_BYTES) {
+      return res.status(413).json({ error: 'image is too large (max 10 MB)' });
+    }
+    await readProject(req.params.slug); // 404 before writing anything
+    const ext = m[1] === 'png' ? 'png' : 'jpg';
+    const hash = crypto.createHash('sha256').update(buf).digest('hex').slice(0, 8);
+    const fileName = `pasted-${hash}.${ext}`;
+    const assetsDir = resolveProjectPath(DATA_DIR, req.params.slug, 'notes', 'assets');
+    await fsp.mkdir(assetsDir, { recursive: true });
+    const file = path.join(assetsDir, fileName);
+    try {
+      await fsp.stat(file); // already there — same hash means same bytes
+    } catch {
+      await fsp.writeFile(file, buf);
+    }
+    res.json({ fileName, path: `assets/${fileName}` });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// Serve an asset file written by the cell export or the paste upload
+// (notes/assets/<file>). PNG or JPEG only; file names are content-hash
+// suffixed by the writing route, so a name that exists is a file the app
+// wrote. The markdown itself keeps relative assets/... links (portable for
+// download); the app's previews rewrite those links to this route at
+// render time.
 app.get('/api/projects/:slug/assets/:file', async (req, res, next) => {
   try {
     const file = req.params.file;
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.png$/.test(file)) {
-      return res.status(400).json({ error: 'asset file must be a .png file name' });
+    const m = file.match(/^([A-Za-z0-9][A-Za-z0-9._-]*)\.(png|jpe?g)$/);
+    if (!m) {
+      return res.status(400).json({ error: 'asset file must be a .png or .jpg file name' });
     }
     await readProject(req.params.slug); // 404 before touching the disk
     const abs = resolveProjectPath(DATA_DIR, req.params.slug, 'notes', 'assets', file);
-    res.type('image/png');
+    res.type(m[2] === 'png' ? 'image/png' : 'image/jpeg');
     res.sendFile(abs);
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'asset not found' });

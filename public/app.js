@@ -21,6 +21,8 @@
    - POST   /api/projects/:slug/export-cells  {notebook, name, cells:[indexes]}
                                               → {markdown, images, cells}
    - GET    /api/projects/:slug/assets/:file  exported plot PNG (notes/assets/)
+   - POST   /api/projects/:slug/assets        {dataUrl} → {fileName, path}
+                                              pasted screenshot (notes/assets/)
    - POST   /api/execute                      {language, code}
    - POST   /api/execute                      {language, cells:[{source}]}
                                               → {results:[{stdout, stderr, exitCode, images, skipped}]}
@@ -42,6 +44,9 @@ import {
   emptyReadingPosition, parseReadingPosition, recordReadingPosition,
   storedPageOrDefault,
 } from './readingPosition.js';
+import {
+  imageMarkdownRef, appendImageEdit, embedAssetsInMarkdown,
+} from './pasteImage.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdfjs/pdf.worker.mjs';
 
@@ -2959,11 +2964,28 @@ async function previewNoteText() {
 }
 
 /* Download the note currently being previewed (the old toolbar Export
-   notes, moved here next to the picker). */
+   notes, moved here next to the picker). Local assets/... images the note
+   references are embedded as base64 data URIs, so the downloaded .md
+   shows the images when opened elsewhere; external URLs stay as-is. */
 async function exportPreviewedNote() {
   const { name, text } = await previewNoteText();
   if (!name) return;
-  downloadBlob(text, `${state.project.slug}-${name}`);
+  const embedded = await embedAssetsInMarkdown(text, async (file) => {
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(state.project.slug)}/assets/${encodeURIComponent(file)}`);
+      if (!res.ok) return null;
+      const blob = await res.blob();
+      return await new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(String(r.result));
+        r.onerror = () => reject(new Error('read failed'));
+        r.readAsDataURL(blob);
+      });
+    } catch {
+      return null;
+    }
+  });
+  downloadBlob(embedded, `${state.project.slug}-${name}`);
 }
 
 async function renderLeftPreview({ follow = false } = {}) {
@@ -3606,6 +3628,157 @@ function insertMdQuickAction(ta, action, override = {}) {
   ta.focus();
 }
 
+/* Paste a screenshot into the markdown editor: the image uploads first
+   (notes/assets/, content-hash named), then a small popup near the cursor
+   offers [Append to note] (the reference at the END of the note) or
+   [Copy markdown] (the `![...](assets/...)` code, shown so it can be
+   copied by hand too). Nothing is inserted until he picks one — dismissing
+   (Esc / click elsewhere / ×) inserts nothing, and the already-uploaded
+   file stays in notes/assets/ as an orphan (harmless; a re-paste of the
+   same screenshot reuses the same hash-named file). Text pastes have no
+   image item and fall through to the default paste untouched. */
+async function handleMdEditorPaste(ta, e) {
+  const item = [...(e.clipboardData?.items || [])]
+    .find((it) => it.type && it.type.startsWith('image/'));
+  if (!item) return;
+  e.preventDefault();
+  const file = item.getAsFile();
+  if (!file) return;
+  setSaveStatus('Uploading image…');
+  let dataUrl;
+  try {
+    dataUrl = await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = () => reject(new Error('could not read the image'));
+      r.readAsDataURL(file);
+    });
+  } catch (err) {
+    setSaveStatus(`Could not paste image: ${err.message}`, 'error');
+    return;
+  }
+  let uploaded;
+  try {
+    uploaded = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/assets`,
+      'POST', { dataUrl });
+  } catch (err) {
+    setSaveStatus(`Could not paste image: ${err.message}`, 'error');
+    return;
+  }
+  setSaveStatus('Image uploaded.');
+  showPasteImageMenu(ta, imageMarkdownRef(uploaded.fileName));
+}
+
+let pasteImageMenu = null;
+
+function closePasteImageMenu() {
+  if (!pasteImageMenu) return;
+  pasteImageMenu.el.remove();
+  document.removeEventListener('pointerdown', pasteImageMenu.onOutside, true);
+  document.removeEventListener('keydown', pasteImageMenu.onKey, true);
+  pasteImageMenu = null;
+}
+
+/* Caret position in viewport coordinates, via a mirror div (same font,
+   padding, width as the textarea, text up to the caret + a marker span).
+   Used to put the paste popup next to where he is typing. */
+function textareaCaretPos(ta) {
+  const rect = ta.getBoundingClientRect();
+  const cs = getComputedStyle(ta);
+  const div = document.createElement('div');
+  div.style.position = 'absolute';
+  div.style.visibility = 'hidden';
+  div.style.whiteSpace = 'pre-wrap';
+  div.style.wordWrap = 'break-word';
+  div.style.width = `${ta.clientWidth}px`;
+  div.style.font = cs.font;
+  div.style.padding = cs.padding;
+  div.style.border = cs.border;
+  div.style.lineHeight = cs.lineHeight;
+  div.style.letterSpacing = cs.letterSpacing;
+  div.textContent = ta.value.slice(0, ta.selectionStart ?? 0);
+  const marker = document.createElement('span');
+  marker.textContent = '\u200b';
+  div.appendChild(marker);
+  document.body.appendChild(div);
+  const x = rect.left + marker.offsetLeft - ta.scrollLeft;
+  const y = rect.top + marker.offsetTop - ta.scrollTop;
+  div.remove();
+  return { x, y };
+}
+
+function showPasteImageMenu(ta, code) {
+  closePasteImageMenu();
+  const el = document.createElement('div');
+  el.className = 'floating-menu paste-image-menu';
+  el.setAttribute('role', 'menu');
+  el.innerHTML = `
+    <input type="text" class="paste-image-code" readonly value="${esc(code)}" aria-label="Markdown for the pasted image">
+    <div class="paste-image-actions">
+      <button type="button" data-paste-action="append">Append to note</button>
+      <button type="button" data-paste-action="copy">Copy markdown</button>
+      <button type="button" class="paste-image-close" data-paste-action="close" aria-label="Close">×</button>
+    </div>`;
+  document.body.appendChild(el);
+  // Near the caret, clamped to the viewport (below the line, or above it
+  // when there is no room below).
+  const pos = textareaCaretPos(ta);
+  const mw = el.offsetWidth;
+  const mh = el.offsetHeight;
+  let left = Math.min(pos.x, window.innerWidth - mw - 8);
+  left = Math.max(8, left);
+  let top = pos.y + 24;
+  if (top + mh > window.innerHeight - 8) top = Math.max(8, pos.y - mh - 4);
+  el.style.left = `${left}px`;
+  el.style.top = `${top}px`;
+  const codeInput = $('.paste-image-code', el);
+  codeInput.addEventListener('click', () => codeInput.select());
+  codeInput.addEventListener('focus', () => codeInput.select());
+  const onOutside = (e) => { if (!el.contains(e.target)) closePasteImageMenu(); };
+  const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); closePasteImageMenu(); } };
+  document.addEventListener('pointerdown', onOutside, true);
+  document.addEventListener('keydown', onKey, true);
+  pasteImageMenu = { el, onOutside, onKey };
+  el.addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-paste-action]');
+    if (!btn) return;
+    const action = btn.dataset.pasteAction;
+    if (action === 'close') { closePasteImageMenu(); return; }
+    if (action === 'copy') {
+      try {
+        await navigator.clipboard.writeText(code);
+        setSaveStatus('Markdown copied.');
+        closePasteImageMenu();
+      } catch {
+        setSaveStatus('Copy failed — select the code above.', 'error');
+      }
+      return;
+    }
+    if (action === 'append') {
+      closePasteImageMenu();
+      appendImageToNote(ta, code);
+    }
+  });
+  codeInput.focus();
+  codeInput.select();
+}
+
+/* Append the image reference at the END of the note (one native undo
+   step, so Ctrl/Cmd+Z takes it back; the input event it fires drives the
+   autosave + live preview like typing). */
+function appendImageToNote(ta, code) {
+  const edit = appendImageEdit(ta.value, code);
+  ta.focus();
+  ta.setSelectionRange(edit.start, edit.end);
+  const done = document.execCommand('insertText', false, edit.text);
+  if (!done) {
+    ta.setRangeText(edit.text, edit.start, edit.end, 'end');
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  ta.focus();
+  setSaveStatus('Image appended to note.');
+}
+
 /* The Page anchor dropdown: pages/slides looked at in the last 5 minutes,
    most recent first. Clicking one inserts THAT anchor at the cursor; the
    main Page anchor button still inserts the current page. With no recent
@@ -3697,6 +3870,45 @@ function renderNotebookBody() {
       leftPreviewTimer = setTimeout(() => renderLeftPreview(), 400);
     }
   });
+  // Pasting a screenshot uploads it first, then offers Append / Copy in a
+  // popup — nothing is inserted until he picks one. Text pastes are
+  // untouched (no image item on the clipboard).
+  ta.addEventListener('paste', (e) => handleMdEditorPaste(ta, e));
+}
+
+/* Typeset LaTeX math in a rendered markdown element (notebook markdown
+   cells AND the left Markdown preview both go through renderMdPreview,
+   so one call covers both). KaTeX is vendored locally (public/vendor/
+   katex — katex.min.js + auto-render.min.js + CSS + fonts, no CDN);
+   renderMathInElement is its auto-render helper. Delimiters: inline
+   $...$ and \(...\), display $$...$$ and \[...\], plus
+   \begin{equation}/\begin{align} environments (the UDL labs use them).
+   throwOnError: false — a construct KaTeX cannot render falls back to
+   the raw source text (shown red, but visible) instead of breaking the
+   cell. Code/pre are skipped by auto-render's ignoredTags. No-op when
+   KaTeX failed to load. */
+const KATEX_DELIMITERS = [
+  { left: '$$', right: '$$', display: true },
+  { left: '$', right: '$', display: false },
+  { left: '\\(', right: '\\)', display: false },
+  { left: '\\[', right: '\\]', display: true },
+  { left: '\\begin{equation}', right: '\\end{equation}', display: true },
+  { left: '\\begin{equation*}', right: '\\end{equation*}', display: true },
+  { left: '\\begin{align}', right: '\\end{align}', display: true },
+  { left: '\\begin{align*}', right: '\\end{align*}', display: true },
+];
+
+function renderMathInPreview(el) {
+  if (!el || typeof window.renderMathInElement !== 'function') return;
+  try {
+    window.renderMathInElement(el, {
+      delimiters: KATEX_DELIMITERS,
+      throwOnError: false,
+      strict: 'ignore',
+    });
+  } catch {
+    // Math is decorative here — a failure must never break the preview.
+  }
 }
 
 /* Render markdown into el; tag headings with data-h for scroll-spy and
@@ -3704,6 +3916,7 @@ function renderNotebookBody() {
 function renderMdPreview(el, text) {
   el.innerHTML = window.marked ? window.marked.parse(text || '') : esc(text || '');
   rewriteAssetSrcs(el); // exported plots (assets/...) resolve via the asset API
+  renderMathInPreview(el); // $...$ / $$...$$ / \begin{equation} → typeset KaTeX
   $$('h2, h3', el).forEach((h) => { h.dataset.h = normalizeHeading(h.textContent); });
   // Page anchors: an `<!-- @page N · source: <id> -->` comment in the
   // markdown becomes a chip; clicking it jumps the LEFT pane to that
@@ -3927,20 +4140,80 @@ function setNbCellSource(cell, text) {
 
 /* Notebook cell editors auto-grow to fit their content: height follows
    the code (minimum ~3 lines from CSS min-height), so a normal cell
-   never shows a cramped inner scroll. NB_CELL_MAX_HEIGHT is the cap
-   for very long cells — past it the editor scrolls internally instead
-   of taking over the page. A manual drag still works (resize:
-   vertical in CSS); the next keystroke re-fits the height to the
-   content, so a drag is a temporary "make it bigger" rather than a
-   permanent size. No-op while the editor is hidden (scrollHeight is
-   0 then); fitCellEditors re-fits when the pane becomes visible. */
+   never shows a cramped inner scroll. NB_CELL_MAX_HEIGHT is the AUTO-fit
+   cap — past it the editor scrolls internally instead of taking over
+   the page. A manual drag (the explicit .nb-cell-resize bar under the
+   editor) sets a MINIMUM height for the session, kept in cellManualHeights
+   (WeakMap keyed by cell object: never written into the .ipynb, dies with
+   the cell, so a reload / tab switch starts fresh). Auto-grow still
+   grows past a dragged height when the content is taller, but never
+   shrinks below it; the 480px cap does not apply once a cell has been
+   dragged. No-op while the editor is hidden (scrollHeight is 0 then);
+   fitCellEditors re-fits when the pane becomes visible. */
 const NB_CELL_MAX_HEIGHT = 480;
+const cellManualHeights = new WeakMap();
+
+/* The notebook cell an editor textarea belongs to (set as data-cell-idx
+   at render time), for its dragged minimum height. */
+function cellForEditor(ta) {
+  const idx = Number(ta?.dataset?.cellIdx);
+  if (!Number.isInteger(idx)) return null;
+  return state.activeNotebook?.cells?.[idx] ?? null;
+}
+
+function manualMinHeightFor(ta) {
+  const cell = cellForEditor(ta);
+  return cell ? (cellManualHeights.get(cell) || 0) : 0;
+}
+
 function autoGrowCellEditor(ta) {
   if (!ta || !ta.isConnected || ta.offsetParent === null) return;
   ta.style.height = 'auto';
-  const capped = Math.min(ta.scrollHeight, NB_CELL_MAX_HEIGHT);
-  ta.style.height = `${capped}px`;
-  ta.style.overflowY = ta.scrollHeight > NB_CELL_MAX_HEIGHT ? 'auto' : 'hidden';
+  const content = ta.scrollHeight;
+  const manual = manualMinHeightFor(ta);
+  let h;
+  if (manual > 0) {
+    // Dragged height is a floor for the session: grow past it when the
+    // content is taller, never shrink below it.
+    h = Math.max(content, manual);
+    ta.style.overflowY = 'hidden';
+  } else {
+    h = Math.min(content, NB_CELL_MAX_HEIGHT);
+    ta.style.overflowY = content > NB_CELL_MAX_HEIGHT ? 'auto' : 'hidden';
+  }
+  ta.style.height = `${h}px`;
+}
+
+/* Explicit drag handle under a cell editor (the native textarea grip is
+   a ~12px texture that is effectively invisible against the dark code
+   background, so the user drags this bar instead). Pointer drag resizes
+   live; the height is recorded as the cell's manual minimum, so the
+   next keystroke (auto-grow) keeps it. Dragging shorter than the
+   content has no lasting effect — the drag is a floor, and auto-grow
+   re-expands to fit the content on release. */
+function attachCellResize(handle, ta, cell) {
+  if (!handle || !ta) return;
+  handle.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = ta.offsetHeight;
+    try { handle.setPointerCapture(e.pointerId); } catch { /* no capture */ }
+    const onMove = (ev) => {
+      const h = Math.max(88, startH + (ev.clientY - startY));
+      ta.style.height = `${h}px`;
+      ta.style.overflowY = ta.scrollHeight > h ? 'auto' : 'hidden';
+      if (cell) cellManualHeights.set(cell, h);
+    };
+    const done = () => {
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', done);
+      handle.removeEventListener('pointercancel', done);
+      autoGrowCellEditor(ta); // reconcile: keeps the dragged minimum, grows if content is taller
+    };
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', done);
+    handle.addEventListener('pointercancel', done);
+  });
 }
 
 /* Re-fit every cell editor currently on screen (code cells + any
@@ -4007,20 +4280,20 @@ function renderIpynbBody(body) {
     state.exportSelection = new Set();
     state.exportSelectionFor = notebookKey();
   }
-  // Run-all is unavailable for Java: cells cannot share one session.
-  const runAllRow = lang === 'java' ? '' : `
+  // One toolbar row above the cells: Run all (not for Java — cells cannot
+  // share one session) + the small Export button beside it. The export
+  // used to be a big standalone pill in its own row; same function, just
+  // small and beside the cells.
+  const runAllRow = `
     <div class="nb-runall-row">
-      <button type="button" class="run-btn" id="nb-run-all"
+      ${lang === 'java' ? '' : `<button type="button" class="run-btn" id="nb-run-all"
         title="Run all code cells top to bottom in one shared session">▶ Run all</button>
-      <span class="save-status" id="nb-runall-status"></span>
-    </div>`;
-  const exportRow = `
-    <div class="nb-export-row">
-      <button type="button" id="nb-export-md" disabled
+      <span class="save-status" id="nb-runall-status"></span>`}
+      <button type="button" class="run-btn" id="nb-export-md" disabled
         title="Generate markdown from the selected code cells (code fences, outputs, plots as files)">Export to Markdown</button>
       <span class="save-status" id="nb-export-count">Select cells to export</span>
     </div>`;
-  body.innerHTML = `${runAllRow}${exportRow}<div class="nb-cells" id="nb-cells"></div>`;
+  body.innerHTML = `${runAllRow}<div class="nb-cells" id="nb-cells"></div>`;
   const runAllBtn = $('#nb-run-all', body);
   if (runAllBtn) {
     runAllBtn.addEventListener('click', async (e) => {
@@ -4043,6 +4316,7 @@ function renderIpynbBody(body) {
         <div class="md-preview" data-md-view="${idx}"></div>
         <div data-md-editor="${idx}" hidden>
           <textarea class="md-editor" rows="6" spellcheck="false"></textarea>
+          <div class="nb-cell-resize" data-cell-resize="${idx}" title="Drag to resize"><span aria-hidden="true">⋯</span></div>
         </div>`;
       const viewEl = $(`[data-md-view="${idx}"]`, cellEl);
       renderMdPreview(viewEl, nbCellSource(cell));
@@ -4050,6 +4324,8 @@ function renderIpynbBody(body) {
       const editorWrap = $(`[data-md-editor="${idx}"]`, cellEl);
       const ta = $('textarea', editorWrap);
       ta.value = nbCellSource(cell);
+      ta.dataset.cellIdx = String(idx);
+      attachCellResize($('.nb-cell-resize', editorWrap), ta, cell);
       ta.addEventListener('input', () => autoGrowCellEditor(ta));
       editBtn.addEventListener('click', () => {
         const editing = editorWrap.hidden;
@@ -4073,6 +4349,7 @@ function renderIpynbBody(body) {
           <span>Code · ${esc(lang)}</span><span class="spacer"></span>
           <button type="button" data-cell-del="${idx}">Delete</button></div>
         <textarea class="nb-code-source" spellcheck="false"></textarea>
+        <div class="nb-cell-resize" data-cell-resize="${idx}" title="Drag to resize"><span aria-hidden="true">⋯</span></div>
         <div class="nb-cell-foot">
           <button type="button" class="run-btn" data-cell-run="${idx}">▶ Run</button>
           ${lang === 'java' ? '' : `<button type="button" class="run-btn" data-cell-run-above="${idx}" title="Run this cell and every code cell above it in one shared session">▶ Run all above</button>`}
@@ -4086,6 +4363,8 @@ function renderIpynbBody(body) {
       });
       const ta = $('.nb-code-source', cellEl);
       ta.value = nbCellSource(cell);
+      ta.dataset.cellIdx = String(idx);
+      attachCellResize($('.nb-cell-resize', cellEl), ta, cell);
       ta.addEventListener('input', () => { setNbCellSource(cell, ta.value); autoGrowCellEditor(ta); });
       ta.addEventListener('blur', () => saveNotebook());
       ta.addEventListener('focus', () => { state.editorFocused = true; });
