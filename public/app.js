@@ -4914,7 +4914,11 @@ function updateAiContext() {
   if (el) el.textContent = aiContextText();
   const codeEl = $('#ai-code-context', view);
   if (codeEl) {
-    const nb = state.activeNotebook ? `Notebook: ${notebookDisplayName()}. ` : '';
+    // Name the language Code AI will write, so a Java/JS notebook does
+    // not look like the Python-only panel it used to be.
+    const langName = { python: 'Python', java: 'Java', javascript: 'JavaScript' }[notebookLanguage()];
+    const nb = state.activeNotebook
+      ? `Notebook: ${notebookDisplayName()}${langName ? ` (${langName})` : ''}. ` : '';
     codeEl.textContent = `${nb}${aiContextText()}`;
   }
   // "Include my notes" only applies when a book chapter is in context
@@ -5274,11 +5278,20 @@ function renderAiPanel() {
 }
 
 /* The current notebook's language (kernelspec / language_info; 'python'
-   when undeclared — the seeded labs all declare it). Code AI is Python
-   only, so anything else disables it with a note. */
+   when undeclared — the seeded labs all declare it). */
 function notebookLanguage() {
   const md = state.activeNotebook?.metadata || {};
   return String(md.kernelspec?.language || md.language_info?.name || 'python').toLowerCase();
+}
+
+/* The language Code AI will write for the open notebook, or null when
+   the notebook's language is not one it supports (should not happen
+   with the app's own notebook kinds — a notebook whose metadata names
+   something else entirely). */
+function aiCodeLanguage() {
+  if (!state.activeNotebook) return null;
+  const lang = notebookLanguage();
+  return RUNNABLE_LANGS.includes(lang) ? lang : null;
 }
 
 /* The current notebook's project-relative path, as the ai-code request
@@ -5360,7 +5373,7 @@ function renderAiCodeThread() {
     thread.appendChild(chip);
   }
   // Empty thread stays empty: the input + chips are self-evident, and
-  // asking with no Python notebook open reports it as a status message.
+  // asking with no supported notebook open reports it as a status message.
   if (!messages.length) {
     return;
   }
@@ -5420,8 +5433,14 @@ async function askAiCode() {
   statusEl.classList.remove('error');
   if (!prompt) { statusEl.textContent = 'Type what you want the code to do.'; return; }
   if (prompt.length > 2000) { statusEl.textContent = 'Keep the request under 2000 characters.'; return; }
-  if (!state.activeNotebook || notebookLanguage() !== 'python') {
-    statusEl.textContent = 'Open a Python notebook first — Code AI writes code for the current Python notebook.';
+  if (!state.activeNotebook) {
+    statusEl.textContent = 'Open a notebook first — Code AI writes code for the current notebook.';
+    statusEl.classList.add('error');
+    return;
+  }
+  const lang = aiCodeLanguage();
+  if (!lang) {
+    statusEl.textContent = 'Code AI supports Python, Java and JavaScript notebooks.';
     statusEl.classList.add('error');
     return;
   }
@@ -5449,6 +5468,7 @@ async function askAiCode() {
       chapter: activeChapterTitle(),
       prompt,
       notebook: notebookPath(),
+      language: lang,
       source: reading && reading.sourceId !== PAGE_ANCHOR_SOURCE_BOOK ? reading.sourceId : null,
       page: reading ? reading.page : null,
       cells,
@@ -5476,10 +5496,10 @@ async function applyAiCode(i) {
   const thread = aiCodeThread();
   const msg = thread.messages[i];
   if (!msg || msg.role !== 'assistant' || msg.applied) return;
-  if (!state.activeNotebook || notebookLanguage() !== 'python') {
+  if (!state.activeNotebook || !aiCodeLanguage()) {
     const statusEl = $('#ai-code-status', view);
     if (statusEl) {
-      statusEl.textContent = 'The notebook changed — open a Python notebook to apply this code.';
+      statusEl.textContent = 'The notebook changed — Code AI supports Python, Java and JavaScript notebooks.';
       statusEl.classList.add('error');
     }
     return;

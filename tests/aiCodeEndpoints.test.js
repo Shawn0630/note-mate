@@ -72,6 +72,8 @@ const post = async (slug, path, body) => {
 };
 
 const STUB_CODE = '```python\nx = np.arange(3)\n```\nBuilds an array of 0, 1, 2.';
+const STUB_JAVA = '```java\npublic class Main {\n  public static void main(String[] args) {\n    System.out.println("Hello, World!");\n  }\n}\n```\nPrints Hello, World!.';
+const STUB_JS = '```javascript\nconsole.log("Hello, World!");\n```\nLogs Hello, World!.';
 
 // --- ai-code ---------------------------------------------------------------
 
@@ -91,6 +93,42 @@ test('POST ai-code: stub returns code + explanation + chapter range + context', 
     assert.equal(json.source, null);
     assert.ok(json.contextChars > 0);
   });
+});
+
+test('POST ai-code: language java / javascript return code in that language', async () => {
+  await withLlmEnv({ LLM_STUB_RESPONSE: STUB_JAVA }, async () => {
+    const { status, json } = await post('fixture-code', '/ai-code', {
+      chapter: 'Introduction',
+      prompt: 'Print hello.',
+      notebook: 'notes/java-scratch.ipynb',
+      language: 'java',
+      cells: [],
+    });
+    assert.equal(status, 200, JSON.stringify(json));
+    assert.equal(json.language, 'java');
+    assert.match(json.code, /public class Main/);
+    assert.equal(json.explanation, 'Prints Hello, World!.');
+  });
+  await withLlmEnv({ LLM_STUB_RESPONSE: STUB_JS }, async () => {
+    const { status, json } = await post('fixture-code', '/ai-code', {
+      chapter: 'Introduction',
+      prompt: 'Log hello.',
+      notebook: 'notes/js-scratch.ipynb',
+      language: 'javascript',
+      cells: [],
+    });
+    assert.equal(status, 200, JSON.stringify(json));
+    assert.equal(json.language, 'javascript');
+    assert.equal(json.code, 'console.log("Hello, World!");');
+  });
+});
+
+test('POST ai-code: 400 for an unknown language', async () => {
+  const { status, json } = await post('fixture-code', '/ai-code', {
+    prompt: 'hi', notebook: 'notes/java-scratch.ipynb', language: 'ruby',
+  });
+  assert.equal(status, 400, JSON.stringify(json));
+  assert.match(json.error, /language must be python, java, or javascript/);
 });
 
 test('POST ai-code: deck source + page resolves the slide range (window fallback, no outline)', async () => {

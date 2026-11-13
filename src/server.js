@@ -21,7 +21,7 @@ import {
   MAX_AI_NOTE_HISTORY_CHARS, MAX_AI_NOTE_NOTE_CHARS, MAX_CHAPTER_PAGES,
 } from './aiNote.js';
 import {
-  generateAiCode, MAX_AI_CODE_PROMPT_CHARS, MAX_AI_CODE_CELLS_CHARS,
+  generateAiCode, AI_CODE_LANGUAGES, MAX_AI_CODE_PROMPT_CHARS, MAX_AI_CODE_CELLS_CHARS,
 } from './aiCode.js';
 import { cellsToMarkdown } from './cellExport.js';
 import {
@@ -1260,10 +1260,11 @@ app.post('/api/projects/:slug/ai-note', async (req, res, next) => {
 
 // ---------------------------------------------------------------------------
 // On-demand Code AI — the second tab of the AI panel. Same proposal-only
-// rule as ai-note, but the model returns Python code for the notebook the
-// user is working in; Apply replaces the pinned target cell in place, or
-// appends a new code cell when nothing is pinned (client-side, through
-// the notebook PUT path). Python notebooks only. The request carries the
+// rule as ai-note, but the model returns code in the notebook's language
+// (Python, Java or JavaScript, via `language` — 'python' when absent) for
+// the notebook the user is working in; Apply replaces the pinned target
+// cell in place, or appends a new code cell when nothing is pinned
+// (client-side, through the notebook PUT path). The request carries the
 // active reading source + page (same context rules as ai-note) plus the
 // whole notebook's cell sources (`cells`, capped server-side at
 // MAX_AI_CODE_CELLS_CHARS) and the pinned cell index (`targetCell`) so
@@ -1272,7 +1273,11 @@ app.post('/api/projects/:slug/ai-note', async (req, res, next) => {
 
 app.post('/api/projects/:slug/ai-code', async (req, res, next) => {
   try {
-    const { chapter, prompt, notebook, source, page, cells, targetCell, history, model } = req.body ?? {};
+    const { chapter, prompt, notebook, source, page, cells, targetCell, history, model, language } = req.body ?? {};
+    if (language !== undefined && language !== null
+      && !AI_CODE_LANGUAGES.includes(String(language).toLowerCase())) {
+      return res.status(400).json({ error: 'language must be python, java, or javascript' });
+    }
     if (typeof prompt !== 'string' || !prompt.trim()) {
       return res.status(400).json({ error: 'prompt (string) is required' });
     }
@@ -1325,6 +1330,7 @@ app.post('/api/projects/:slug/ai-code', async (req, res, next) => {
         notebookCells,
         prompt: prompt.trim(),
         hasTargetCell: Number.isInteger(targetCell),
+        language: language == null ? undefined : String(language).toLowerCase(),
         history: cleanHistory,
         model: typeof model === 'string' && model.trim() ? model.trim() : undefined,
       });
