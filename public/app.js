@@ -49,6 +49,7 @@ import {
 } from './pasteImage.js';
 import {
   resolveScreenshotTarget, pageCanvasSelector, pageHolderSelector,
+  normalizeSelectionRect, isClickSelection, cropRegionToCanvas,
 } from './screenshotCapture.js';
 import {
   AI_CODE_CONTEXT_CHARS, targetCellLabel, targetCellFingerprint,
@@ -3691,14 +3692,11 @@ async function uploadImageAndShowMenu(ta, dataUrl, errLabel) {
   return uploaded;
 }
 
-/* Screenshot button (main click): capture the currently visible PDF page
-   or deck slide — the canvas the reader already rendered; never re-render
-   the PDF or fetch the page again. Uploads through the same assets
-   endpoint as paste, then shows the same popup (Append to note / Copy
-   markdown). When the left pane shows no page canvas (video, YouTube, a
-   Google Slides iframe, the Markdown preview tab, a page not rendered
-   yet), a status hint and nothing else — never a blank upload. */
-async function capturePageScreenshot(ta) {
+/* Shared by whole-page capture and region select: resolve the capturable
+   canvas for the current left tab and wait for pdf.js to finish painting
+   it. Returns { canvas, container }, or null after setting a status hint
+   (no page / still loading — never a blank capture). */
+async function getRenderedPageCanvas() {
   const target = resolveScreenshotTarget({
     kind: state.project?.kind,
     leftTab: state.leftTab,
@@ -3709,7 +3707,7 @@ async function capturePageScreenshot(ta) {
   });
   if (target.error) {
     setSaveStatus('No page to capture — open a PDF page or slide first.');
-    return;
+    return null;
   }
   const container = target.container === 'deck' ? state.deckContainer : state.pdfContainer;
   // The canvas exists in the DOM while pdf.js is still painting it, so a
@@ -3728,22 +3726,117 @@ async function capturePageScreenshot(ta) {
     setSaveStatus(holder()
       ? 'Page still loading — try again in a moment.'
       : 'No page to capture — open a PDF page or slide first.');
-    return;
+    return null;
   }
   const canvas = container?.querySelector(pageCanvasSelector(target.page));
   if (!canvas || !canvas.width || !canvas.height) {
     setSaveStatus('No page to capture — open a PDF page or slide first.');
+    return null;
+  }
+  return { canvas, container };
+}
+
+/* Crop one rectangle out of a rendered page canvas as a PNG data URL. */
+function cropCanvasToDataUrl(canvas, { sx, sy, sw, sh }) {
+  const out = document.createElement('canvas');
+  out.width = sw;
+  out.height = sh;
+  out.getContext('2d').drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+  return out.toDataURL('image/png');
+}
+
+/* Screenshot button (main click): macOS-style region select. A
+   translucent overlay covers the reading pane; drag to draw the region,
+   release to capture just that part of the current PDF page / deck
+   slide (the canvas the reader already rendered — never re-rendered or
+   re-fetched). The cropped PNG uploads through the same assets endpoint
+   as paste, then shows the same popup (Append to note / Copy markdown).
+   Esc, or a click without dragging, cancels — nothing uploaded. A
+   selection outside the page, or too small, shows a status hint and
+   uploads nothing. When the left pane shows no page canvas (video,
+   YouTube, a Google Slides iframe, the Markdown preview tab, a page not
+   rendered yet), a status hint and nothing else. */
+async function enterRegionSelect(ta) {
+  const got = await getRenderedPageCanvas();
+  if (!got) return;
+  const { canvas, container } = got;
+  const paneRect = container.getBoundingClientRect();
+  if (!paneRect.width || !paneRect.height) {
+    setSaveStatus('No page to capture — open a PDF page or slide first.');
     return;
   }
-  let dataUrl;
-  try {
-    dataUrl = canvas.toDataURL('image/png');
-  } catch {
-    setSaveStatus('Could not capture this page.', 'error');
-    return;
-  }
-  setSaveStatus('Uploading image…');
-  await uploadImageAndShowMenu(ta, dataUrl, 'Could not upload screenshot');
+  const overlay = document.createElement('div');
+  overlay.className = 'screenshot-select-overlay';
+  overlay.style.left = `${paneRect.left}px`;
+  overlay.style.top = `${paneRect.top}px`;
+  overlay.style.width = `${paneRect.width}px`;
+  overlay.style.height = `${paneRect.height}px`;
+  overlay.innerHTML = `<div class="screenshot-select-hint">Drag to select a region — Esc to cancel</div>`;
+  const rectEl = document.createElement('div');
+  rectEl.className = 'screenshot-select-rect';
+  rectEl.hidden = true;
+  document.body.append(overlay, rectEl);
+  let start = null;
+  let sel = null;
+  let done = false;
+  const close = () => {
+    if (done) return;
+    done = true;
+    document.removeEventListener('keydown', onKey, true);
+    overlay.remove();
+    rectEl.remove();
+  };
+  const onKey = (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
+  };
+  document.addEventListener('keydown', onKey, true);
+  overlay.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    start = { x: e.clientX, y: e.clientY };
+    sel = null;
+    rectEl.hidden = true;
+    try { overlay.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+  });
+  overlay.addEventListener('pointermove', (e) => {
+    if (!start) return;
+    sel = normalizeSelectionRect(start.x, start.y, e.clientX, e.clientY);
+    rectEl.hidden = false;
+    rectEl.style.left = `${sel.x}px`;
+    rectEl.style.top = `${sel.y}px`;
+    rectEl.style.width = `${sel.width}px`;
+    rectEl.style.height = `${sel.height}px`;
+  });
+  const finish = async () => {
+    if (!start) return;
+    start = null;
+    if (!sel || isClickSelection(sel)) { close(); return; } // a click, not a drag
+    // Re-measure the canvas at release: the pane may have scrolled
+    // mid-drag, and the crop maps viewport coordinates to pixels.
+    const crop = cropRegionToCanvas({
+      canvasRect: canvas.getBoundingClientRect(),
+      canvasWidth: canvas.width, canvasHeight: canvas.height, sel,
+    });
+    close();
+    if (crop.error === 'outside') {
+      setSaveStatus('Selection is outside the page — drag inside the page.');
+      return;
+    }
+    if (crop.error === 'too-small') {
+      setSaveStatus('Selection too small — drag a larger region.');
+      return;
+    }
+    let dataUrl;
+    try {
+      dataUrl = cropCanvasToDataUrl(canvas, crop);
+    } catch {
+      setSaveStatus('Could not capture this region.', 'error');
+      return;
+    }
+    setSaveStatus('Uploading image…');
+    await uploadImageAndShowMenu(ta, dataUrl, 'Could not upload screenshot');
+  };
+  overlay.addEventListener('pointerup', finish);
+  overlay.addEventListener('pointercancel', close);
 }
 
 /* The Screenshot chevron: "Choose image file…" — pick an existing PNG or
@@ -3981,9 +4074,9 @@ function renderNotebookBody() {
     }
     const btn = e.target.closest('button[data-md-action]');
     if (!btn) return;
-    // Screenshot is not a snippet insert: the main button captures the
-    // current page; the chevron (above) opens the file picker.
-    if (btn.dataset.mdAction === 'screenshot') { capturePageScreenshot(ta); return; }
+    // Screenshot is not a snippet insert: the main button opens region
+    // select on the current page; the chevron (above) opens the file picker.
+    if (btn.dataset.mdAction === 'screenshot') { enterRegionSelect(ta); return; }
     insertMdQuickAction(ta, btn.dataset.mdAction);
   });
   ta.value = state.activeNoteContent;

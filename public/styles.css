@@ -644,6 +644,24 @@ input[type="text"].note-tab-input {
 }
 /* Recent-impressions dropdown (Page anchor chevron): label + time rows. */
 .impression-menu { min-width: 280px; }
+/* Region-select screenshot: the overlay covers the reading pane while
+   selecting (removed on capture / cancel / Esc); the rect is the drag
+   rectangle, its box-shadow dims everything outside it. */
+.screenshot-select-overlay {
+  position: fixed; z-index: 70; background: rgba(20, 16, 12, .18);
+  cursor: crosshair; touch-action: none;
+}
+.screenshot-select-hint {
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+  background: rgba(20, 16, 12, .88); color: #f8efdd; font-size: 12.5px;
+  line-height: 1.4; padding: 6px 12px; border-radius: 999px;
+  white-space: nowrap; pointer-events: none;
+}
+.screenshot-select-rect {
+  position: fixed; z-index: 71; border: 1.5px dashed #fff;
+  box-shadow: 0 0 0 9999px rgba(20, 16, 12, .38);
+  background: rgba(255, 255, 255, .04); pointer-events: none;
+}
 .impression-row {
   display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
   width: 100%; padding: 7px 8px; border: none; border-radius: 6px;
