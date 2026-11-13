@@ -144,6 +144,37 @@ test('POST ai-code: 400s — empty/over-long prompt, bad notebook, bad page, unk
   }
 });
 
+test('POST ai-code: whole-notebook cells + targetCell are accepted (32k budget)', async () => {
+  await withLlmEnv({ LLM_STUB_RESPONSE: STUB_CODE }, async () => {
+    // A whole UDL-sized notebook: 21 formatted cells, ~9k chars, with the
+    // TARGET marker on the cell to change — well inside the 32k budget.
+    const cells = Array.from({ length: 21 }, (_, i) => (
+      i === 4
+        ? '--- cell 4 (code) · TARGET — replace this cell ---\ndef linear_function_1D(x,beta,omega):\n  y = x\n\n  return y'
+        : `--- cell ${i} (code) ---\n# cell ${i}\nx = ${i}`
+    ));
+    const { status, json } = await post('fixture-code', '/ai-code', {
+      chapter: 'Introduction',
+      prompt: 'implement the linear function',
+      notebook: 'notes/labs/Chap01/1_1_Test.ipynb',
+      cells,
+      targetCell: 4,
+    });
+    assert.equal(status, 200, JSON.stringify(json));
+    assert.equal(json.code, 'x = np.arange(3)');
+  });
+});
+
+test('POST ai-code: 400 for a bad targetCell', async () => {
+  for (const targetCell of [-1, 1.5, '4']) {
+    const { status, json } = await post('fixture-code', '/ai-code', {
+      prompt: 'hi', notebook: 'notes/labs/Chap01/1_1_Test.ipynb', targetCell,
+    });
+    assert.equal(status, 400, JSON.stringify(json));
+    assert.match(json.error, /targetCell must be a non-negative integer/);
+  }
+});
+
 test('POST ai-code: unknown project is a 404', async () => {
   const { status } = await post('missing-project', '/ai-code', {
     prompt: 'hi', notebook: 'notes/labs/Chap01/1_1_Test.ipynb',

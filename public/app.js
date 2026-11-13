@@ -47,6 +47,10 @@ import {
 import {
   imageMarkdownRef, appendImageEdit, embedAssetsInMarkdown,
 } from './pasteImage.js';
+import {
+  AI_CODE_CONTEXT_CHARS, targetCellLabel, targetCellFingerprint,
+  formatNotebookCellsForCodeAi,
+} from './aiCodeContext.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdfjs/pdf.worker.mjs';
 
@@ -4281,17 +4285,14 @@ function renderIpynbBody(body) {
     state.exportSelectionFor = notebookKey();
   }
   // One toolbar row above the cells: Run all (not for Java — cells cannot
-  // share one session) + the small Export button beside it. The export
-  // used to be a big standalone pill in its own row; same function, just
-  // small and beside the cells.
-  const runAllRow = `
+  // share one session), at the TOP RIGHT with breathing room. Export lives
+  // at the cell level now (a rail button beside each code cell), so the
+  // toolbar carries no Export button.
+  const runAllRow = lang === 'java' ? '' : `
     <div class="nb-runall-row">
-      ${lang === 'java' ? '' : `<button type="button" class="run-btn" id="nb-run-all"
+      <span class="save-status" id="nb-runall-status"></span>
+      <button type="button" class="run-btn" id="nb-run-all"
         title="Run all code cells top to bottom in one shared session">▶ Run all</button>
-      <span class="save-status" id="nb-runall-status"></span>`}
-      <button type="button" class="run-btn" id="nb-export-md" disabled
-        title="Generate markdown from the selected code cells (code fences, outputs, plots as files)">Export to Markdown</button>
-      <span class="save-status" id="nb-export-count">Select cells to export</span>
     </div>`;
   body.innerHTML = `${runAllRow}<div class="nb-cells" id="nb-cells"></div>`;
   const runAllBtn = $('#nb-run-all', body);
@@ -4303,21 +4304,23 @@ function renderIpynbBody(body) {
       btn.textContent = '▶ Run all';
     });
   }
-  $('#nb-export-md', body).addEventListener('click', exportSelectedCells);
   const wrap = $('#nb-cells', body);
 
   nb.cells.forEach((cell, idx) => {
     const cellEl = document.createElement('div');
     cellEl.className = 'nb-cell';
+    cellEl.dataset.nbIndex = String(idx);
     if (cell.cell_type === 'markdown') {
       cellEl.innerHTML = `
+      <div class="nb-cell-card">
         <div class="nb-cell-head"><span>Markdown</span><span class="spacer"></span>
           <button type="button" data-md-edit="${idx}">Edit</button></div>
         <div class="md-preview" data-md-view="${idx}"></div>
         <div data-md-editor="${idx}" hidden>
           <textarea class="md-editor" rows="6" spellcheck="false"></textarea>
           <div class="nb-cell-resize" data-cell-resize="${idx}" title="Drag to resize"><span aria-hidden="true">⋯</span></div>
-        </div>`;
+        </div>
+      </div>`;
       const viewEl = $(`[data-md-view="${idx}"]`, cellEl);
       renderMdPreview(viewEl, nbCellSource(cell));
       const editBtn = $(`[data-md-edit="${idx}"]`, cellEl);
@@ -4342,8 +4345,12 @@ function renderIpynbBody(body) {
         }
       });
     } else {
-      // Code cell: editable source, Run button, outputs area.
+      // Code cell: editable source, Run button, outputs area. The card
+      // holds the cell itself; the rail beside it carries the per-cell
+      // actions (✨ AI pins this cell as the Code AI target; Export starts
+      // the export flow for this cell).
       cellEl.innerHTML = `
+      <div class="nb-cell-card">
         <div class="nb-cell-head"><label class="nb-export-check" title="Select for Markdown export">
             <input type="checkbox" data-cell-select="${idx}" ${state.exportSelection.has(idx) ? 'checked' : ''}> Export</label>
           <span>Code · ${esc(lang)}</span><span class="spacer"></span>
@@ -4355,11 +4362,24 @@ function renderIpynbBody(body) {
           ${lang === 'java' ? '' : `<button type="button" class="run-btn" data-cell-run-above="${idx}" title="Run this cell and every code cell above it in one shared session">▶ Run all above</button>`}
           <span class="save-status" data-cell-status="${idx}"></span>
         </div>
-        <div class="nb-output" data-cell-output="${idx}"></div>`;
+        <div class="nb-output" data-cell-output="${idx}"></div>
+      </div>
+      <div class="nb-cell-rail">
+        <button type="button" class="rail-btn rail-btn-ai" data-cell-ai="${idx}" title="Ask Code AI about this cell">✨ AI</button>
+        <button type="button" class="rail-btn" data-cell-export="${idx}" title="Export this cell to Markdown">Export</button>
+      </div>`;
       $(`[data-cell-select="${idx}"]`, cellEl).addEventListener('change', (e) => {
         if (e.currentTarget.checked) state.exportSelection.add(idx);
         else state.exportSelection.delete(idx);
-        updateExportButton();
+      });
+      // Rail: ✨ AI pins this cell as the Code AI target; Export selects
+      // this cell and opens the export picker for it.
+      $(`[data-cell-ai="${idx}"]`, cellEl).addEventListener('click', () => pinAiCodeTarget(idx));
+      $(`[data-cell-export="${idx}"]`, cellEl).addEventListener('click', () => {
+        state.exportSelection.add(idx);
+        const cb = $(`[data-cell-select="${idx}"]`, cellEl);
+        if (cb) cb.checked = true;
+        exportSelectedCells();
       });
       const ta = $('.nb-code-source', cellEl);
       ta.value = nbCellSource(cell);
@@ -4443,7 +4463,6 @@ function renderIpynbBody(body) {
     saveNotebook().then(() => renderNotebookBody());
   });
   wrap.appendChild(bottomRow);
-  updateExportButton(); // restores the button state after a re-render
   // Fit every cell editor NOW that the cells are in the DOM: measuring
   // scrollHeight before appendChild returns 0, so the per-cell fit
   // above could never run at render time — only the input listener
@@ -4452,6 +4471,7 @@ function renderIpynbBody(body) {
   // minimum with an inner scrollbar. Cells in a hidden pane measure
   // 0 and are re-fit by applyReaderLayout when the pane reappears.
   fitCellEditors();
+  markAiTargetCell(); // re-apply the pinned-target outline after a re-render
 }
 
 function outputsFromExecuteResult(result) {
@@ -4974,21 +4994,77 @@ function notebookPath() {
 
 function aiCodeThread() {
   const key = notebookKey();
-  if (!state.aiCodeThreads[key]) state.aiCodeThreads[key] = { messages: [] };
-  return state.aiCodeThreads[key];
+  if (!state.aiCodeThreads[key]) state.aiCodeThreads[key] = { messages: [], target: null };
+  const thread = state.aiCodeThreads[key];
+  if (!('target' in thread)) thread.target = null;
+  return thread;
+}
+
+/* Pin a code cell as the Code AI context + Apply target: the ✨ AI button
+   beside the cell. The panel opens on the Code AI tab with the cell shown
+   as the target; Apply replaces this cell in place. Clearing the target
+   returns to the unpinned flow (Apply appends a new cell at the end). */
+function pinAiCodeTarget(idx) {
+  const cell = state.activeNotebook?.cells?.[idx];
+  if (!cell || cell.cell_type !== 'code') return;
+  aiCodeThread().target = {
+    index: idx,
+    label: targetCellLabel(cell),
+    fingerprint: targetCellFingerprint(cell),
+  };
+  state.aiTab = 'code';
+  if (!state.panels.ai) toggleAiPanel();
+  renderAiColumn();
+  markAiTargetCell();
+  const input = $('#ai-code-prompt', view);
+  if (input) input.focus();
+}
+
+function clearAiCodeTarget() {
+  aiCodeThread().target = null;
+  renderAiCodeThread();
+  markAiTargetCell();
+}
+
+/* Outline the pinned target cell in the notebook body (the card, not the
+   rail button — the outline is what the eye finds when scrolling). */
+function markAiTargetCell() {
+  const target = aiCodeThread().target;
+  $$('#nb-cells .nb-cell').forEach((el) => {
+    el.classList.toggle('nb-cell-ai-target',
+      !!target && Number(el.dataset.nbIndex) === target.index);
+  });
+  $$('#nb-cells .rail-btn-ai').forEach((btn) => {
+    btn.classList.toggle('active',
+      !!target && Number(btn.dataset.cellAi) === target.index);
+  });
 }
 
 function renderAiCodeThread() {
   const thread = $('#ai-code-thread', view);
   if (!thread) return;
-  const { messages } = aiCodeThread();
+  const { messages, target } = aiCodeThread();
+  thread.innerHTML = '';
+  // Pinned target chip — shown even before the first question, so the
+  // panel always says which cell Apply will replace. Label-only.
+  if (target) {
+    const chip = document.createElement('div');
+    chip.className = 'ai-target-chip';
+    const label = document.createElement('span');
+    label.textContent = `Target: ${target.label}`;
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.textContent = '✕';
+    clear.title = 'Clear target';
+    clear.addEventListener('click', () => clearAiCodeTarget());
+    chip.append(label, clear);
+    thread.appendChild(chip);
+  }
   // Empty thread stays empty: the input + chips are self-evident, and
   // asking with no Python notebook open reports it as a status message.
   if (!messages.length) {
-    thread.innerHTML = '';
     return;
   }
-  thread.innerHTML = '';
   messages.forEach((msg, i) => {
     const el = document.createElement('div');
     el.className = `ai-msg ai-msg-${msg.role}`;
@@ -5055,17 +5131,14 @@ async function askAiCode() {
     role: m.role,
     content: m.role === 'assistant' ? (m.code || '') : m.content,
   }));
-  // The current notebook's code cells, capped at 8k chars (the server caps
-  // too) so the model writes code that fits.
-  const cells = [];
-  let cellsChars = 0;
-  for (const c of (state.activeNotebook.cells || [])) {
-    if (c.cell_type !== 'code') continue;
-    const src = nbCellSource(c);
-    if (cellsChars + src.length > 8000) break;
-    cells.push(src);
-    cellsChars += src.length;
-  }
+  // The WHOLE notebook as context (code + markdown cells, in order),
+  // with the pinned cell marked TARGET — capped at 32k chars (the server
+  // caps too), so the model writes code that fits the notebook it is in.
+  const { parts: cells } = formatNotebookCellsForCodeAi(
+    state.activeNotebook.cells || [],
+    thread.target ? thread.target.index : null,
+    AI_CODE_CONTEXT_CHARS,
+  );
   const reading = currentReadingPage();
   thread.messages.push({ role: 'user', content: prompt });
   input.value = '';
@@ -5080,10 +5153,14 @@ async function askAiCode() {
       source: reading && reading.sourceId !== PAGE_ANCHOR_SOURCE_BOOK ? reading.sourceId : null,
       page: reading ? reading.page : null,
       cells,
+      targetCell: thread.target ? thread.target.index : null,
       history,
       model: state.aiModel || undefined,
     });
-    thread.messages.push({ role: 'assistant', content: '', code: res.code || '', explanation: res.explanation || '', applied: false });
+    thread.messages.push({
+      role: 'assistant', content: '', code: res.code || '', explanation: res.explanation || '',
+      applied: false, target: thread.target ? { ...thread.target } : null,
+    });
     statusEl.textContent = res.chapter?.title ? `Drafted from “${res.chapter.title}”.` : 'Drafted.';
   } catch (err) {
     statusEl.textContent = /LLM not configured/i.test(err.message || '')
@@ -5108,9 +5185,38 @@ async function applyAiCode(i) {
     }
     return;
   }
-  // No cell-selection UI exists in v1, so Apply appends a new code cell at
-  // the end of the notebook (never edits an existing cell). notes.md is
-  // untouched — this writes the notebook only.
+  // Pinned target: replace that cell in place — but only when the cell
+  // still holds what was pinned (same first line). Its old outputs belong
+  // to the old source, so they are cleared with it; the stale error a cell
+  // showed before the fix must not survive under the new code. Other cells
+  // are untouched. notes.md is untouched — this writes the notebook only.
+  const target = msg.target;
+  const targetCell = target && Number.isInteger(target.index)
+    ? state.activeNotebook.cells[target.index] : null;
+  const statusEl = $('#ai-code-status', view);
+  if (targetCell && targetCell.cell_type === 'code'
+    && targetCellFingerprint(targetCell) === target.fingerprint) {
+    setNbCellSource(targetCell, msg.code);
+    targetCell.outputs = [];
+    targetCell.execution_count = null;
+    await saveNotebook();
+    msg.applied = true;
+    // Keep the pin on the same cell so the user can iterate on it: its
+    // fingerprint/label now describe the new source.
+    thread.target = {
+      index: target.index,
+      label: targetCellLabel(targetCell),
+      fingerprint: targetCellFingerprint(targetCell),
+    };
+    renderAiCodeThread();
+    renderNotebookBody();
+    const el = $(`#nb-cells .nb-cell[data-nb-index="${target.index}"]`, view);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (statusEl) statusEl.textContent = 'Replaced the target cell in place.';
+    return;
+  }
+  // No pin, or the pinned cell moved/changed since the question: append a
+  // new code cell at the end of the notebook (never edits an existing cell).
   state.activeNotebook.cells.push({
     cell_type: 'code', execution_count: null, metadata: {}, outputs: [], source: msg.code,
   });
@@ -5122,8 +5228,11 @@ async function applyAiCode(i) {
   const cellEls = body ? $$('.nb-cell', body) : [];
   const last = cellEls[cellEls.length - 1];
   if (last) last.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  const statusEl = $('#ai-code-status', view);
-  if (statusEl) statusEl.textContent = 'Added as a new code cell at the end of the notebook.';
+  if (statusEl) {
+    statusEl.textContent = target
+      ? 'Target cell changed — added as a new code cell at the end of the notebook.'
+      : 'Added as a new code cell at the end of the notebook.';
+  }
 }
 
 function renderAiThread() {
@@ -5304,36 +5413,19 @@ function rewriteAssetSrcs(el) {
   });
 }
 
-function updateExportButton() {
-  const btn = $('#nb-export-md', view);
-  const count = $('#nb-export-count', view);
-  if (!btn) return;
-  const n = state.exportSelection.size;
-  btn.disabled = n === 0;
-  if (count) {
-    count.textContent = n === 0
-      ? 'Select cells to export'
-      : `${n} cell${n === 1 ? '' : 's'} selected`;
-  }
-}
-
 async function exportSelectedCells() {
   const indices = [...state.exportSelection].sort((a, b) => a - b);
   if (!indices.length || !state.activeNotebook) return;
   const name = state.activeTabKind === 'lab' && state.activeLab
     ? state.activeLab.name : state.activeNoteName;
-  const btn = $('#nb-export-md', view);
-  if (btn) { btn.disabled = true; btn.textContent = 'Exporting…'; }
   try {
     const res = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/export-cells`, 'POST', {
       notebook: state.activeNotebook, name, cells: indices,
     });
     openCellExportModal(res.markdown, name, res.images || []);
   } catch (err) {
-    const count = $('#nb-export-count', view);
-    if (count) count.textContent = `Export failed: ${err.message}`;
-  } finally {
-    if (btn) { btn.textContent = 'Export to Markdown'; updateExportButton(); }
+    const status = $('#nb-runall-status', view);
+    if (status) status.textContent = `Export failed: ${err.message}`;
   }
 }
 

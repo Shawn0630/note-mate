@@ -106,7 +106,28 @@ test('generateAiCode: stub returns code + explanation; no config -> 503', async 
   }
 });
 
-test('caps: prompt and cell constants are sane', () => {
+test('caps: prompt and cell constants are sane (whole-notebook budget)', () => {
   assert.equal(MAX_AI_CODE_PROMPT_CHARS, 2000);
-  assert.equal(MAX_AI_CODE_CELLS_CHARS, 8000);
+  assert.equal(MAX_AI_CODE_CELLS_CHARS, 32768);
+});
+
+test('buildAiCodePrompt: TARGET rule appears only with a pinned cell', () => {
+  const base = {
+    bookTitle: 'Understanding Deep Learning',
+    chapter: null,
+    sourceLabel: 'Understanding Deep Learning',
+    page: 15,
+    readingText: '',
+    notebookCells: '--- cell 4 (code) · TARGET — replace this cell ---\ndef linear_function_1D(x,beta,omega):',
+    prompt: 'implement the linear function',
+  };
+  const pinned = buildAiCodePrompt({ ...base, hasTargetCell: true });
+  assert.match(pinned, /TARGET — it is the cell the user wants changed/);
+  assert.match(pinned, /COMPLETE new source/);
+  assert.match(pinned, /all cells, in order; code and markdown/);
+  const unpinned = buildAiCodePrompt({
+    ...base,
+    notebookCells: '--- cell 4 (code) ---\ndef linear_function_1D(x,beta,omega):',
+  });
+  assert.doesNotMatch(unpinned, /TARGET/);
 });

@@ -1261,16 +1261,18 @@ app.post('/api/projects/:slug/ai-note', async (req, res, next) => {
 // ---------------------------------------------------------------------------
 // On-demand Code AI — the second tab of the AI panel. Same proposal-only
 // rule as ai-note, but the model returns Python code for the notebook the
-// user is working in; Apply inserts it as a new code cell (client-side,
-// through the notebook PUT path). Python notebooks only. The request
-// carries the active reading source + page (same context rules as ai-note)
-// plus the current notebook's code cell sources (`cells`, capped server-side
-// at MAX_AI_CODE_CELLS_CHARS) so the model writes code that fits.
+// user is working in; Apply replaces the pinned target cell in place, or
+// appends a new code cell when nothing is pinned (client-side, through
+// the notebook PUT path). Python notebooks only. The request carries the
+// active reading source + page (same context rules as ai-note) plus the
+// whole notebook's cell sources (`cells`, capped server-side at
+// MAX_AI_CODE_CELLS_CHARS) and the pinned cell index (`targetCell`) so
+// the model writes code that fits.
 // ---------------------------------------------------------------------------
 
 app.post('/api/projects/:slug/ai-code', async (req, res, next) => {
   try {
-    const { chapter, prompt, notebook, source, page, cells, history, model } = req.body ?? {};
+    const { chapter, prompt, notebook, source, page, cells, targetCell, history, model } = req.body ?? {};
     if (typeof prompt !== 'string' || !prompt.trim()) {
       return res.status(400).json({ error: 'prompt (string) is required' });
     }
@@ -1289,6 +1291,10 @@ app.post('/api/projects/:slug/ai-code', async (req, res, next) => {
     }
     if (page !== undefined && page !== null && (!Number.isInteger(page) || page < 1)) {
       return res.status(400).json({ error: 'page must be a positive integer' });
+    }
+    if (targetCell !== undefined && targetCell !== null
+      && (!Number.isInteger(targetCell) || targetCell < 0)) {
+      return res.status(400).json({ error: 'targetCell must be a non-negative integer' });
     }
     let cleanHistory;
     try {
@@ -1318,6 +1324,7 @@ app.post('/api/projects/:slug/ai-code', async (req, res, next) => {
         readingText: ctx.text,
         notebookCells,
         prompt: prompt.trim(),
+        hasTargetCell: Number.isInteger(targetCell),
         history: cleanHistory,
         model: typeof model === 'string' && model.trim() ? model.trim() : undefined,
       });
