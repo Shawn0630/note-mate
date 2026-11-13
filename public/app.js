@@ -38,6 +38,10 @@ import { MD_QUICK_ACTIONS, mdQuickSnippet } from './mdQuickActions.js';
 import {
   recordImpression, recentImpressions, relativeTimeLabel, impressionLabel,
 } from './recentImpressions.js';
+import {
+  emptyReadingPosition, parseReadingPosition, recordReadingPosition,
+  storedPageOrDefault,
+} from './readingPosition.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdfjs/pdf.worker.mjs';
 
@@ -269,6 +273,20 @@ const state = {
   // Recent impressions: pages/slides looked at in the last 5 minutes,
   // session-only. The Page anchor quick action offers them in a dropdown.
   recentImpressions: [],
+  // Reading position: where he was, per project AND per source — the book
+  // remembers its own page, each extra PDF its own page, each deck its own
+  // slide (see public/readingPosition.js). Durable in localStorage, so a
+  // refresh or reopen returns to the same page/slide. restoringPosition
+  // guards the save while a restore scroll is in flight (a fresh load
+  // starts at the top — saving that would clobber the stored position).
+  readingPosition: emptyReadingPosition(),
+  restoringPosition: false,
+  // Sources whose position this session has actually established — by a
+  // restore, a jump, or a real scroll of the container. A fresh load
+  // leaves every source but the active one at the top, and the save must
+  // not overwrite those sources' stored pages with the untouched top
+  // until the reader really moves in them. Session-only, never stored.
+  positionEstablished: new Set(),
   // Labs (v1.1): chapters from GET .../labs; labTabs are labs opened as
   // notebook tabs. activeTabKind 'note' | 'lab' decides the save endpoint.
   // The Labs index lives behind the tab-bar + menu (no visible section).
@@ -346,6 +364,9 @@ function resetReaderState() {
   state.activeSourceId = null;
   state.pdfSourceId = 'book';
   state.recentImpressions = [];
+  state.readingPosition = emptyReadingPosition();
+  state.restoringPosition = false;
+  state.positionEstablished = new Set();
   state.labs = [];
   state.labTabs = [];
   state.activeTabKind = 'note';
@@ -379,6 +400,13 @@ function route() {
 }
 
 window.addEventListener('hashchange', route);
+
+// A refresh mid-scroll (or mid-flight after a chapter click) should keep
+// the last position the reader was actually on — flush the current
+// position before the page goes away. Synchronous localStorage write.
+window.addEventListener('beforeunload', () => {
+  try { saveReadingPosition(); } catch { /* ignore */ }
+});
 
 /* Zoom shortcuts (bound once): Cmd/Ctrl + +/- zooms the reading pane's
    document, Cmd/Ctrl + 0 fits it to the pane width. Skipped while typing
@@ -837,6 +865,14 @@ async function openProject(slug) {
   }
   await loadAnnotations();
 
+  // Reading position: load the stored per-source positions before the
+  // reader renders, and guard the save while the first load is in flight
+  // — a fresh load starts at the top, and saving that would clobber the
+  // stored position before the restore runs. restoreReadingPosition
+  // clears the flag when it finishes.
+  loadReadingPosition();
+  state.restoringPosition = true;
+
   // Default note: the first editable note — notes.md is read-only and
   // never opens in the right pane (it lives in the left preview).
   const def = defaultEditorNote();
@@ -858,6 +894,7 @@ async function openProject(slug) {
   renderReaderShell();
   renderChapterPanel();
   await renderReadingPane();
+  await restoreReadingPosition();
 }
 
 function renderReaderShell() {
@@ -964,6 +1001,176 @@ function saveReaderLayout() {
     }));
   } catch {
     // Storage unavailable — the layout simply does not persist.
+  }
+}
+
+/* ---------------- reading position: persistence ---------------- */
+
+// One localStorage entry per project (see public/readingPosition.js):
+// {activeTab, activeSource, positions: {[sourceId]: page}}. Same spirit
+// as the layout key above — per-browser reading state, not shared data,
+// so it lives in localStorage, not project.json.
+function readingPositionKey() {
+  return `nm-reading-position:${state.project?.slug || 'default'}`;
+}
+
+function loadReadingPosition() {
+  try {
+    state.readingPosition = parseReadingPosition(
+      window.localStorage.getItem(readingPositionKey()),
+    );
+  } catch {
+    state.readingPosition = emptyReadingPosition();
+  }
+}
+
+/* A source's position is established in this session once it has been
+   restored, jumped to, or really scrolled — never by a fresh mount
+   sitting at the top. The save only records established sources (see
+   saveReadingPosition). */
+function markPositionEstablished(sourceId) {
+  if (sourceId) state.positionEstablished.add(String(sourceId));
+}
+
+function isPositionEstablished(sourceId) {
+  return state.positionEstablished.has(String(sourceId));
+}
+
+/* Save where he is: the current tab's source + page. Cheap and
+   idempotent — only writes when the store actually changed, so the
+   scroll handlers can call it on every scroll tick. The Preview tab has
+   no page of its own: it records the tab only, so opening the preview
+   never overwrites the book page he was on. Suppressed while a restore
+   scroll is in flight, and on non-PDF projects (nothing to restore). */
+function saveReadingPosition() {
+  if (!state.project || state.restoringPosition) return;
+  if (String(state.project.kind || '').toLowerCase() !== 'pdf') return;
+  let next = state.readingPosition;
+  if (state.leftTab === 'preview') {
+    next = recordReadingPosition(next, { tab: 'preview' });
+  } else {
+    const reading = currentReadingPage();
+    if (!reading) return;
+    // A Slides tab whose deck has not loaded yet reports slide 1 by
+    // default — recording that would clobber the deck's stored slide
+    // before the load restores it.
+    if (state.leftTab === 'slides' && (!state.deckDoc || state.deckMaterialId !== reading.sourceId)) return;
+    if (isPositionEstablished(reading.sourceId)) {
+      next = recordReadingPosition(next, { sourceId: reading.sourceId, page: reading.page, tab: state.leftTab });
+    } else {
+      // The source has not been read, restored or scrolled in this
+      // session (a fresh load leaves every source but the active one at
+      // the top): record that it is the active source, but do NOT
+      // overwrite its stored page with the untouched top-of-document
+      // position — it will be restored, not overwritten, when he moves
+      // in it.
+      next = recordReadingPosition(next, { sourceId: reading.sourceId, tab: state.leftTab });
+    }
+  }
+  const prevJson = JSON.stringify(state.readingPosition);
+  state.readingPosition = next;
+  if (JSON.stringify(next) === prevJson) return;
+  try {
+    window.localStorage.setItem(readingPositionKey(), JSON.stringify(next));
+  } catch {
+    // Storage unavailable — the position simply does not persist.
+  }
+}
+
+/* The page to restore for a source, from the store, clamped to the
+   document actually loaded (out of range -> page 1). */
+function storedPageFor(sourceId, numPages) {
+  return storedPageOrDefault(state.readingPosition, sourceId, numPages);
+}
+
+/* Restore the PDF tab's source to its stored page after a source load
+   (book or extra PDF): the switch path reloads the container at the top,
+   so without this a source switch would always land on page 1. No-op
+   when nothing is stored for the source. */
+function restorePdfSourcePosition(sourceId) {
+  if (!state.pdfDoc || state.pdfSourceId !== sourceId) return;
+  const page = storedPageFor(sourceId, state.pdfDoc.numPages);
+  if (page > 1) {
+    markPositionEstablished(sourceId);
+    scrollBookToPage(page, { behavior: 'auto' });
+  }
+}
+
+/* Same for a deck load: the container is rebuilt at the top on every deck
+   switch, so the deck returns to the slide it was left on. */
+function restoreDeckPosition(materialId) {
+  if (!state.deckDoc || state.deckMaterialId !== materialId) return;
+  const slide = storedPageFor(materialId, state.deckDoc.numPages);
+  if (slide > 1) {
+    markPositionEstablished(materialId);
+    scrollDeckToPage(slide, { behavior: 'auto' });
+  }
+}
+
+/* Restore the reader to where he was, on project open: the last-active
+   tab + source at its stored page/slide. Anything stale — a source that
+   no longer exists, a page past the end — falls back to the PDF tab at
+   page 1, and the project still opens. The flag guards the save while
+   the restore scroll is in flight (a fresh load starts at the top). */
+async function restoreReadingPosition() {
+  state.restoringPosition = true;
+  try {
+    if (String(state.project?.kind || '').toLowerCase() !== 'pdf') return;
+    const stored = state.readingPosition;
+    if (stored.activeTab === 'slides') {
+      const target = resolveAnchorTarget(stored.activeSource, state.materials);
+      if (target.target === 'material' && target.kind === 'slides') {
+        // Pre-seed the deck choice so the Slides tab opens on the stored
+        // deck instead of the chapter's deck (see setLeftTab/applyLeftTab),
+        // and pin it to the current chapter so a later chapter click still
+        // re-resolves the deck the usual way.
+        state.deckMaterialId = target.id;
+        state.deckChapter = state.activeChapter ?? null;
+        setLeftTab('slides');
+        await ensureDeckLoaded(target.id);
+        if (state.deckDoc && state.deckMaterialId === target.id) {
+          markPositionEstablished(target.id);
+          scrollDeckToPage(storedPageFor(target.id, state.deckDoc.numPages), { behavior: 'auto' });
+        }
+        return;
+      }
+      // Stale deck: the source he was on no longer exists — fall back to
+      // the PDF tab at page 1 (not the book's stored page, which belongs
+      // to a different source he was not on).
+      setLeftTab('pdf');
+      await ensurePdfSourceLoaded(PAGE_ANCHOR_SOURCE_BOOK);
+      if (state.pdfDoc) {
+        markPositionEstablished(PAGE_ANCHOR_SOURCE_BOOK);
+        scrollBookToPage(1, { behavior: 'auto' });
+      }
+      return;
+    }
+    if (stored.activeTab === 'preview') {
+      setLeftTab('preview');
+      return;
+    }
+    let sourceId = PAGE_ANCHOR_SOURCE_BOOK;
+    const target = resolveAnchorTarget(stored.activeSource, state.materials);
+    if (target.target === 'material' && target.kind === 'pdf') {
+      sourceId = target.id;
+    } else if (stored.activeSource !== PAGE_ANCHOR_SOURCE_BOOK) {
+      // Stale PDF source (an extra PDF that no longer exists): page 1,
+      // not the book's stored page.
+      setLeftTab('pdf');
+      await ensurePdfSourceLoaded(PAGE_ANCHOR_SOURCE_BOOK);
+      if (state.pdfDoc) {
+        markPositionEstablished(PAGE_ANCHOR_SOURCE_BOOK);
+        scrollBookToPage(1, { behavior: 'auto' });
+      }
+      return;
+    }
+    setLeftTab('pdf');
+    await ensurePdfSourceLoaded(sourceId);
+    if (!state.pdfDoc) return; // the document failed to load — leave as is
+    markPositionEstablished(sourceId);
+    scrollBookToPage(storedPageFor(sourceId, state.pdfDoc.numPages), { behavior: 'auto' });
+  } finally {
+    state.restoringPosition = false;
   }
 }
 
@@ -1408,6 +1615,9 @@ function setLeftTab(tab) {
   applyLeftTab();
   renderChapterPanel();
   updateAiContext();
+  // The tab switch itself is a position change even when no scroll event
+  // fires (e.g. returning to a tab whose container never moved).
+  saveReadingPosition();
 }
 
 function applyLeftTab() {
@@ -1997,8 +2207,9 @@ async function jumpToAnchor(sourceId, page) {
 }
 
 /* Scroll the book container to a page, with the same scroll-spy
-   suppression as a chapter click (see setActiveChapter). */
-function scrollBookToPage(page) {
+   suppression as a chapter click (see setActiveChapter). Restores pass
+   behavior 'auto' — the reader should land, not watch a flight. */
+function scrollBookToPage(page, { behavior = 'smooth' } = {}) {
   const container = state.pdfContainer;
   if (!container) return;
   measurePdfPages();
@@ -2008,16 +2219,16 @@ function scrollBookToPage(page) {
   state.suppressSpyUntil = Date.now() + 3000;
   state.suppressSpyPage = page;
   state.suppressSpyTop = top;
-  container.scrollTo({ top, behavior: 'smooth' });
+  container.scrollTo({ top, behavior });
 }
 
-function scrollDeckToPage(page) {
+function scrollDeckToPage(page, { behavior = 'smooth' } = {}) {
   const container = state.deckContainer;
   if (!container) return;
   measureDeckPages();
   const pg = state.deckPages.find((p) => p.num === page);
   if (!pg) return;
-  container.scrollTo({ top: Math.max(0, pg.top - 8), behavior: 'smooth' });
+  container.scrollTo({ top: Math.max(0, pg.top - 8), behavior });
 }
 
 /* ---------------- PDF ---------------- */
@@ -2025,6 +2236,11 @@ function scrollDeckToPage(page) {
 async function loadPdf(fileUrl, sourceUrl, sourceId = 'book') {
   const container = $('#pdf-scroll', view);
   if (!container) return;
+  // Load token: a source switch while a big document is still fetching
+  // starts a newer load; the older one must abandon its work instead of
+  // mounting over the newer document, writing an error into its
+  // container, or resetting its scroll.
+  const myToken = ++pdfLoadToken;
   state.pdfContainer = container;
   state.pdfSourceId = sourceId;
   // Source switches reload into the same viewer: drop the previous document
@@ -2041,6 +2257,7 @@ async function loadPdf(fileUrl, sourceUrl, sourceId = 'book') {
     const task = pdfjsLib.getDocument({ url });
     pdf = await task.promise;
   } catch (err) {
+    if (myToken !== pdfLoadToken) return; // superseded — the newer load owns the container now
     container.innerHTML = `<p class="reading-note">Could not load this PDF: ${esc(err.message)}</p>`;
     // No readable document: clear the outline so the chapter panel falls
     // back to the note headings as navigation (same as a slide deck).
@@ -2048,6 +2265,7 @@ async function loadPdf(fileUrl, sourceUrl, sourceId = 'book') {
     renderChapterPanel();
     return;
   }
+  if (myToken !== pdfLoadToken) { try { pdf.destroy(); } catch { /* ignore */ } return; }
   state.pdfDoc = pdf;
 
   // Outline (chapters) — resolve each destination to a page number.
@@ -2059,7 +2277,11 @@ async function loadPdf(fileUrl, sourceUrl, sourceId = 'book') {
   }
   renderChapterPanel();
 
-  await mountPdfViewer(container, pdf, { measure: measurePdfPages, onScroll: onPdfScroll, zoomKey: 'pdf', sourceId });
+  await mountPdfViewer(container, pdf, {
+    measure: measurePdfPages, onScroll: onPdfScroll, zoomKey: 'pdf', sourceId,
+    isCurrent: () => myToken === pdfLoadToken,
+  });
+  if (myToken !== pdfLoadToken) return; // superseded mid-mount — leave the newer load's scroll alone
 
   // A source switch reloads the container: the old document's scroll offset
   // must not carry over numerically into the new one (it would land on
@@ -2081,6 +2303,7 @@ async function loadPdf(fileUrl, sourceUrl, sourceId = 'book') {
    previous PDF is not kept — the book and the decks keep theirs because
    they live in separate containers. */
 let pdfLoadPromise = null; // {sourceId, promise} — one in-flight PDF load
+let pdfLoadToken = 0; // increments per loadPdf call; a stale load abandons its work (see loadPdf)
 
 async function ensurePdfSourceLoaded(sourceId) {
   const id = sourceId || PAGE_ANCHOR_SOURCE_BOOK;
@@ -2098,23 +2321,33 @@ async function ensurePdfSourceLoaded(sourceId) {
 }
 
 async function loadPdfSource(sourceId) {
-  if (sourceId === PAGE_ANCHOR_SOURCE_BOOK) {
-    await loadPdf(
-      `/api/projects/${encodeURIComponent(state.project.slug)}/file`,
-      state.project.url || state.project.sourceUrl || '',
-      PAGE_ANCHOR_SOURCE_BOOK,
-    );
-  } else {
-    const mat = state.materials.find((m) => String(m.id) === String(sourceId));
-    if (!mat || mat.hasFile === false) {
-      setSaveStatus(`Can’t open “${mat?.label || sourceId}” — its file is not in this project.`, 'error');
-      return;
+  // A source switch reloads the container at the top, and loadPdf's
+  // trailing onPdfScroll would save page 1 and clobber the stored
+  // position — so the load + restore run under the restore guard, and
+  // the source returns to the page it was left on.
+  state.restoringPosition = true;
+  try {
+    if (sourceId === PAGE_ANCHOR_SOURCE_BOOK) {
+      await loadPdf(
+        `/api/projects/${encodeURIComponent(state.project.slug)}/file`,
+        state.project.url || state.project.sourceUrl || '',
+        PAGE_ANCHOR_SOURCE_BOOK,
+      );
+    } else {
+      const mat = state.materials.find((m) => String(m.id) === String(sourceId));
+      if (!mat || mat.hasFile === false) {
+        setSaveStatus(`Can’t open “${mat?.label || sourceId}” — its file is not in this project.`, 'error');
+        return;
+      }
+      await loadPdf(
+        `/api/projects/${encodeURIComponent(state.project.slug)}/materials/${encodeURIComponent(sourceId)}/file`,
+        '',
+        sourceId,
+      );
     }
-    await loadPdf(
-      `/api/projects/${encodeURIComponent(state.project.slug)}/materials/${encodeURIComponent(sourceId)}/file`,
-      '',
-      sourceId,
-    );
+    restorePdfSourcePosition(sourceId);
+  } finally {
+    state.restoringPosition = false;
   }
   // The chapter panel's source note and the AI context line follow the
   // newly loaded PDF (same as loadDeckPdf for decks).
@@ -2136,8 +2369,11 @@ async function loadPdfSource(sourceId) {
    width in points, times the zoom multiplier (1 = fit width). A pane
    resize or a zoom change re-mounts at the new scale (see refitPdfViewer)
    — pages re-render, never CSS-stretched. */
-async function mountPdfViewer(container, pdf, { measure, onScroll, zoomKey = 'pdf', sourceId = 'book' }) {
+async function mountPdfViewer(container, pdf, { measure, onScroll, zoomKey = 'pdf', sourceId = 'book', isCurrent = () => true }) {
   const page = await pdf.getPage(1);
+  // A newer load started while this one was fetching: do not clear the
+  // container — the newer load owns it now (see the load tokens).
+  if (!isCurrent()) return;
   const pageWpt = page.getViewport({ scale: 1 }).width;
   const scale = fitScale(Math.max(200, container.clientWidth - 32), pageWpt)
     * (state.zoom[zoomKey] ?? 1);
@@ -2208,7 +2444,7 @@ async function mountPdfViewer(container, pdf, { measure, onScroll, zoomKey = 'pd
     container.addEventListener('scroll', () => {
       if (ticking) return;
       ticking = true;
-      requestAnimationFrame(() => { ticking = false; onScroll(); });
+      requestAnimationFrame(() => { ticking = false; onScroll({ fromEvent: true }); });
     }, { passive: true });
     container.addEventListener('wheel', (e) => {
       if (!(e.ctrlKey || e.metaKey)) return;
@@ -2234,6 +2470,7 @@ async function mountPdfViewer(container, pdf, { measure, onScroll, zoomKey = 'pd
    position; it never touches the chapter panel (the panel stays the book's
    outline) or the scroll-spy. */
 let deckLoadPromise = null; // {materialId, promise} — one in-flight deck load
+let deckLoadToken = 0; // increments per loadDeckPdf call; a stale load abandons its work (see loadDeckPdf)
 let leftPreviewTimer = null; // debounce for the left Preview tab's live sync
 
 async function ensureDeckLoaded(materialId) {
@@ -2259,6 +2496,9 @@ async function loadDeckPdf(materialId) {
   // `hasFile` — the file URL is built from the material id below, so the
   // guard must read hasFile, never mat.file (always undefined here).
   if (!mat || mat.hasFile === false) return;
+  // Load token (same as loadPdf): a deck switch while a deck is still
+  // fetching starts a newer load; the older one abandons its work.
+  const myToken = ++deckLoadToken;
   // Replace the container so a re-mount never stacks scroll listeners on
   // the same element (mountPdfViewer binds them once per element). The
   // clone carries the data-scroll-bound flag as an attribute — drop it so
@@ -2287,11 +2527,20 @@ async function loadDeckPdf(materialId) {
     const url = `/api/projects/${encodeURIComponent(state.project.slug)}/materials/${encodeURIComponent(materialId)}/file`;
     pdf = await pdfjsLib.getDocument({ url }).promise;
   } catch (err) {
+    if (myToken !== deckLoadToken) return; // superseded — the newer load owns the container now
     fresh.innerHTML = `<p class="reading-note">Could not load this deck: ${esc(err.message)}</p>`;
     return;
   }
+  if (myToken !== deckLoadToken) { try { pdf.destroy(); } catch { /* ignore */ } return; }
   state.deckDoc = pdf;
-  await mountPdfViewer(fresh, pdf, { measure: measureDeckPages, onScroll: onDeckScroll, zoomKey: 'deck', sourceId: materialId });
+  await mountPdfViewer(fresh, pdf, {
+    measure: measureDeckPages, onScroll: onDeckScroll, zoomKey: 'deck', sourceId: materialId,
+    isCurrent: () => myToken === deckLoadToken,
+  });
+  if (myToken !== deckLoadToken) return; // superseded mid-mount — leave the newer load's scroll alone
+  // The container is rebuilt at the top on every deck switch: return to
+  // the slide this deck was left on (nothing stored -> stay on slide 1).
+  restoreDeckPosition(materialId);
   // The Slides tab may have opened before the load finished; the chapter
   // panel's source note and the AI context line follow the loaded deck.
   if (state.leftTab === 'slides') {
@@ -2337,9 +2586,11 @@ function updateDeckPageIndicator() {
 
 /* Deck scroll: the slide indicator + the AI context line follow the slide
    (no chapter follow — the deck has no chapter mapping of its own). */
-function onDeckScroll() {
+function onDeckScroll({ fromEvent = false } = {}) {
+  if (fromEvent) markPositionEstablished(state.deckMaterialId);
   updateDeckPageIndicator();
   updateAiContext();
+  saveReadingPosition();
 }
 
 async function flattenOutline(pdf, items, depth = 0, out = []) {
@@ -2416,10 +2667,15 @@ function chapterForPage(pageNum) {
   return best || pool[0] || null;
 }
 
-function onPdfScroll() {
+function onPdfScroll({ fromEvent = false } = {}) {
   // Record the page even when the outline is empty (an outline-less PDF
   // still has pages worth anchoring to) — the spy below needs the outline.
   noteReadingImpression();
+  // Only a real scroll event establishes the position: the direct call
+  // at the end of loadPdf runs on a fresh mount sitting at the top, and
+  // saving that would clobber the stored page before it is restored.
+  if (fromEvent) markPositionEstablished(state.pdfSourceId);
+  saveReadingPosition();
   if (!state.pdfDoc || !state.outline.length) return;
   if (Date.now() < state.suppressSpyUntil) {
     // A programmatic chapter-click scroll is still in flight: ignore the spy
@@ -2639,6 +2895,25 @@ function mdNotes() {
   const notes = (state.notes || []).filter((n) => n.kind === 'md');
   notes.sort((a, b) => (a.name === 'notes.md' ? -1 : b.name === 'notes.md' ? 1 : a.name.localeCompare(b.name)));
   return notes;
+}
+
+/* The markdown notes Note AI Apply may write to: every .md note EXCEPT
+   the master notes.md — notes.md is the read-only directory (preview
+   only, never an editor tab), not a place AI writes into. */
+function editableMdNotes() {
+  return mdNotes().filter((n) => n.name !== 'notes.md');
+}
+
+/* Default Apply destination: the editable note open in the right pane,
+   else the first editable note. Null when the project has no editable
+   note — Apply is disabled then, never filed into notes.md. */
+function defaultAiApplyDest() {
+  const dests = editableMdNotes();
+  if (state.activeTabKind === 'note' && state.activeNoteKind === 'md' && state.activeNoteName) {
+    const open = dests.find((n) => n.name === state.activeNoteName);
+    if (open) return open;
+  }
+  return dests[0] || null;
 }
 
 function previewNoteName() {
@@ -4593,14 +4868,18 @@ function renderAiThread() {
       body.innerHTML = window.marked ? window.marked.parse(msg.markdown || '') : esc(msg.markdown || '');
       const actions = document.createElement('div');
       actions.className = 'ai-msg-actions';
-      // Destination picker: which markdown note Apply writes to. Default
-      // is the master notes.md (today's behaviour); shown only when the
-      // project has more than one markdown note, so a single-note project
-      // has no extra friction. The choice lives on the message, so each
-      // proposal can go to a different note.
-      const dests = mdNotes();
+      // Destination picker: which EDITABLE markdown note Apply writes
+      // to — notes.md is never offered (it is the read-only master
+      // directory, preview only). Default is the note open in the right
+      // pane, else the first editable note; shown only when there is
+      // more than one editable note, so a single-note project has no
+      // extra friction. The choice lives on the message, so each
+      // proposal can go to a different note. With no editable note,
+      // Apply is disabled with a hint instead of filing into notes.md.
+      const dests = editableMdNotes();
+      const defaultDest = defaultAiApplyDest();
       const dest = (msg.destNote && dests.some((n) => n.name === msg.destNote))
-        ? msg.destNote : 'notes.md';
+        ? msg.destNote : (defaultDest ? defaultDest.name : null);
       if (dests.length > 1) {
         const destSel = document.createElement('select');
         destSel.className = 'ai-apply-dest';
@@ -4616,7 +4895,8 @@ function renderAiThread() {
       applyBtn.type = 'button';
       applyBtn.className = 'primary';
       applyBtn.textContent = msg.applied ? 'Applied ✓' : 'Apply';
-      applyBtn.disabled = !!msg.applied;
+      applyBtn.disabled = !!msg.applied || !dest;
+      if (!dest) applyBtn.title = 'No editable note — create one first';
       applyBtn.addEventListener('click', () => applyAiNote(i));
       const copyBtn = document.createElement('button');
       copyBtn.type = 'button';
@@ -4629,6 +4909,12 @@ function renderAiThread() {
         } catch { copyBtn.textContent = 'Copy failed'; }
       });
       actions.append(applyBtn, copyBtn);
+      if (!dest) {
+        const hint = document.createElement('span');
+        hint.className = 'ai-apply-hint';
+        hint.textContent = 'No editable note — create one first.';
+        actions.append(hint);
+      }
       el.append(body, actions);
     }
     thread.appendChild(el);
@@ -4689,11 +4975,21 @@ async function applyAiNote(i) {
   const ch = activeOutlineChapter();
   const heading = ch ? ch.title : 'AI notes';
   const statusEl = $('#ai-status', view);
-  // Destination: this proposal's picker choice, falling back to the master
-  // when the note is gone (or was never picked).
-  const dests = mdNotes();
+  // Destination: this proposal's picker choice, falling back to the open
+  // editable note (else the first editable note). notes.md is never a
+  // destination — with no editable note, Apply refuses instead of
+  // filing into the master.
+  const dests = editableMdNotes();
+  const defaultDest = defaultAiApplyDest();
   const dest = (msg.destNote && dests.some((n) => n.name === msg.destNote))
-    ? msg.destNote : 'notes.md';
+    ? msg.destNote : (defaultDest ? defaultDest.name : null);
+  if (!dest) {
+    if (statusEl) {
+      statusEl.textContent = 'No editable note — create one first.';
+      statusEl.classList.add('error');
+    }
+    return;
+  }
   try {
     const { inserted } = await insertIntoNote(dest, heading, msg.markdown, chapterPageAnchor(ch));
     msg.applied = true;
