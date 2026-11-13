@@ -15,6 +15,13 @@ FROM node:22-bookworm-slim
 # Bookworm's python3 is externally managed (PEP 668), so a system-wide pip
 # install needs --break-system-packages (the executor runs plain `python3`,
 # so no venv). scipy comes from PyPI, not the torch index.
+# The torch install needs PyPI as an extra index: torch 2.15 needs
+# typing-extensions>=4.13, whose wheel the torch index serves with
+# inconsistent metadata, so pip falls back to building it from source —
+# and that build needs flit_core, which the torch index does not carry
+# (build failed 2026-11-13: "No matching distribution found for
+# flit_core"). Versions are pinned to the +cpu builds so the extra index
+# can never swap in PyPI's CUDA-flavoured torch/torchvision.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 \
       python3-pip \
@@ -23,7 +30,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libreoffice-impress \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m pip install --no-cache-dir --break-system-packages \
-         torch torchvision --index-url https://download.pytorch.org/whl/cpu \
+         'torch==2.15.0+cpu' 'torchvision==0.29.2+cpu' \
+         --index-url https://download.pytorch.org/whl/cpu \
+         --extra-index-url https://pypi.org/simple \
     && python3 -m pip install --no-cache-dir --break-system-packages scipy
 
 WORKDIR /app
