@@ -29,8 +29,10 @@ docker compose up --build -d
 ```
 
 The image (`Dockerfile`) is `node:22-bookworm-slim` plus the runtimes the
-`/api/execute` endpoint needs: `python3` + `python3-matplotlib` (plots) and
-`openjdk-21-jdk-headless` (`javac`/`java`). LibreOffice (`libreoffice-impress`)
+`/api/execute` endpoint needs: `python3` + `python3-matplotlib` (plots),
+PyTorch (CPU) + `torchvision` + `scipy` via pip (the UDL labs import them;
+costs roughly +800MB–1GB on the image), and `openjdk-17-jdk-headless`
+(`javac`/`java`). LibreOffice (`libreoffice-impress`)
 is also installed so PPTX slide decks can be converted to PDF inside the
 container; it costs roughly +500MB on the image, traded for renderable slides.
 
