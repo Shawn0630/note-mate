@@ -43,6 +43,10 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdfjs/pdf.worker.mjs';
 
 const view = document.getElementById('view');
 const RUNNABLE_LANGS = ['python', 'java', 'javascript'];
+// Display name per runnable language — shown in the + menu and the
+// create dialog. The file format (.ipynb, language-agnostic Jupyter)
+// is never shown as a language tag.
+const LANG_DISPLAY = { python: 'IPython', java: 'Java', javascript: 'JavaScript' };
 
 /* ---------------- helpers ---------------- */
 
@@ -978,8 +982,12 @@ function applyReaderLayout({ save = true } = {}) {
   };
   show('#chapter-panel', state.panels.nav);
   show('#reading-pane', state.panels.reading);
+  const notebookWasHidden = $('#notebook-pane', view)?.style.display === 'none';
   show('#notebook-pane', state.panels.notebook);
   show('#ai-column', state.panels.ai);
+  // Cell editors measure 0 while hidden; re-fit them the moment the
+  // working pane comes back into view (preset / panel toggle).
+  if (state.panels.notebook && notebookWasHidden) fitCellEditors();
   const dividerVisible = {
     'divider-nav': state.panels.nav && state.panels.reading,
     'divider-reading': state.panels.reading && state.panels.notebook,
@@ -2800,14 +2808,46 @@ function resetExecCounter() {
   });
 }
 
-/* Note rename/delete (AV TabContainer style). Rename is commit-based:
-   the active markdown tab is an input; Enter/blur commits, Escape
-   cancels. Delete is two-click: the first click arms the tab's × for
-   2s, the second confirms. notes.md — the master filing home — has no
-   tab at all, and the server refuses to rename or delete it. */
+/* Note rename/delete (AV TabContainer style). Tabs always display as
+   plain labels; rename is entered explicitly with a double-click on
+   the tab name. In rename mode the input looks exactly like the tab
+   label — transparent, borderless, same font — and its width follows
+   the name (AV AutosizeInput equivalent), so a long name is never cut
+   off. Enter/blur commits, Escape cancels. Delete is two-click: the
+   first click arms the tab's × for 2s, the second confirms. notes.md —
+   the master filing home — has no tab at all, and the server refuses
+   to rename or delete it. */
 let armedNoteDelete = null;
 let armedNoteDeleteTimer = 0;
 let noteRenameSuppressed = false;
+let renamingNoteName = null;
+let paneRendering = false;
+// True while renderNotebookPane is rebuilding the tab bar: a rename
+// input focused at that moment is destroyed by the rebuild, and its
+// blur fires synchronously inside the innerHTML assignment — that
+// blur is a render artifact, not a user commit (see commitNoteRename).
+
+function sizeNoteTabInput(input) {
+  // Size the rename input to its text with a hidden mirror span in the
+  // same font (AV's AutosizeInput does the same) — no fixed width, so
+  // the name is never squeezed or cut off.
+  let mirror = document.getElementById('note-tab-input-mirror');
+  if (!mirror) {
+    mirror = document.createElement('span');
+    mirror.id = 'note-tab-input-mirror';
+    mirror.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;top:-9999px;left:-9999px;';
+    document.body.appendChild(mirror);
+  }
+  const cs = getComputedStyle(input);
+  mirror.style.font = cs.font;
+  mirror.textContent = input.value || 'x';
+  input.style.width = `${mirror.offsetWidth + 2}px`;
+}
+
+function enterNoteRename(name) {
+  renamingNoteName = name;
+  renderNotebookPane(); // focus + selection happen at the end of the render
+}
 
 function suppressNoteRenameCommit() {
   // Clicking the tab's own × blurs the rename input; the delete intent
@@ -2818,12 +2858,20 @@ function suppressNoteRenameCommit() {
 }
 
 function cancelNoteRename(input) {
+  renamingNoteName = null;
   input.dataset.done = '1';
   input.blur();
   renderNotebookPane();
 }
 
 async function commitNoteRename(oldName, input) {
+  // Blur fired while the tab bar is being re-rendered (the input is
+  // destroyed by the rebuild, e.g. the pending tab switch behind a
+  // double-click on an inactive tab): not a user commit — leave rename
+  // mode alone so the re-render restores the input. A disconnected
+  // input is the same case (blur from removal, not from the user).
+  if (paneRendering || !input.isConnected) return;
+  renamingNoteName = null;
   if (input.dataset.done) return;
   input.dataset.done = '1';
   if (noteRenameSuppressed) return; // the delete click owns the next render
@@ -2905,14 +2953,19 @@ async function deleteNote(name) {
 function renderNotebookPane() {
   const pane = $('#notebook-pane', view);
   if (!pane) return;
+  // A rename in progress for a note that no longer exists (deleted
+  // elsewhere) leaves rename mode instead of rendering a stale input.
+  if (renamingNoteName && !state.notes.some((n) => n.name === renamingNoteName)) renamingNoteName = null;
   // No toolbar row: the tab bar is on top, the editor/notebook directly
   // below. Preview lives in the left pane (picker + Export next to it),
   // Ask AI in the top bar, + Note here / new note / new notebook / labs
   // in the + menu, and everything autosaves (see renderNotebookBody and
   // saveNotebook) — so nothing needs a Save button.
+  paneRendering = true;
   pane.innerHTML = `
     <div class="notebook-tabs" id="notebook-tabs"></div>
     <div class="notebook-body" id="notebook-body"></div>`;
+  paneRendering = false;
 
   const tabs = $('#notebook-tabs', pane);
   state.notes.forEach((n) => {
@@ -2923,15 +2976,17 @@ function renderNotebookPane() {
     const tab = document.createElement('button');
     tab.type = 'button';
     tab.className = `note-tab${isActive ? ' active' : ''}`;
-    if (isActive && n.kind === 'md') {
-      // AV-style inline rename: the active markdown tab is an input;
-      // Enter/blur commits, Escape cancels.
+    if (n.kind === 'md' && renamingNoteName === n.name) {
+      // Rename mode (entered by double-click): a borderless input
+      // styled exactly like the tab label; Enter/blur commits, Escape
+      // cancels. It grows with the name as you type.
       const input = document.createElement('input');
       input.type = 'text';
       input.className = 'note-tab-input';
       input.value = n.name;
       input.title = 'Rename this note (Enter to confirm, Esc to cancel)';
       input.addEventListener('click', (e) => e.stopPropagation());
+      input.addEventListener('input', () => sizeNoteTabInput(input));
       input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
         if (e.key === 'Escape') { e.preventDefault(); cancelNoteRename(input); }
@@ -2940,6 +2995,7 @@ function renderNotebookPane() {
       tab.appendChild(input);
     } else {
       tab.textContent = n.name;
+      if (n.kind === 'md') tab.title = 'Double-click to rename';
     }
     if (n.kind === 'md' && n.name !== 'notes.md') {
       // AV-style two-click delete: first click arms, second confirms.
@@ -2958,6 +3014,23 @@ function renderNotebookPane() {
       renderChapterPanel();
     });
     tabs.appendChild(tab);
+  });
+  // Double-click a markdown tab name to rename (single-click still
+  // switches). Delegated to the tab bar, not the tab: switching tabs
+  // re-renders the bar between the two clicks of a double-click, so a
+  // per-tab listener can miss the second click entirely — and when the
+  // two clicks land on different elements the dblclick event itself
+  // targets their common ancestor, so the tab is resolved from the
+  // mouse position instead of the event target.
+  tabs.addEventListener('dblclick', (e) => {
+    if (e.target.closest('.tab-close')) return; // that's the delete ×
+    const under = document.elementFromPoint(e.clientX, e.clientY);
+    const tabEl = under?.closest('.note-tab');
+    if (!tabEl || tabEl.classList.contains('lab-tab')) return;
+    const name = (tabEl.querySelector('input')?.value || tabEl.textContent || '')
+      .replace(/Sure\?|✕/g, '').trim();
+    const note = state.notes.find((n) => n.name === name);
+    if (note?.kind === 'md') enterNoteRename(note.name);
   });
   // Labs opened as tabs (v1.1): only the opened lab becomes a tab.
   state.labTabs.forEach((lab) => {
@@ -2997,6 +3070,14 @@ function renderNotebookPane() {
   status.className = 'save-status';
   status.id = 'save-status';
   tabs.appendChild(status);
+
+  // A rename in progress survives a re-render (e.g. the pending tab
+  // switch behind a double-click on an inactive tab recreates the
+  // input) — put the focus back in it, text selected.
+  if (renamingNoteName) {
+    const input = $('.note-tab-input', tabs);
+    if (input) { sizeNoteTabInput(input); input.focus(); input.select(); }
+  }
 
   renderNotebookBody();
 }
@@ -3069,9 +3150,9 @@ function openAddMenu(anchorBtn) {
     onClick: addNoteAtCurrentPage,
   });
   addItem({ label: 'Markdown note', ext: '.md', onClick: createMdNote });
-  addItem({ label: 'IPython notebook', ext: '.ipynb', onClick: () => createIpynbNote('python') });
-  addItem({ label: 'Java notebook', ext: '.ipynb', onClick: () => createIpynbNote('java') });
-  addItem({ label: 'JavaScript notebook', ext: '.ipynb', onClick: () => createIpynbNote('javascript') });
+  addItem({ label: 'IPython notebook', ext: 'Python', onClick: () => createIpynbNote('python') });
+  addItem({ label: 'Java notebook', ext: 'Java', onClick: () => createIpynbNote('java') });
+  addItem({ label: 'JavaScript notebook', ext: 'JavaScript', onClick: () => createIpynbNote('javascript') });
   if (state.labs.length) {
     addSection('Labs');
     state.labs.forEach((group) => {
@@ -3517,7 +3598,10 @@ async function createMdNote() {
    existing notebook instead of overwriting it. */
 async function createIpynbNote(lang = 'python') {
   lang = RUNNABLE_LANGS.includes(lang) ? lang : 'python';
-  const name = window.prompt('New notebook name (ends with .ipynb):',
+  // Language-aware prompt; .ipynb is appended automatically below if
+  // the typed name lacks it, so the dialog never presents it as a
+  // requirement. The prefill is still the full default filename.
+  const name = window.prompt(`New ${LANG_DISPLAY[lang]} notebook name:`,
     firstFreeName(state.notes.map((n) => n.name), `${lang}-scratch`, '.ipynb'));
   if (!name) return;
   const clean = name.trim().endsWith('.ipynb') ? name.trim() : `${name.trim()}.ipynb`;
@@ -3527,8 +3611,10 @@ async function createIpynbNote(lang = 'python') {
     renderChapterPanel();
     return;
   }
+  // New notebooks start Jupyter-style: one empty code cell, no
+  // auto-created markdown title cell (user 2026-11-12).
   const nb = {
-    cells: [{ cell_type: 'markdown', metadata: {}, source: [`# ${clean.replace(/\.ipynb$/, '')}\n`] }],
+    cells: [{ cell_type: 'code', execution_count: null, metadata: {}, outputs: [], source: [] }],
     metadata: { kernelspec: { display_name: lang, language: lang, name: lang }, language_info: { name: lang } },
     nbformat: 4,
     nbformat_minor: 5,
@@ -3555,6 +3641,31 @@ function setNbCellSource(cell, text) {
   // Keep nbformat shape: store source as a single string (accepted by the
   // backend's documented shape, string or string[]).
   cell.source = text;
+}
+
+/* Notebook cell editors auto-grow to fit their content: height follows
+   the code (minimum ~3 lines from CSS min-height), so a normal cell
+   never shows a cramped inner scroll. NB_CELL_MAX_HEIGHT is the cap
+   for very long cells — past it the editor scrolls internally instead
+   of taking over the page. A manual drag still works (resize:
+   vertical in CSS); the next keystroke re-fits the height to the
+   content, so a drag is a temporary "make it bigger" rather than a
+   permanent size. No-op while the editor is hidden (scrollHeight is
+   0 then); fitCellEditors re-fits when the pane becomes visible. */
+const NB_CELL_MAX_HEIGHT = 480;
+function autoGrowCellEditor(ta) {
+  if (!ta || !ta.isConnected || ta.offsetParent === null) return;
+  ta.style.height = 'auto';
+  const capped = Math.min(ta.scrollHeight, NB_CELL_MAX_HEIGHT);
+  ta.style.height = `${capped}px`;
+  ta.style.overflowY = ta.scrollHeight > NB_CELL_MAX_HEIGHT ? 'auto' : 'hidden';
+}
+
+/* Re-fit every cell editor currently on screen (code cells + any
+   markdown cell editor open in Edit mode). */
+function fitCellEditors() {
+  $$('#nb-cells textarea.nb-code-source, #nb-cells [data-md-editor]:not([hidden]) textarea')
+    .forEach(autoGrowCellEditor);
 }
 
 /* Code cells from the top through notebook index idx, in order. */
@@ -3657,6 +3768,7 @@ function renderIpynbBody(body) {
       const editorWrap = $(`[data-md-editor="${idx}"]`, cellEl);
       const ta = $('textarea', editorWrap);
       ta.value = nbCellSource(cell);
+      ta.addEventListener('input', () => autoGrowCellEditor(ta));
       editBtn.addEventListener('click', () => {
         const editing = editorWrap.hidden;
         editorWrap.hidden = !editing;
@@ -3667,6 +3779,7 @@ function renderIpynbBody(body) {
           renderMdPreview(viewEl, ta.value);
           saveNotebook();
         } else {
+          autoGrowCellEditor(ta);
           ta.focus();
         }
       });
@@ -3691,7 +3804,8 @@ function renderIpynbBody(body) {
       });
       const ta = $('.nb-code-source', cellEl);
       ta.value = nbCellSource(cell);
-      ta.addEventListener('input', () => { setNbCellSource(cell, ta.value); });
+      autoGrowCellEditor(ta);
+      ta.addEventListener('input', () => { setNbCellSource(cell, ta.value); autoGrowCellEditor(ta); });
       ta.addEventListener('blur', () => saveNotebook());
       ta.addEventListener('focus', () => { state.editorFocused = true; });
       ta.addEventListener('blur', () => { state.editorFocused = false; });

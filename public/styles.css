@@ -568,20 +568,22 @@ body.reader-open .reader {
   align-items: center;
   gap: 6px;
 }
-/* Inline rename (AV-style): the active markdown tab is an input. */
-.note-tab-input {
+/* Rename (double-click a tab): the input looks exactly like the tab
+   label — transparent, borderless, same font — and its width follows
+   the name (sized in JS), so a long name is never cut off.
+   Specificity beats the global input[type="text"] rule above, which
+   would otherwise give it a form-field border, background and
+   padding. */
+input[type="text"].note-tab-input {
   font: inherit;
-  font-weight: 700;
-  color: var(--ink);
-  background: var(--paper);
-  border: 1px solid var(--accent);
-  border-radius: 4px;
-  padding: 0 4px;
-  width: 12ch;
-  min-width: 8ch;
-  max-width: 180px;
-  flex: none;
+  color: inherit;
+  background: transparent;
+  border: none;
+  border-radius: 0;
   outline: none;
+  padding: 0;
+  margin: 0;
+  flex: none;
 }
 /* Delete × on note tabs (AV-style two-click confirm). */
 .note-tab .tab-close {
@@ -757,7 +759,17 @@ body.reader-open .reader {
   line-height: 1.6;
   background: #2b2620;
   color: #f3ead7;
-  min-height: 60px;
+  /* ~3 lines minimum; autoGrowCellEditor sets the height above this
+     to fit the content, capped at 480px (then inner scroll). */
+  min-height: 88px;
+}
+/* The markdown cell editor is a textarea.md-editor inside the notebook
+   body, so the main-note rule above (height: 100%; resize: none) would
+   otherwise apply to it. Cell editors size to their content instead. */
+.nb-cell textarea.md-editor {
+  height: auto;
+  min-height: 104px;
+  resize: vertical;
 }
 .nb-code-source:focus { outline: none; }
 .nb-cell-foot { display: flex; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--line); }
