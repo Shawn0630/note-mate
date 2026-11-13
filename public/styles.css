@@ -636,9 +636,9 @@ input[type="text"].note-tab-input {
 }
 .md-quick-actions button:hover { background: var(--paper-dim); }
 .md-quick-actions button:active { background: var(--accent-soft); }
-/* The Page anchor split button: main button + chevron, joined. */
+/* Split buttons (Page anchor, Screenshot): main button + chevron, joined. */
 .md-action-split { display: inline-flex; }
-.md-action-split button[data-md-action="anchor"] { border-radius: 6px 0 0 6px; }
+.md-action-split button[data-md-action] { border-radius: 6px 0 0 6px; }
 .md-action-split .md-action-chevron {
   border-radius: 0 6px 6px 0; border-left: none; padding: 3px 6px;
 }

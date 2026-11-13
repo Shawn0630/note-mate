@@ -2,12 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { MD_QUICK_ACTIONS, mdQuickSnippet } from '../public/mdQuickActions.js';
 
-test('action list: 10 actions, H3 first, no ## chapter heading', () => {
-  assert.equal(MD_QUICK_ACTIONS.length, 10);
+test('action list: 11 actions, H3 first, no ## chapter heading', () => {
+  assert.equal(MD_QUICK_ACTIONS.length, 11);
   assert.equal(MD_QUICK_ACTIONS[0].id, 'h3');
   assert.ok(!MD_QUICK_ACTIONS.some((a) => a.id === 'h2'));
   assert.deepEqual(MD_QUICK_ACTIONS.map((a) => a.id),
-    ['h3', 'checklist', 'bullet', 'code', 'table', 'quote', 'divider', 'link', 'date', 'anchor']);
+    ['h3', 'checklist', 'bullet', 'code', 'table', 'quote', 'divider', 'link', 'date', 'anchor', 'screenshot']);
 });
 
 test('inline prefixes insert at the cursor, cursor after', () => {

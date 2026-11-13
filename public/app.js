@@ -48,6 +48,9 @@ import {
   imageMarkdownRef, appendImageEdit, embedAssetsInMarkdown,
 } from './pasteImage.js';
 import {
+  resolveScreenshotTarget, pageCanvasSelector, pageHolderSelector,
+} from './screenshotCapture.js';
+import {
   AI_CODE_CONTEXT_CHARS, targetCellLabel, targetCellFingerprint,
   formatNotebookCellsForCodeAi,
 } from './aiCodeContext.js';
@@ -2424,8 +2427,13 @@ async function mountPdfViewer(container, pdf, { measure, onScroll, zoomKey = 'pd
       const num = $('.page-num', holder);
       holder.insertBefore(canvas, num);
       await pg.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+      // The canvas exists in the DOM while pdf.js is still painting it, so
+      // the Screenshot button needs a finished-render flag, not just the
+      // canvas: an unfinished canvas reads back blank white.
+      holder.dataset.renderDone = '1';
     } catch {
       delete holder.dataset.rendered;
+      delete holder.dataset.renderDone;
     }
   };
 
@@ -3661,16 +3669,132 @@ async function handleMdEditorPaste(ta, e) {
     setSaveStatus(`Could not paste image: ${err.message}`, 'error');
     return;
   }
+  await uploadImageAndShowMenu(ta, dataUrl, 'Could not paste image');
+}
+
+/* Upload an image data URL to notes/assets/ (content-hash named, deduped
+   like a paste) and show the paste-image popup with its markdown code.
+   Shared by paste, the Screenshot button and the file picker — one upload
+   path, one popup. Returns the upload record, or null on failure (the
+   status line already says what went wrong). */
+async function uploadImageAndShowMenu(ta, dataUrl, errLabel) {
   let uploaded;
   try {
     uploaded = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/assets`,
       'POST', { dataUrl });
   } catch (err) {
-    setSaveStatus(`Could not paste image: ${err.message}`, 'error');
-    return;
+    setSaveStatus(`${errLabel}: ${err.message}`, 'error');
+    return null;
   }
   setSaveStatus('Image uploaded.');
   showPasteImageMenu(ta, imageMarkdownRef(uploaded.fileName));
+  return uploaded;
+}
+
+/* Screenshot button (main click): capture the currently visible PDF page
+   or deck slide — the canvas the reader already rendered; never re-render
+   the PDF or fetch the page again. Uploads through the same assets
+   endpoint as paste, then shows the same popup (Append to note / Copy
+   markdown). When the left pane shows no page canvas (video, YouTube, a
+   Google Slides iframe, the Markdown preview tab, a page not rendered
+   yet), a status hint and nothing else — never a blank upload. */
+async function capturePageScreenshot(ta) {
+  const target = resolveScreenshotTarget({
+    kind: state.project?.kind,
+    leftTab: state.leftTab,
+    pdfPage: currentPdfPage(),
+    deckPage: currentDeckPage(),
+    hasPdfContainer: !!state.pdfContainer,
+    hasDeckContainer: !!state.deckContainer,
+  });
+  if (target.error) {
+    setSaveStatus('No page to capture — open a PDF page or slide first.');
+    return;
+  }
+  const container = target.container === 'deck' ? state.deckContainer : state.pdfContainer;
+  // The canvas exists in the DOM while pdf.js is still painting it, so a
+  // capture taken the instant a page/slide appears would read back blank
+  // white. Wait briefly for the finished-render flag (covers a tab switch
+  // or a scroll straight onto an unrendered page); if the page still
+  // hasn't finished, say so instead of uploading a blank image.
+  const holderSel = pageHolderSelector(target.page);
+  const holder = () => container?.querySelector(holderSel);
+  let rendered = false;
+  for (let i = 0; i < 20 && !rendered; i++) {
+    if (holder()?.dataset.renderDone) { rendered = true; break; }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (!rendered) {
+    setSaveStatus(holder()
+      ? 'Page still loading — try again in a moment.'
+      : 'No page to capture — open a PDF page or slide first.');
+    return;
+  }
+  const canvas = container?.querySelector(pageCanvasSelector(target.page));
+  if (!canvas || !canvas.width || !canvas.height) {
+    setSaveStatus('No page to capture — open a PDF page or slide first.');
+    return;
+  }
+  let dataUrl;
+  try {
+    dataUrl = canvas.toDataURL('image/png');
+  } catch {
+    setSaveStatus('Could not capture this page.', 'error');
+    return;
+  }
+  setSaveStatus('Uploading image…');
+  await uploadImageAndShowMenu(ta, dataUrl, 'Could not upload screenshot');
+}
+
+/* The Screenshot chevron: "Choose image file…" — pick an existing PNG or
+   JPEG from disk instead of capturing the current page; same upload +
+   popup afterwards. */
+function openScreenshotMenu(anchorBtn, ta) {
+  if (floatingMenu?.anchor === anchorBtn) { closeFloatingMenu(); return; }
+  const el = document.createElement('div');
+  el.className = 'floating-menu impression-menu';
+  el.setAttribute('role', 'menu');
+  el.setAttribute('aria-label', 'Screenshot options');
+  el.innerHTML = `<button type="button" class="impression-row" data-screenshot-file role="menuitem">
+      <span class="impression-label">Choose image file…</span></button>`;
+  el.addEventListener('click', (e) => {
+    if (!e.target.closest('[data-screenshot-file]')) return;
+    closeFloatingMenu();
+    openScreenshotFilePicker(ta);
+  });
+  showFloatingMenu(anchorBtn, el);
+}
+
+/* File picker behind the Screenshot chevron (same pattern as ＋ Add
+   material): PNG/JPEG only; the server rejects anything else with a 400,
+   surfaced here as a status error. Cancelling the picker does nothing. */
+function openScreenshotFilePicker(ta) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/png,image/jpeg';
+  input.addEventListener('change', async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    if (!/^image\/(png|jpe?g)$/.test(file.type || '')) {
+      setSaveStatus('Choose a PNG or JPEG image.', 'error');
+      return;
+    }
+    setSaveStatus('Uploading image…');
+    let dataUrl;
+    try {
+      dataUrl = await new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(r.result);
+        r.onerror = () => reject(new Error('could not read the image'));
+        r.readAsDataURL(file);
+      });
+    } catch (err) {
+      setSaveStatus(`Could not upload image: ${err.message}`, 'error');
+      return;
+    }
+    await uploadImageAndShowMenu(ta, dataUrl, 'Could not upload image');
+  });
+  input.click();
 }
 
 let pasteImageMenu = null;
@@ -3833,11 +3957,14 @@ function renderNotebookBody() {
   // the LEFT pane's Preview tab (pick the note there). One slim row of
   // quick actions sits above the editor — labels only, no prose.
   body.classList.add('has-quick-actions');
-  // The Page anchor action is a split button: the main button inserts the
-  // current page; the chevron opens the recent-impressions dropdown.
+  // The Page anchor and Screenshot actions are split buttons: the main
+  // button acts on the current page; the chevron opens a dropdown (recent
+  // pages for the anchor, "Choose image file…" for the screenshot).
+  const splitBtn = (a, menuTitle, menuLabel) => `<span class="md-action-split"><button type="button" data-md-action="${a.id}" title="${esc(a.title)}">${esc(a.label)}</button><button type="button" class="md-action-chevron" data-md-action-menu="${a.id}" title="${esc(menuTitle)}" aria-label="${esc(menuLabel)}">▾</button></span>`;
   const actionsHtml = MD_QUICK_ACTIONS.map((a) => {
-    if (a.id !== 'anchor') return `<button type="button" data-md-action="${a.id}" title="${esc(a.title)}">${esc(a.label)}</button>`;
-    return `<span class="md-action-split"><button type="button" data-md-action="anchor" title="${esc(a.title)}">${esc(a.label)}</button><button type="button" class="md-action-chevron" data-md-action-menu="anchor" title="Anchor to a page you looked at recently" aria-label="Recent pages">▾</button></span>`;
+    if (a.id === 'anchor') return splitBtn(a, 'Anchor to a page you looked at recently', 'Recent pages');
+    if (a.id === 'screenshot') return splitBtn(a, 'Choose an image file from disk', 'Screenshot options');
+    return `<button type="button" data-md-action="${a.id}" title="${esc(a.title)}">${esc(a.label)}</button>`;
   }).join('');
   body.innerHTML = `<div class="md-quick-actions" role="toolbar" aria-label="Quick actions">${actionsHtml}</div><textarea class="md-editor" id="md-editor" spellcheck="false"></textarea>`;
   const ta = $('#md-editor', body);
@@ -3848,9 +3975,16 @@ function renderNotebookBody() {
   });
   $('.md-quick-actions', body).addEventListener('click', (e) => {
     const menuBtn = e.target.closest('button[data-md-action-menu]');
-    if (menuBtn) { openAnchorImpressionsMenu(menuBtn, ta); return; }
+    if (menuBtn) {
+      if (menuBtn.dataset.mdActionMenu === 'screenshot') { openScreenshotMenu(menuBtn, ta); return; }
+      openAnchorImpressionsMenu(menuBtn, ta); return;
+    }
     const btn = e.target.closest('button[data-md-action]');
-    if (btn) insertMdQuickAction(ta, btn.dataset.mdAction);
+    if (!btn) return;
+    // Screenshot is not a snippet insert: the main button captures the
+    // current page; the chevron (above) opens the file picker.
+    if (btn.dataset.mdAction === 'screenshot') { capturePageScreenshot(ta); return; }
+    insertMdQuickAction(ta, btn.dataset.mdAction);
   });
   ta.value = state.activeNoteContent;
   ta.addEventListener('focus', () => { state.editorFocused = true; });
