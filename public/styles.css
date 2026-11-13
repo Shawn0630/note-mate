@@ -397,6 +397,10 @@ body.reader-open .reader {
 .topbar button:hover { background: rgba(255, 255, 255, .22); }
 .topbar button[aria-pressed="true"] { background: rgba(255, 255, 255, .3); }
 #ai-toggle-top.active { background: rgba(255, 255, 255, .3); font-weight: 700; }
+/* Screenshot split button in the reader top bar: main button + chevron, joined. */
+.topbar-split { display: inline-flex; }
+.topbar-split button:first-child { border-radius: 7px 0 0 7px; }
+.topbar-split .topbar-chevron { border-radius: 0 7px 7px 0; padding: 4px 6px; }
 
 /* ---------- Chapter panel ---------- */
 
@@ -750,9 +754,8 @@ input[type="text"].note-tab-input {
   gap: 8px;
   align-items: flex-start;
 }
-/* The card holds the cell itself; the rail beside it carries the per-cell
-   actions (✨ AI, Export). The border/background live on the card so the
-   rail sits outside it, beside the cell. */
+/* The card holds the cell itself; the head row carries the per-cell
+   actions (✨ AI, Export, Delete) in one line. */
 .nb-cell-card {
   flex: 1;
   min-width: 0;
@@ -766,18 +769,14 @@ input[type="text"].note-tab-input {
   outline: 2px solid var(--wood);
   outline-offset: -2px;
 }
-.nb-cell-rail {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding-top: 2px;
-  flex: none;
-}
 .rail-btn {
   font-size: 12px;
   padding: 4px 8px;
   white-space: nowrap;
 }
+/* The rail buttons live in the cell head row now; keep their own size
+   (the head's button rule would shrink the padding). */
+.nb-cell-head .rail-btn { padding: 4px 8px; }
 .rail-btn-ai.active {
   background: var(--wood);
   color: #fff;
@@ -1372,7 +1371,12 @@ input[type="text"].note-tab-input {
   cursor: pointer;
 }
 .paste-image-actions button:hover { background: rgba(138, 90, 43, .08); }
+.paste-image-actions button:disabled { opacity: .45; cursor: default; }
+.paste-image-actions button:disabled:hover { background: var(--paper); }
 .paste-image-close { margin-left: auto; padding: 5px 8px; }
+/* One-line hint when the popup has no editable note to append to
+   (top-bar Screenshot with no note open). */
+.paste-image-hint { font-size: 12px; color: var(--ink-soft); margin-top: 6px; }
 .menu-count {
   font-size: 11.5px;
   font-weight: 600;

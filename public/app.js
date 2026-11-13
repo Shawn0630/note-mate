@@ -55,6 +55,11 @@ import {
   AI_CODE_CONTEXT_CHARS, targetCellLabel, targetCellFingerprint,
   formatNotebookCellsForCodeAi,
 } from './aiCodeContext.js';
+import {
+  pushUndoEntry, popUndoEntry,
+  editUndoEntry, addUndoEntry, deleteUndoEntry,
+  replaceUndoEntry, appendUndoEntry, createEditBaselines,
+} from './nbUndo.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdfjs/pdf.worker.mjs';
 
@@ -319,6 +324,7 @@ const state = {
   aiTab: 'note',        // 'note' (Note AI) | 'code' (Code AI)
   aiThreads: {},        // notebookKey -> {messages: [{role, content, markdown, applied}]}
   aiCodeThreads: {},    // notebookKey -> {messages: [{role, content, code, explanation, applied}]}
+  nbUndoStacks: {},     // notebookKey -> undo stack (LIFO, cap 20, session-only)
   exportSelection: new Set(), // notebook cell indexes selected for export
   exportSelectionFor: null,   // notebook key the selection belongs to
   // AI model picker (AV-style): the server lists the models the key can
@@ -937,6 +943,9 @@ function renderReaderShell() {
         <h1>${esc(p.title || 'Untitled')}</h1>
         <button type="button" id="layout-menu-btn" title="Layout — presets and panels">▦ Layout</button>
         ${switcher}
+        <span class="topbar-split">
+          <button type="button" id="screenshot-top" title="Drag to select a region of the page to capture">Screenshot</button><button type="button" id="screenshot-top-chevron" class="topbar-chevron" title="Choose an image file from disk" aria-label="Screenshot options">▾</button>
+        </span>
         <button type="button" id="ai-toggle-top" class="${state.panels.ai ? 'active' : ''}"
                 title="Ask the AI — opens the AI panel">✨ Ask AI</button>
         <button type="button" id="theme-toggle-top" class="theme-toggle"
@@ -960,6 +969,10 @@ function renderReaderShell() {
 
   $('#layout-menu-btn', view).addEventListener('click', (e) => {
     openLayoutMenu(e.currentTarget);
+  });
+  $('#screenshot-top', view).addEventListener('click', onTopbarScreenshot);
+  $('#screenshot-top-chevron', view).addEventListener('click', (e) => {
+    openScreenshotMenu(e.currentTarget, () => activeMdEditor());
   });
   $('#ai-toggle-top', view).addEventListener('click', toggleAiPanel);
   $('#theme-toggle-top', view).addEventListener('click', toggleTheme);
@@ -3745,6 +3758,37 @@ function cropCanvasToDataUrl(canvas, { sx, sy, sw, sh }) {
   return out.toDataURL('image/png');
 }
 
+/* The editable markdown note's textarea, or null when no editable note is
+   open (a notebook tab, or the notes.md-only empty state). The top-bar
+   Screenshot button is global, so it resolves this at capture time, not
+   at click time. */
+function activeMdEditor() {
+  return $('#md-editor', view) ?? null;
+}
+
+/* Screenshot callers pass either the editor textarea or a getter for it
+   (the top-bar button resolves the open note at capture time). */
+function resolveNoteTa(ta) {
+  return typeof ta === 'function' ? ta() : ta;
+}
+
+/* Top-bar Screenshot: the button is global, so make sure there is a page
+   to capture before entering region select — show the reading pane if a
+   layout hid it, and move off the Markdown preview tab onto a PDF/slide
+   tab when the project has one. Only a project with no capturable
+   material at all still ends in the "No page to capture" hint. */
+async function onTopbarScreenshot() {
+  if (!state.panels.reading) {
+    updatePanels({ ...state.panels, reading: true });
+  }
+  if (String(state.project?.kind || '').toLowerCase() === 'pdf'
+    && state.leftTab !== 'pdf' && state.leftTab !== 'slides') {
+    if (state.pdfContainer) setLeftTab('pdf');
+    else if (state.deckContainer) setLeftTab('slides');
+  }
+  await enterRegionSelect(() => activeMdEditor());
+}
+
 /* Screenshot button (main click): macOS-style region select. A
    translucent overlay covers the reading pane; drag to draw the region,
    release to capture just that part of the current PDF page / deck
@@ -3833,7 +3877,7 @@ async function enterRegionSelect(ta) {
       return;
     }
     setSaveStatus('Uploading image…');
-    await uploadImageAndShowMenu(ta, dataUrl, 'Could not upload screenshot');
+    await uploadImageAndShowMenu(resolveNoteTa(ta), dataUrl, 'Could not upload screenshot');
   };
   overlay.addEventListener('pointerup', finish);
   overlay.addEventListener('pointercancel', close);
@@ -3885,7 +3929,7 @@ function openScreenshotFilePicker(ta) {
       setSaveStatus(`Could not upload image: ${err.message}`, 'error');
       return;
     }
-    await uploadImageAndShowMenu(ta, dataUrl, 'Could not upload image');
+    await uploadImageAndShowMenu(resolveNoteTa(ta), dataUrl, 'Could not upload image');
   });
   input.click();
 }
@@ -3928,22 +3972,31 @@ function textareaCaretPos(ta) {
   return { x, y };
 }
 
+/* The paste-image popup: the markdown code (selected), Append to note /
+   Copy markdown / ×. `ta` may be null when the image came from the
+   top-bar Screenshot button with no editable note open — then there is
+   nothing to append to: Append is disabled with a one-line hint, and
+   Copy still works. Positioned near the caret when there is one, else
+   top-right under the top bar. */
 function showPasteImageMenu(ta, code) {
   closePasteImageMenu();
+  const canAppend = !!ta && ta.isConnected;
   const el = document.createElement('div');
   el.className = 'floating-menu paste-image-menu';
   el.setAttribute('role', 'menu');
   el.innerHTML = `
     <input type="text" class="paste-image-code" readonly value="${esc(code)}" aria-label="Markdown for the pasted image">
     <div class="paste-image-actions">
-      <button type="button" data-paste-action="append">Append to note</button>
+      <button type="button" data-paste-action="append" ${canAppend ? '' : 'disabled'}>Append to note</button>
       <button type="button" data-paste-action="copy">Copy markdown</button>
       <button type="button" class="paste-image-close" data-paste-action="close" aria-label="Close">×</button>
-    </div>`;
+    </div>
+    ${canAppend ? '' : '<div class="paste-image-hint">Open a note to append</div>'}`;
   document.body.appendChild(el);
   // Near the caret, clamped to the viewport (below the line, or above it
-  // when there is no room below).
-  const pos = textareaCaretPos(ta);
+  // when there is no room below); top-right under the top bar when there
+  // is no editor caret to anchor to.
+  const pos = canAppend ? textareaCaretPos(ta) : { x: window.innerWidth - 340, y: 56 };
   const mw = el.offsetWidth;
   const mh = el.offsetHeight;
   let left = Math.min(pos.x, window.innerWidth - mw - 8);
@@ -3976,6 +4029,7 @@ function showPasteImageMenu(ta, code) {
       return;
     }
     if (action === 'append') {
+      if (!canAppend) return;
       closePasteImageMenu();
       appendImageToNote(ta, code);
     }
@@ -4050,13 +4104,12 @@ function renderNotebookBody() {
   // the LEFT pane's Preview tab (pick the note there). One slim row of
   // quick actions sits above the editor — labels only, no prose.
   body.classList.add('has-quick-actions');
-  // The Page anchor and Screenshot actions are split buttons: the main
-  // button acts on the current page; the chevron opens a dropdown (recent
-  // pages for the anchor, "Choose image file…" for the screenshot).
+  // The Page anchor action is a split button: the main button inserts an
+  // anchor for the current page; the chevron opens a dropdown of recent
+  // pages. (Screenshot moved to the reader top bar — it is global now.)
   const splitBtn = (a, menuTitle, menuLabel) => `<span class="md-action-split"><button type="button" data-md-action="${a.id}" title="${esc(a.title)}">${esc(a.label)}</button><button type="button" class="md-action-chevron" data-md-action-menu="${a.id}" title="${esc(menuTitle)}" aria-label="${esc(menuLabel)}">▾</button></span>`;
   const actionsHtml = MD_QUICK_ACTIONS.map((a) => {
     if (a.id === 'anchor') return splitBtn(a, 'Anchor to a page you looked at recently', 'Recent pages');
-    if (a.id === 'screenshot') return splitBtn(a, 'Choose an image file from disk', 'Screenshot options');
     return `<button type="button" data-md-action="${a.id}" title="${esc(a.title)}">${esc(a.label)}</button>`;
   }).join('');
   body.innerHTML = `<div class="md-quick-actions" role="toolbar" aria-label="Quick actions">${actionsHtml}</div><textarea class="md-editor" id="md-editor" spellcheck="false"></textarea>`;
@@ -4069,14 +4122,10 @@ function renderNotebookBody() {
   $('.md-quick-actions', body).addEventListener('click', (e) => {
     const menuBtn = e.target.closest('button[data-md-action-menu]');
     if (menuBtn) {
-      if (menuBtn.dataset.mdActionMenu === 'screenshot') { openScreenshotMenu(menuBtn, ta); return; }
       openAnchorImpressionsMenu(menuBtn, ta); return;
     }
     const btn = e.target.closest('button[data-md-action]');
     if (!btn) return;
-    // Screenshot is not a snippet insert: the main button opens region
-    // select on the current page; the chevron (above) opens the file picker.
-    if (btn.dataset.mdAction === 'screenshot') { enterRegionSelect(ta); return; }
     insertMdQuickAction(ta, btn.dataset.mdAction);
   });
   ta.value = state.activeNoteContent;
@@ -4472,7 +4521,7 @@ async function runNotebookCells(list, statusEl) {
   if (!list.length) return;
   const lang = state.activeNotebook?.metadata?.language_info?.name
     || state.activeNotebook?.metadata?.kernelspec?.language || 'python';
-  const btns = $$('#nb-cells .run-btn, #nb-run-all');
+  const btns = $$('#nb-cells .run-btn, #nb-run-all, #nb-undo');
   btns.forEach((b) => { b.disabled = true; });
   if (statusEl) statusEl.textContent = 'Running…';
   try {
@@ -4498,6 +4547,7 @@ async function runNotebookCells(list, statusEl) {
     if (statusEl) statusEl.textContent = `Run failed: ${err.message}`;
   } finally {
     btns.forEach((b) => { b.disabled = false; });
+    syncNbUndoButton(); // Undo's disabled state follows its stack, not the run
   }
 }
 
@@ -4511,17 +4561,25 @@ function renderIpynbBody(body) {
     state.exportSelection = new Set();
     state.exportSelectionFor = notebookKey();
   }
-  // One toolbar row above the cells: Run all (not for Java — cells cannot
-  // share one session), at the TOP RIGHT with breathing room. Export lives
-  // at the cell level now (a rail button beside each code cell), so the
-  // toolbar carries no Export button.
-  const runAllRow = lang === 'java' ? '' : `
+  // One toolbar row above the cells: Undo + Run all (Run all not for
+  // Java — cells cannot share one session), at the TOP RIGHT with
+  // breathing room. Export lives at the cell level now (a rail button
+  // beside each code cell), so the toolbar carries no Export button.
+  // Undo covers this notebook's edits, adds, deletes and Code AI
+  // Applies — never runs. Disabled while its stack is empty.
+  const runAllRow = `
     <div class="nb-runall-row">
       <span class="save-status" id="nb-runall-status"></span>
-      <button type="button" class="run-btn" id="nb-run-all"
-        title="Run all code cells top to bottom in one shared session">▶ Run all</button>
+      <button type="button" id="nb-undo" title="Undo the last change in this notebook"
+        ${(nbUndoStack().length || nbEditBaselines.hasUncommittedChange()) ? '' : 'disabled'}>Undo</button>
+      ${lang === 'java' ? '' : `<button type="button" class="run-btn" id="nb-run-all"
+        title="Run all code cells top to bottom in one shared session">▶ Run all</button>`}
     </div>`;
   body.innerHTML = `${runAllRow}<div class="nb-cells" id="nb-cells"></div>`;
+  const undoBtn = $('#nb-undo', body);
+  if (undoBtn) {
+    undoBtn.addEventListener('click', () => undoNotebook());
+  }
   const runAllBtn = $('#nb-run-all', body);
   if (runAllBtn) {
     runAllBtn.addEventListener('click', async (e) => {
@@ -4564,23 +4622,27 @@ function renderIpynbBody(body) {
         editBtn.textContent = editing ? 'Done' : 'Edit';
         if (!editing) {
           setNbCellSource(cell, ta.value);
+          commitNbEdit(cell); // one undo step for the whole edit session
           renderMdPreview(viewEl, ta.value);
           saveNotebook();
         } else {
+          nbEditBaselines.begin(cell, nbCellSource(cell));
           autoGrowCellEditor(ta);
           ta.focus();
         }
       });
     } else {
-      // Code cell: editable source, Run button, outputs area. The card
-      // holds the cell itself; the rail beside it carries the per-cell
-      // actions (✨ AI pins this cell as the Code AI target; Export starts
-      // the export flow for this cell).
+      // Code cell: editable source, Run button, outputs area. The head row
+      // carries the per-cell actions in one line: ✨ AI pins this cell as
+      // the Code AI target, Export starts the export flow for this cell,
+      // Delete removes it.
       cellEl.innerHTML = `
       <div class="nb-cell-card">
         <div class="nb-cell-head"><label class="nb-export-check" title="Select for Markdown export">
             <input type="checkbox" data-cell-select="${idx}" ${state.exportSelection.has(idx) ? 'checked' : ''}> Export</label>
           <span>Code · ${esc(lang)}</span><span class="spacer"></span>
+          <button type="button" class="rail-btn rail-btn-ai" data-cell-ai="${idx}" title="Ask Code AI about this cell">✨ AI</button>
+          <button type="button" class="rail-btn" data-cell-export="${idx}" title="Export this cell to Markdown">Export</button>
           <button type="button" data-cell-del="${idx}">Delete</button></div>
         <textarea class="nb-code-source" spellcheck="false"></textarea>
         <div class="nb-cell-resize" data-cell-resize="${idx}" title="Drag to resize"><span aria-hidden="true">⋯</span></div>
@@ -4590,16 +4652,12 @@ function renderIpynbBody(body) {
           <span class="save-status" data-cell-status="${idx}"></span>
         </div>
         <div class="nb-output" data-cell-output="${idx}"></div>
-      </div>
-      <div class="nb-cell-rail">
-        <button type="button" class="rail-btn rail-btn-ai" data-cell-ai="${idx}" title="Ask Code AI about this cell">✨ AI</button>
-        <button type="button" class="rail-btn" data-cell-export="${idx}" title="Export this cell to Markdown">Export</button>
       </div>`;
       $(`[data-cell-select="${idx}"]`, cellEl).addEventListener('change', (e) => {
         if (e.currentTarget.checked) state.exportSelection.add(idx);
         else state.exportSelection.delete(idx);
       });
-      // Rail: ✨ AI pins this cell as the Code AI target; Export selects
+      // Head row: ✨ AI pins this cell as the Code AI target; Export selects
       // this cell and opens the export picker for it.
       $(`[data-cell-ai="${idx}"]`, cellEl).addEventListener('click', () => pinAiCodeTarget(idx));
       $(`[data-cell-export="${idx}"]`, cellEl).addEventListener('click', () => {
@@ -4612,9 +4670,9 @@ function renderIpynbBody(body) {
       ta.value = nbCellSource(cell);
       ta.dataset.cellIdx = String(idx);
       attachCellResize($('.nb-cell-resize', cellEl), ta, cell);
-      ta.addEventListener('input', () => { setNbCellSource(cell, ta.value); autoGrowCellEditor(ta); });
-      ta.addEventListener('blur', () => saveNotebook());
-      ta.addEventListener('focus', () => { state.editorFocused = true; });
+      ta.addEventListener('input', () => { setNbCellSource(cell, ta.value); autoGrowCellEditor(ta); syncNbUndoButton(); });
+      ta.addEventListener('blur', () => { commitNbEdit(cell); saveNotebook(); });
+      ta.addEventListener('focus', () => { state.editorFocused = true; nbEditBaselines.begin(cell, nbCellSource(cell)); });
       ta.addEventListener('blur', () => { state.editorFocused = false; });
       renderCellOutputs($(`[data-cell-output="${idx}"]`, cellEl), cell);
       $(`[data-cell-run="${idx}"]`, cellEl).addEventListener('click', async (e) => {
@@ -4649,6 +4707,8 @@ function renderIpynbBody(body) {
       }
       $(`[data-cell-del="${idx}"]`, cellEl).addEventListener('click', async () => {
         if (!window.confirm('Delete this cell?')) return;
+        commitAllNbEdits();
+        pushUndoEntry(nbUndoStack(), deleteUndoEntry({ cell: nb.cells[idx], index: idx }));
         nb.cells.splice(idx, 1);
         state.exportSelection = new Set(); // indexes shift — drop the selection
         await saveNotebook();
@@ -4664,12 +4724,18 @@ function renderIpynbBody(body) {
       <button type="button" data-add-md="${idx}">+ Markdown cell</button>
       <button type="button" data-add-code="${idx}">+ Code cell</button>`;
     $(`[data-add-md="${idx}"]`, addRow).addEventListener('click', () => {
-      nb.cells.splice(idx + 1, 0, { cell_type: 'markdown', metadata: {}, source: '' });
+      const newCell = { cell_type: 'markdown', metadata: {}, source: '' };
+      nb.cells.splice(idx + 1, 0, newCell);
+      commitAllNbEdits();
+      pushUndoEntry(nbUndoStack(), addUndoEntry({ cell: newCell }));
       state.exportSelection = new Set(); // indexes shift — drop the selection
       saveNotebook().then(() => renderNotebookBody());
     });
     $(`[data-add-code="${idx}"]`, addRow).addEventListener('click', () => {
-      nb.cells.splice(idx + 1, 0, { cell_type: 'code', execution_count: null, metadata: {}, outputs: [], source: '' });
+      const newCell = { cell_type: 'code', execution_count: null, metadata: {}, outputs: [], source: '' };
+      nb.cells.splice(idx + 1, 0, newCell);
+      commitAllNbEdits();
+      pushUndoEntry(nbUndoStack(), addUndoEntry({ cell: newCell }));
       state.exportSelection = new Set(); // indexes shift — drop the selection
       saveNotebook().then(() => renderNotebookBody());
     });
@@ -4682,11 +4748,17 @@ function renderIpynbBody(body) {
     <button type="button" id="nb-add-md-bottom">+ Markdown cell</button>
     <button type="button" id="nb-add-code-bottom">+ Code cell</button>`;
   $('#nb-add-md-bottom', bottomRow).addEventListener('click', () => {
-    nb.cells.push({ cell_type: 'markdown', metadata: {}, source: '' });
+    const newCell = { cell_type: 'markdown', metadata: {}, source: '' };
+    nb.cells.push(newCell);
+    commitAllNbEdits();
+    pushUndoEntry(nbUndoStack(), addUndoEntry({ cell: newCell }));
     saveNotebook().then(() => renderNotebookBody());
   });
   $('#nb-add-code-bottom', bottomRow).addEventListener('click', () => {
-    nb.cells.push({ cell_type: 'code', execution_count: null, metadata: {}, outputs: [], source: '' });
+    const newCell = { cell_type: 'code', execution_count: null, metadata: {}, outputs: [], source: '' };
+    nb.cells.push(newCell);
+    commitAllNbEdits();
+    pushUndoEntry(nbUndoStack(), addUndoEntry({ cell: newCell }));
     saveNotebook().then(() => renderNotebookBody());
   });
   wrap.appendChild(bottomRow);
@@ -5417,12 +5489,22 @@ async function applyAiCode(i) {
   // to the old source, so they are cleared with it; the stale error a cell
   // showed before the fix must not survive under the new code. Other cells
   // are untouched. notes.md is untouched — this writes the notebook only.
+  commitAllNbEdits(); // open typing sessions commit before the Apply entry
   const target = msg.target;
   const targetCell = target && Number.isInteger(target.index)
     ? state.activeNotebook.cells[target.index] : null;
   const statusEl = $('#ai-code-status', view);
   if (targetCell && targetCell.cell_type === 'code'
     && targetCellFingerprint(targetCell) === target.fingerprint) {
+    // Snapshot the cell (and the pin) first — Apply is reversible via
+    // the notebook toolbar's Undo button.
+    pushUndoEntry(nbUndoStack(), replaceUndoEntry({
+      msgIndex: i, cell: targetCell,
+      prevSource: nbCellSource(targetCell),
+      prevOutputs: targetCell.outputs,
+      prevExecutionCount: targetCell.execution_count,
+      prevTarget: target ? { ...target } : null,
+    }));
     setNbCellSource(targetCell, msg.code);
     targetCell.outputs = [];
     targetCell.execution_count = null;
@@ -5444,9 +5526,11 @@ async function applyAiCode(i) {
   }
   // No pin, or the pinned cell moved/changed since the question: append a
   // new code cell at the end of the notebook (never edits an existing cell).
-  state.activeNotebook.cells.push({
+  const newCell = {
     cell_type: 'code', execution_count: null, metadata: {}, outputs: [], source: msg.code,
-  });
+  };
+  state.activeNotebook.cells.push(newCell);
+  pushUndoEntry(nbUndoStack(), appendUndoEntry({ msgIndex: i, cell: newCell }));
   await saveNotebook();
   msg.applied = true;
   renderAiCodeThread();
@@ -5459,6 +5543,112 @@ async function applyAiCode(i) {
     statusEl.textContent = target
       ? 'Target cell changed — added as a new code cell at the end of the notebook.'
       : 'Added as a new code cell at the end of the notebook.';
+  }
+}
+
+/* This notebook's undo stack (LIFO, cap 20, in-memory): one stack per
+   open .ipynb notebook, keyed like the ai-code threads. Runs never push
+   entries — only edits, adds, deletes and Code AI Applies do. */
+function nbUndoStack() {
+  const key = notebookKey();
+  if (!state.nbUndoStacks[key]) state.nbUndoStacks[key] = [];
+  return state.nbUndoStacks[key];
+}
+
+/* The toolbar Undo button follows the stack: enabled only while this
+   notebook has something to undo — including an uncommitted typing
+   session (clicking it commits the session first, then undoes it). */
+function syncNbUndoButton() {
+  const btn = $('#nb-undo', view);
+  if (btn) btn.disabled = !(nbUndoStack().length || nbEditBaselines.hasUncommittedChange());
+}
+
+/* Typing coalescing baselines (see nbUndo.js): one undo step per edit
+   session, never per keystroke. The WeakMap keeps baselines off the cell
+   objects, so they can never leak into the saved .ipynb file. */
+const nbEditBaselines = createEditBaselines();
+
+/* Commit a finished typing session: if the cell's source moved since the
+   session started, one undo step for the whole session. Called on blur
+   (code cells) / Done (markdown cells). */
+function commitNbEdit(cell) {
+  const prevSource = nbEditBaselines.commit(cell, nbCellSource(cell));
+  if (prevSource !== null) {
+    pushUndoEntry(nbUndoStack(), editUndoEntry({ cell, prevSource }));
+    syncNbUndoButton();
+  }
+}
+
+/* Commit every open typing session onto the stack, in the order they
+   began. Mutation entry points (Apply, add, delete, Undo itself) call
+   this BEFORE pushing their own entry: a re-render blurs the focused
+   editor, and that blur's commit would otherwise land on top of the
+   mutation's entry and break LIFO order. A real mouse click already
+   blurred first (so this finds nothing); a programmatic trigger needs it. */
+function commitAllNbEdits() {
+  for (const { cell, prevSource } of nbEditBaselines.commitAll()) {
+    pushUndoEntry(nbUndoStack(), editUndoEntry({ cell, prevSource }));
+  }
+  syncNbUndoButton();
+}
+
+/* Undo the most recent notebook change (LIFO): a typing session restores
+   the cell's pre-session source; an add removes the cell; a delete puts
+   it back; a pinned Code AI Apply restores the cell's previous source,
+   outputs and execution_count (and the pin as it was, when the pin still
+   points at that cell); an appended Apply removes the added cell. An
+   undone Apply returns its proposal card to its pre-Apply state.
+   Session-only — the stack lives in memory and clears on reload. */
+async function undoNotebook() {
+  commitAllNbEdits(); // a focused editor's session commits first, then undoes
+  const stack = nbUndoStack();
+  const entry = popUndoEntry(stack);
+  if (!entry) {
+    const statusEl = $('#nb-runall-status', view);
+    if (statusEl) statusEl.textContent = 'Nothing to undo.';
+    return;
+  }
+  const cells = state.activeNotebook.cells;
+  if (entry.kind === 'edit') {
+    if (cells.includes(entry.cell)) setNbCellSource(entry.cell, entry.prevSource);
+  } else if (entry.kind === 'add' || entry.kind === 'append') {
+    const idx = cells.indexOf(entry.cell);
+    if (idx >= 0) {
+      cells.splice(idx, 1);
+      state.exportSelection = new Set(); // indexes shift — drop the selection
+    }
+  } else if (entry.kind === 'delete') {
+    cells.splice(Math.min(entry.index, cells.length), 0, entry.cell);
+    state.exportSelection = new Set();
+  } else if (entry.kind === 'replace') {
+    if (cells.includes(entry.cell)) {
+      setNbCellSource(entry.cell, entry.prevSource);
+      entry.cell.outputs = entry.prevOutputs;
+      entry.cell.execution_count = entry.prevExecutionCount;
+      // The pin describes the new source after Apply; put it back to the
+      // restored one — unless the user re-pinned or cleared it since.
+      const thread = aiCodeThread();
+      const curIdx = cells.indexOf(entry.cell);
+      if (entry.prevTarget && thread.target && thread.target.index === curIdx) {
+        thread.target = { ...entry.prevTarget, index: curIdx };
+      }
+    }
+  }
+  // An undone Apply returns its proposal card to its pre-Apply state.
+  if (entry.msgIndex !== undefined && entry.msgIndex !== null) {
+    const msg = aiCodeThread().messages[entry.msgIndex];
+    if (msg) msg.applied = false;
+    renderAiCodeThread();
+  }
+  await saveNotebook();
+  renderNotebookBody();
+  syncNbUndoButton();
+  // Re-query: the render rebuilt the toolbar, so the element captured
+  // at the top of this function is detached now.
+  const statusEl = $('#nb-runall-status', view);
+  if (statusEl) {
+    statusEl.textContent = entry.kind === 'replace' || entry.kind === 'append'
+      ? 'Undid the last Apply.' : 'Undid the last change.';
   }
 }
 

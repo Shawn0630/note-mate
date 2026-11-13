@@ -23,7 +23,6 @@ export const MD_QUICK_ACTIONS = [
   { id: 'link', label: 'Link', title: 'Insert link' },
   { id: 'date', label: 'Date', title: "Insert today's date" },
   { id: 'anchor', label: 'Page anchor', title: 'Insert anchor for the current page' },
-  { id: 'screenshot', label: 'Screenshot', title: 'Drag to select a region of the page to capture' },
 ];
 
 export function mdQuickSnippet(action, before = '', after = '', opts = {}) {
