@@ -2997,12 +2997,19 @@ function renderNotebookPane() {
       tab.textContent = n.name;
       if (n.kind === 'md') tab.title = 'Double-click to rename';
     }
-    if (n.kind === 'md' && n.name !== 'notes.md') {
-      // AV-style two-click delete: first click arms, second confirms.
+    // AV-style two-click delete: first click arms, second confirms.
+    // Markdown notes AND owned notebooks (.ipynb, created via the +
+    // menu) both get it — the server DELETE already accepts both kinds
+    // and keeps notes.md protected. Seeded labs are deliberately NOT
+    // here: lab tabs (state.labTabs, .lab-tab) get a plain close ×
+    // instead, which only hides the tab — the lab file stays on disk
+    // and re-opens from the Labs picker.
+    if ((n.kind === 'md' || n.kind === 'ipynb') && n.name !== 'notes.md') {
       const del = document.createElement('span');
       del.className = `tab-close${armedNoteDelete === n.name ? ' armed' : ''}`;
       del.textContent = armedNoteDelete === n.name ? 'Sure?' : '✕';
-      del.title = armedNoteDelete === n.name ? 'Click again to confirm delete' : 'Delete this note';
+      del.title = armedNoteDelete === n.name ? 'Click again to confirm delete'
+        : (n.kind === 'ipynb' ? 'Delete this notebook' : 'Delete this note');
       del.addEventListener('mousedown', () => suppressNoteRenameCommit());
       del.addEventListener('click', (e) => { e.stopPropagation(); armNoteDelete(n.name); });
       tab.appendChild(del);
@@ -3804,7 +3811,6 @@ function renderIpynbBody(body) {
       });
       const ta = $('.nb-code-source', cellEl);
       ta.value = nbCellSource(cell);
-      autoGrowCellEditor(ta);
       ta.addEventListener('input', () => { setNbCellSource(cell, ta.value); autoGrowCellEditor(ta); });
       ta.addEventListener('blur', () => saveNotebook());
       ta.addEventListener('focus', () => { state.editorFocused = true; });
@@ -3884,6 +3890,14 @@ function renderIpynbBody(body) {
   });
   wrap.appendChild(bottomRow);
   updateExportButton(); // restores the button state after a re-render
+  // Fit every cell editor NOW that the cells are in the DOM: measuring
+  // scrollHeight before appendChild returns 0, so the per-cell fit
+  // above could never run at render time — only the input listener
+  // fitted, which is why lab notebooks opened from the picker (whose
+  // cells arrive with multi-line content) stayed at the ~88px CSS
+  // minimum with an inner scrollbar. Cells in a hidden pane measure
+  // 0 and are re-fit by applyReaderLayout when the pane reappears.
+  fitCellEditors();
 }
 
 function outputsFromExecuteResult(result) {

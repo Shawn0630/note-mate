@@ -101,3 +101,15 @@ test('delete: notes.md cannot be deleted (400); missing note is 404; bad name is
   assert.equal((await req('DELETE', '/api/projects/fixture-book/notes/ghost.md')).status, 404);
   assert.equal((await req('DELETE', '/api/projects/fixture-book/notes/bad%20name.md')).status, 400);
 });
+
+test('delete: an owned .ipynb notebook deletes like a note (notes.md stays protected)', async () => {
+  const nb = JSON.stringify({ cells: [], metadata: {}, nbformat: 4, nbformat_minor: 5 });
+  const put = await req('PUT', '/api/projects/fixture-book/notes/scratch.ipynb', { content: nb });
+  assert.equal(put.status, 200);
+  assert.equal(await exists('scratch.ipynb'), true);
+  const r = await req('DELETE', '/api/projects/fixture-book/notes/scratch.ipynb');
+  assert.equal(r.status, 200);
+  assert.equal(r.json.deleted, 'scratch.ipynb');
+  assert.equal(await exists('scratch.ipynb'), false);
+  assert.deepEqual((await listNotes()).sort(), ['notes.md', 'renamed.md']);
+});
