@@ -1,0 +1,95 @@
+{
+  "sha": "2222222222222222222222222222222222222222",
+  "url": "https://api.github.com/repos/fixture/course-repo/git/trees/main",
+  "tree": [
+    {
+      "path": "001_intro/micrograd.ipynb",
+      "mode": "100644",
+      "type": "blob",
+      "size": 680,
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/repos/fixture/course-repo/git/blobs/0000000000000000000000000000000000000000"
+    },
+    {
+      "path": "001_intro/micrograd_exercises.ipynb",
+      "mode": "100644",
+      "type": "blob",
+      "size": 436,
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/repos/fixture/course-repo/git/blobs/0000000000000000000000000000000000000000"
+    },
+    {
+      "path": "002_makemore/bigram.ipynb",
+      "mode": "100644",
+      "type": "blob",
+      "size": 470,
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/repos/fixture/course-repo/git/blobs/0000000000000000000000000000000000000000"
+    },
+    {
+      "path": "002_makemore/makemore.ipynb",
+      "mode": "100644",
+      "type": "blob",
+      "size": 453,
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/repos/fixture/course-repo/git/blobs/0000000000000000000000000000000000000000"
+    },
+    {
+      "path": "007_gpt/_src/bigram.py",
+      "mode": "100644",
+      "type": "blob",
+      "size": 33,
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/repos/fixture/course-repo/git/blobs/0000000000000000000000000000000000000000"
+    },
+    {
+      "path": "data/names.txt",
+      "mode": "100644",
+      "type": "blob",
+      "size": 21,
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/repos/fixture/course-repo/git/blobs/0000000000000000000000000000000000000000"
+    },
+    {
+      "path": "data/input.txt",
+      "mode": "100644",
+      "type": "blob",
+      "size": 48,
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/repos/fixture/course-repo/git/blobs/0000000000000000000000000000000000000000"
+    },
+    {
+      "path": "README.md",
+      "mode": "100644",
+      "type": "blob",
+      "size": 22,
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/repos/fixture/course-repo/git/blobs/0000000000000000000000000000000000000000"
+    },
+    {
+      "path": "requirements.txt",
+      "mode": "100644",
+      "type": "blob",
+      "size": 37,
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/repos/fixture/course-repo/git/blobs/0000000000000000000000000000000000000000"
+    },
+    {
+      "path": "environment.yml",
+      "mode": "100644",
+      "type": "blob",
+      "size": 116,
+      "sha": "0000000000000000000000000000000000000000",
+      "url": "https://api.github.com/repos/fixture/course-repo/git/blobs/0000000000000000000000000000000000000000"
+    },
+    {
+      "path": "007_gpt/model.pth",
+      "mode": "100644",
+      "type": "blob",
+      "size": 52700258,
+      "sha": "1111111111111111111111111111111111111111",
+      "url": "https://api.github.com/repos/fixture/course-repo/git/blobs/1111111111111111111111111111111111111111"
+    }
+  ],
+  "truncated": false
+}

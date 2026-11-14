@@ -86,6 +86,14 @@ export function normalizeSections(raw) {
         path: n.path,
         ...(typeof n.chapter === 'string' && n.chapter ? { chapter: n.chapter } : {}),
         ...(typeof n.language === 'string' && n.language ? { language: n.language.toLowerCase() } : {}),
+        // Repo-imported notebooks keep their origin: the repo's
+        // on-disk id and the notebook's repo-relative path. The
+        // execute stager needs both to lay out the repo's data files
+        // (dropping them here would silently break `open()` calls).
+        ...(typeof n.repoId === 'string' && /^[a-z0-9][a-z0-9-]*$/.test(n.repoId) ? { repoId: n.repoId } : {}),
+        ...(typeof n.repoPath === 'string' && n.repoPath.toLowerCase().endsWith('.ipynb')
+          && !n.repoPath.startsWith('/') && !n.repoPath.split('/').includes('..')
+          ? { repoPath: n.repoPath } : {}),
       });
     }
     out.push({ id: s.id, name: s.name, notebooks });

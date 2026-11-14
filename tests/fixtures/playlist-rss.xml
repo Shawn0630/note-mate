@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom">
+  <title>Lecture Playlist</title>
+  <entry>
+    <id>yt:video:dQw4w9WgXcQ</id>
+    <yt:videoId>dQw4w9WgXcQ</yt:videoId>
+    <title>Lecture 1: Introduction</title>
+  </entry>
+  <entry>
+    <id>yt:video:9bZkp7q19f0</id>
+    <yt:videoId>9bZkp7q19f0</yt:videoId>
+    <title>Lecture 2: Supervised &amp; Learning</title>
+  </entry>
+  <entry>
+    <id>yt:video:aqz-KE-bpKQ</id>
+    <yt:videoId>aqz-KE-bpKQ</yt:videoId>
+    <title>Lecture 3: Shallow Networks</title>
+  </entry>
+</feed>

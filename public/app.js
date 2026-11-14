@@ -1656,8 +1656,18 @@ function aiMaterialsThreadForSend() {
   return aiMaterialsState.messages.slice(-6).map((m) => {
     if (m.role !== 'assistant' || !m.proposal) return { role: m.role, content: m.content };
     const lines = m.proposal.map((p) => `- ${p.title} (${p.kind}): ${p.url}`).join('\n');
-    return { role: 'assistant', content: `${m.content}\nMaterials proposed:\n${lines}` };
+    const sections = Array.isArray(m.sections) ? m.sections : [];
+    const sectionLines = sections
+      .map((s) => `- ${s.name}: ${s.notebooks.map((n) => n.name).join(', ')}`).join('\n');
+    return {
+      role: 'assistant',
+      content: `${m.content}\nMaterials proposed:\n${lines}${sectionLines ? `\nSections proposed:\n${sectionLines}` : ''}`,
+    };
   });
+}
+
+function sectionNotebookCount(proposal) {
+  return (proposal?.sections ?? []).reduce((n, s) => n + (s.notebooks?.length || 0), 0);
 }
 
 function renderAiMaterialsThread() {
@@ -1685,7 +1695,8 @@ function renderAiMaterialsProposal() {
     if (applyBtn) applyBtn.disabled = true;
     return;
   }
-  if (!proposal.materials.length) {
+  const nbCount = sectionNotebookCount(proposal);
+  if (!proposal.materials.length && !nbCount) {
     const p = document.createElement('p');
     p.className = 'hint';
     p.textContent = proposal.skipped?.length
@@ -1695,37 +1706,83 @@ function renderAiMaterialsProposal() {
     if (applyBtn) applyBtn.disabled = true;
     return;
   }
-  const list = document.createElement('div');
-  list.className = 'ai-proposal-list';
-  proposal.materials.forEach((m) => {
-    const row = document.createElement('div');
-    row.className = 'ai-proposal-row';
-    const name = document.createElement('span');
-    name.className = 'files-row-name';
-    name.textContent = m.title;
-    const tag = document.createElement('span');
-    tag.className = 'files-tag';
-    tag.textContent = kindLabel(m.kind);
-    const link = document.createElement('a');
-    link.className = 'ai-proposal-url';
-    link.href = m.url;
-    link.target = '_blank';
-    link.rel = 'noopener';
-    link.textContent = m.url;
-    row.append(name, tag, link);
-    list.appendChild(row);
+  if (proposal.materials.length) {
+    const list = document.createElement('div');
+    list.className = 'ai-proposal-list';
+    proposal.materials.forEach((m) => {
+      const row = document.createElement('div');
+      row.className = 'ai-proposal-row';
+      const name = document.createElement('span');
+      name.className = 'files-row-name';
+      name.textContent = m.title;
+      const tag = document.createElement('span');
+      tag.className = 'files-tag';
+      tag.textContent = kindLabel(m.kind);
+      const link = document.createElement('a');
+      link.className = 'ai-proposal-url';
+      link.href = m.url;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.textContent = m.url;
+      row.append(name, tag, link);
+      list.appendChild(row);
+    });
+    host.appendChild(list);
+  }
+  // Sections (repo notebooks, right pane): one block per section,
+  // each notebook as a row with its file name.
+  (proposal.sections ?? []).forEach((section) => {
+    const sec = document.createElement('div');
+    sec.className = 'ai-proposal-section';
+    const head = document.createElement('div');
+    head.className = 'ai-proposal-section-name';
+    head.textContent = `${section.name} — ${section.notebooks.length} notebook${section.notebooks.length === 1 ? '' : 's'}`;
+    sec.appendChild(head);
+    section.notebooks.forEach((nb) => {
+      const row = document.createElement('div');
+      row.className = 'ai-proposal-row ai-proposal-nb-row';
+      const name = document.createElement('span');
+      name.className = 'files-row-name';
+      name.textContent = nb.name;
+      const tag = document.createElement('span');
+      tag.className = 'files-tag';
+      tag.textContent = 'notebook';
+      row.append(name, tag);
+      sec.appendChild(row);
+    });
+    host.appendChild(sec);
   });
-  host.appendChild(list);
+  // Repos: what each repo contributes (packages from its manifests,
+  // support files, skipped files).
+  (proposal.repos ?? []).filter((r) => !r.error).forEach((repo) => {
+    const bits = [`${repo.owner}/${repo.repo}: ${repo.notebookCount} notebook${repo.notebookCount === 1 ? '' : 's'}`];
+    if (repo.packages?.length) bits.push(`needs ${repo.packages.join(', ')}`);
+    if (repo.supportFileCount) bits.push(`${repo.supportFileCount} support file${repo.supportFileCount === 1 ? '' : 's'}`);
+    if (repo.skippedCount) bits.push(`${repo.skippedCount} skipped (too large / binary)`);
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = bits.join(' · ');
+    host.appendChild(p);
+  });
+  // Missing Python packages: installed into the container at Apply.
+  if (proposal.missingPackages?.length) {
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = `Will install: ${proposal.missingPackages.map((m) => m.package).join(', ')} (missing Python packages)`;
+    host.appendChild(p);
+  }
   if (applyBtn) {
+    const counts = [];
+    if (proposal.materials.length) counts.push(`${proposal.materials.length} material${proposal.materials.length === 1 ? '' : 's'}`);
+    if (nbCount) counts.push(`${nbCount} notebook${nbCount === 1 ? '' : 's'}`);
     applyBtn.disabled = !!proposal.applied;
-    applyBtn.textContent = proposal.applied
-      ? 'Applied ✓'
-      : `Apply — add ${proposal.materials.length} material${proposal.materials.length === 1 ? '' : 's'}`;
+    applyBtn.textContent = proposal.applied ? 'Applied ✓' : `Apply — add ${counts.join(' + ')}`;
   }
   if (statusEl && !proposal.applied) {
     const bits = [];
     if (proposal.dropped) bits.push(`${proposal.dropped} dropped (invalid URL)`);
     if (proposal.skipped?.length) bits.push(`${proposal.skipped.length} already in the project`);
+    if (proposal.sectionsSkipped?.length) bits.push(`${proposal.sectionsSkipped.length} notebook${proposal.sectionsSkipped.length === 1 ? '' : 's'} already in the project`);
     statusEl.textContent = bits.join(' · ');
   }
 }
@@ -1795,17 +1852,25 @@ async function sendAiMaterialsMessage() {
       { messages: aiMaterialsThreadForSend() },
     );
     const materials = Array.isArray(data?.materials) ? data.materials : [];
+    const sections = Array.isArray(data?.sections) ? data.sections : [];
+    const repos = Array.isArray(data?.repos) ? data.repos : [];
+    const missingPackages = Array.isArray(data?.missingPackages) ? data.missingPackages : [];
+    const nbCount = sections.reduce((n, s) => n + (s.notebooks?.length || 0), 0);
     const note = typeof data?.note === 'string' && data.note.trim() ? data.note.trim() : '';
     const assistantText = note
-      || (materials.length
-        ? `Proposed ${materials.length} material${materials.length === 1 ? '' : 's'}.`
+      || (materials.length || nbCount
+        ? `Proposed ${materials.length} material${materials.length === 1 ? '' : 's'}${nbCount ? ` + ${nbCount} notebook${nbCount === 1 ? '' : 's'}` : ''}.`
         : 'No usable materials proposed.');
-    aiMaterialsState.messages.push({ role: 'assistant', content: assistantText, proposal: materials });
+    aiMaterialsState.messages.push({ role: 'assistant', content: assistantText, proposal: materials, sections });
     // A new proposal replaces the pending one — only the latest applies.
     aiMaterialsState.proposal = {
       materials,
+      sections,
+      repos,
+      missingPackages,
       dropped: data?.dropped || 0,
       skipped: Array.isArray(data?.skipped) ? data.skipped : [],
+      sectionsSkipped: Array.isArray(data?.sectionsSkipped) ? data.sectionsSkipped : [],
       note,
       applied: false,
     };
@@ -1823,9 +1888,10 @@ async function sendAiMaterialsMessage() {
 
 async function applyAiMaterialsProposal() {
   const overlay = document.getElementById('ai-materials-modal');
-  if (!overlay || !aiMaterialsState?.proposal?.materials?.length) return;
+  if (!overlay || !aiMaterialsState?.proposal) return;
   const proposal = aiMaterialsState.proposal;
   if (proposal.applied) return;
+  if (!proposal.materials?.length && !sectionNotebookCount(proposal)) return;
   const applyBtn = $('#ai-materials-apply', overlay);
   const statusEl = $('#ai-materials-apply-status', overlay);
   const errBox = $('#ai-materials-error', overlay);
@@ -1835,12 +1901,37 @@ async function applyAiMaterialsProposal() {
     const data = await apiJson(
       `/api/projects/${encodeURIComponent(aiMaterialsState.slug)}/materials/ai/apply`,
       'POST',
-      { materials: proposal.materials },
+      {
+        materials: proposal.materials,
+        sections: proposal.sections,
+        repos: (proposal.repos ?? []).filter((r) => !r.error)
+          .map((r) => ({ owner: r.owner, repo: r.repo, branch: r.branch })),
+        missingPackages: proposal.missingPackages,
+      },
     );
     const added = Array.isArray(data?.added) ? data.added : [];
     const skipped = Array.isArray(data?.skipped) ? data.skipped : [];
+    const nbAdded = (data?.sections ?? []).reduce((n, s) => n + (s.added?.length || 0), 0);
+    const nbSkipped = (data?.sectionsSkipped ?? []).length;
+    const sfAdded = data?.supportFiles?.added?.length || 0;
+    const sfSkipped = data?.supportFiles?.skipped?.length || 0;
+    const installed = (data?.installs ?? []).filter((i) => i.ok);
+    const failedInstalls = (data?.installs ?? []).filter((i) => !i.ok);
     proposal.applied = true;
-    statusEl.textContent = `${added.length} added${skipped.length ? ` · ${skipped.length} skipped (already in the project)` : ''}`;
+    const bits = [];
+    if (added.length) bits.push(`${added.length} material${added.length === 1 ? '' : 's'} added`);
+    if (skipped.length) bits.push(`${skipped.length} already in the project`);
+    if (nbAdded) bits.push(`${nbAdded} notebook${nbAdded === 1 ? '' : 's'} added`);
+    if (nbSkipped) bits.push(`${nbSkipped} notebook${nbSkipped === 1 ? '' : 's'} skipped`);
+    if (sfAdded) bits.push(`${sfAdded} support file${sfAdded === 1 ? '' : 's'}`);
+    if (sfSkipped) bits.push(`${sfSkipped} support file${sfSkipped === 1 ? '' : 's'} skipped`);
+    if (installed.length) bits.push(`installed ${installed.map((i) => i.package).join(', ')}`);
+    if (failedInstalls.length) {
+      bits.push(`could not install ${failedInstalls.map((i) => i.package).join(', ')}`);
+      errBox.textContent = failedInstalls
+        .map((i) => `${i.package}: ${(i.error || 'install failed').slice(0, 200)}`).join(' — ');
+    }
+    statusEl.textContent = bits.join(' · ') || 'Nothing new added.';
     renderAiMaterialsProposal();
     // Refresh the Materials list behind the modal (the modal itself is
     // body-level, so the re-render leaves it open for follow-ups).
@@ -1848,7 +1939,11 @@ async function applyAiMaterialsProposal() {
   } catch (err) {
     errBox.textContent = err.message;
     applyBtn.disabled = false;
-    applyBtn.textContent = `Apply — add ${proposal.materials.length} material${proposal.materials.length === 1 ? '' : 's'}`;
+    const counts = [];
+    if (proposal.materials?.length) counts.push(`${proposal.materials.length} material${proposal.materials.length === 1 ? '' : 's'}`);
+    const nbCount = sectionNotebookCount(proposal);
+    if (nbCount) counts.push(`${nbCount} notebook${nbCount === 1 ? '' : 's'}`);
+    applyBtn.textContent = `Apply — add ${counts.join(' + ')}`;
   }
 }
 
@@ -3065,6 +3160,26 @@ async function loadVideo(materialId) {
    endpoint when it answers within 3s, else "YouTube video"). The server
    validates the URL and extracts the video id; a non-YouTube URL is
    rejected there and the error is shown in the status line. */
+/* A playlist URL is `youtube.com/playlist?list=…` or a watch URL with
+   a `list` param but no `v` param (same rule as the server) — a watch
+   URL that names a video is a single video, not the playlist. */
+function extractPlaylistId(rawUrl) {
+  let s = String(rawUrl ?? '').trim();
+  if (!s) return null;
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = `https://${s}`;
+  let u;
+  try { u = new URL(s); } catch { return null; }
+  const host = u.hostname.toLowerCase();
+  if (host !== 'youtube.com' && !host.endsWith('.youtube.com')
+    && host !== 'youtube-nocookie.com' && !host.endsWith('.youtube-nocookie.com')) return null;
+  const list = u.searchParams.get('list') || '';
+  if (!/^PL[A-Za-z0-9_-]{10,}$/.test(list)) return null;
+  const segments = u.pathname.split('/').filter(Boolean);
+  if (segments[0] === 'playlist') return list;
+  if (segments[0] === 'watch' && !u.searchParams.get('v')) return list;
+  return null;
+}
+
 async function promptAddYoutube({ manage = false } = {}) {
   const url = window.prompt('YouTube video URL');
   if (url == null) return;
@@ -3076,6 +3191,13 @@ async function promptAddYoutube({ manage = false } = {}) {
     else setSaveStatus(msg, 'error');
   };
   if (!/youtu\.?be/i.test(trimmed)) { notYoutube(); return; }
+  // A playlist URL expands server-side and adds all its videos at
+  // once, with real titles — no per-video title prompt.
+  if (extractPlaylistId(trimmed)) {
+    if (manage) await manageAddPlaylist(trimmed);
+    else await addPlaylistMaterial(trimmed);
+    return;
+  }
   let title = 'YouTube video';
   try {
     const ctrl = new AbortController();
@@ -3102,6 +3224,40 @@ async function manageAddYoutube(url, label) {
   } catch (err) {
     const el = $('#manage-material-status', view);
     if (el) el.textContent = err.message;
+  }
+}
+
+function playlistAddStatus(data) {
+  const added = Array.isArray(data?.added) ? data.added.length : 0;
+  const skipped = Array.isArray(data?.skipped) ? data.skipped.length : 0;
+  const bits = [`Added ${added} video${added === 1 ? '' : 's'} from the playlist`];
+  if (data?.truncated && typeof data?.total === 'number') bits[0] += ` (first ${added} of ${data.total})`;
+  if (skipped) bits.push(`${skipped} already in the project`);
+  return `${bits.join(' · ')}.`;
+}
+
+async function manageAddPlaylist(url) {
+  try {
+    const data = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/materials/playlist`, 'POST', { url });
+    await renderManagePage(state.project.slug);
+    setManageStatus(playlistAddStatus(data));
+  } catch (err) {
+    const el = $('#manage-material-status', view);
+    if (el) el.textContent = err.message;
+  }
+}
+
+async function addPlaylistMaterial(url) {
+  try {
+    const data = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/materials/playlist`, 'POST', { url });
+    const materials = await apiGet(`/api/projects/${encodeURIComponent(state.project.slug)}/materials`);
+    state.materials = Array.isArray(materials) ? materials : [];
+    syncDeckPicker();
+    syncPdfPicker();
+    syncVideoPicker();
+    setSaveStatus(`${playlistAddStatus(data)} Open them from the picker.`);
+  } catch (err) {
+    setSaveStatus(err.message, 'error');
   }
 }
 
@@ -6301,18 +6457,27 @@ function renderMdPreview(el, text) {
   });
 }
 
-async function runCode(language, code) {
-  return apiJson('/api/execute', 'POST', { language, code });
+/* The notebook context ({slug, path}) lets a Python run stage the
+   repo files of a GitHub-imported notebook; omitted for markdown code
+   blocks and for notebooks without one. */
+function notebookExecuteContext() {
+  if (state.activeNoteKind !== 'ipynb') return null;
+  return { slug: state.project.slug, path: notebookPath() };
+}
+
+async function runCode(language, code, notebook) {
+  const body = { language, code };
+  if (notebook) body.notebook = notebook;
+  return apiJson('/api/execute', 'POST', body);
 }
 
 /* Run cells 0..N in one shared session; returns {results: [...]} aligned
    with the submitted cells. A cell that raises stops the run; later
    results carry skipped: true. */
-async function runCells(language, sources) {
-  return apiJson('/api/execute', 'POST', {
-    language,
-    cells: sources.map((source) => ({ source })),
-  });
+async function runCells(language, sources, notebook) {
+  const body = { language, cells: sources.map((source) => ({ source })) };
+  if (notebook) body.notebook = notebook;
+  return apiJson('/api/execute', 'POST', body);
 }
 
 /* Render {stdout, stderr, exitCode, images} into HTML. */
@@ -6579,7 +6744,7 @@ async function runNotebookCells(list, statusEl) {
   btns.forEach((b) => { b.disabled = true; });
   if (statusEl) statusEl.textContent = 'Running…';
   try {
-    const { results } = await runCells(lang, list.map(({ cell }) => nbCellSource(cell)));
+    const { results } = await runCells(lang, list.map(({ cell }) => nbCellSource(cell)), notebookExecuteContext());
     let ran = 0;
     let failed = null;
     list.forEach(({ nbIndex, cell }, k) => {
@@ -6736,7 +6901,7 @@ function renderIpynbBody(body) {
         btn.textContent = 'Running…';
         status.textContent = '';
         try {
-          const result = await runCode(lang, nbCellSource(cell));
+          const result = await runCode(lang, nbCellSource(cell), notebookExecuteContext());
           cell.outputs = outputsFromExecuteResult(result);
           cell.execution_count = ++state.execCounter;
           renderCellOutputs($(`[data-cell-output="${idx}"]`, cellEl), cell);

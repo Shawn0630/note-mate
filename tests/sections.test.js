@@ -108,6 +108,21 @@ test('normalizeSections: drops malformed sections and entries', () => {
   assert.equal(out[0].notebooks[0].language, 'python'); // lowercased
 });
 
+test('normalizeSections: keeps a repo-imported notebook\'s origin, drops a bad one', () => {
+  const out = normalizeSections([
+    { id: 's1', name: 'S1', notebooks: [
+      { name: 'a.ipynb', path: 'notes/sections/s1/a.ipynb', repoId: 'fixture-course-repo', repoPath: '001_intro/a.ipynb' },
+      { name: 'b.ipynb', path: 'notes/sections/s1/b.ipynb', repoId: 'BAD ID', repoPath: '../escape.ipynb' },
+      { name: 'c.ipynb', path: 'notes/sections/s1/c.ipynb', repoPath: 'data/names.txt' },
+    ] },
+  ]);
+  assert.equal(out[0].notebooks[0].repoId, 'fixture-course-repo');
+  assert.equal(out[0].notebooks[0].repoPath, '001_intro/a.ipynb');
+  assert.equal(out[0].notebooks[1].repoId, undefined);
+  assert.equal(out[0].notebooks[1].repoPath, undefined);
+  assert.equal(out[0].notebooks[2].repoPath, undefined);
+});
+
 test('nextSectionName and sectionIdFor', () => {
   assert.equal(nextSectionName([]), 'Section 1');
   assert.equal(nextSectionName([{ name: 'Section 1' }, { name: 'Labs' }]), 'Section 2');

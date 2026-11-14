@@ -1180,6 +1180,9 @@ input[type="text"].note-tab-input {
 .ai-proposal-list { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; }
 .ai-proposal-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .ai-proposal-url { font-size: 12.5px; color: var(--ink-soft); word-break: break-all; }
+.ai-proposal-section { margin: 10px 0 6px; }
+.ai-proposal-section-name { font-weight: 600; font-size: 13.5px; margin-bottom: 4px; }
+.ai-proposal-nb-row { padding-left: 12px; }
 /* The apply status is information ("2 added"), not an error — it must not
    wear the red .form-error colour. Errors go to #ai-materials-error. */
 #ai-materials-apply-status { color: var(--ink-soft); }

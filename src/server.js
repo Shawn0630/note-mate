@@ -17,8 +17,21 @@ import { proposeProjectData, LLM_NOT_CONFIGURED, listModels, isAllowedModel } fr
 import { validateProposal } from './aiImport.js';
 import {
   proposeMaterials, validateMaterialsProposal, normalizeMaterialsProposal,
-  dedupeMaterials,
+  normalizeSectionsProposal, validateSectionsProposal,
+  dedupeMaterials, dedupeSectionsByRepoPath,
 } from './aiMaterials.js';
+import {
+  expandPlaylist, extractPlaylistId,
+} from './playlist.js';
+import {
+  fetchRepoTree, selectRepoFiles, rawUrlFor, validateSectionNotebookUrl,
+  fetchTextCapped, repoIdFor,
+  MAX_NOTEBOOK_BYTES, MAX_SUPPORT_FILE_BYTES,
+} from './repoIngest.js';
+import {
+  checkImportable, pipInstall, recordInstalledPackages,
+  ensureRecordedPackages,
+} from './pyPackages.js';
 import {
   generateAiNote, resolveChapterRange, resolvePageRange, extractChapterSection,
   MAX_AI_NOTE_PROMPT_CHARS, MAX_AI_NOTE_HISTORY_MESSAGES,
@@ -59,7 +72,11 @@ export const DATA_DIR = path.resolve(process.env.DATA_DIR || 'data');
 export const PORT = Number(process.env.PORT || 9300);
 
 const MAX_CODE_BYTES = 200 * 1024; // ~200KB cap on /api/execute code
-const EXEC_TIMEOUT_MS = 30_000;
+// Execute timeout: 10 minutes (2026-11-13 — repo notebooks train for
+// minutes on CPU; the old 30s cut them off). Applies to single-cell
+// and cells mode, all three languages. The client fetch has no
+// timeout of its own, so a long run just takes a while.
+const EXEC_TIMEOUT_MS = 600_000;
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 // Run-all (cells) mode: one shared session, so the caps are per batch.
 const MAX_RUN_ALL_CELLS = 200;
@@ -793,12 +810,17 @@ app.post('/api/projects/:slug/materials/ai/propose', async (req, res, next) => {
     }
     const project = await readProject(req.params.slug);
     let rawProposal;
+    let sources;
     try {
-      rawProposal = await proposeMaterials({
+      ({ proposal: rawProposal, sources } = await proposeMaterials({
         projectTitle: project.title,
         existing: project.materials ?? [],
         messages: cleanMessages,
-      });
+        ytPageBase: process.env.NM_YT_PAGE_BASE || undefined,
+        ytRssBase: process.env.NM_YT_RSS_BASE || undefined,
+        apiBase: process.env.NM_GITHUB_API_BASE || undefined,
+        rawBase: process.env.NM_GITHUB_RAW_BASE || undefined,
+      }));
     } catch (err) {
       if (err.code === LLM_NOT_CONFIGURED) {
         return res.status(503).json({ error: 'LLM not configured', hint: err.hint });
@@ -808,47 +830,310 @@ app.post('/api/projects/:slug/materials/ai/propose', async (req, res, next) => {
       }
       throw err;
     }
-    const { materials, dropped, note } = normalizeMaterialsProposal(rawProposal);
-    const { added, skipped } = dedupeMaterials(project.materials ?? [], materials);
-    res.json({ materials: added, dropped, skipped, note });
+    const { materials, dropped: modelDropped, note } = normalizeMaterialsProposal(rawProposal);
+    // Dependency manifests become link materials (raw URLs) — they
+    // must be visible to the user, not silently dropped.
+    const manifestMaterials = [];
+    for (const repo of sources.repos) {
+      if (repo.error) continue;
+      for (const manifest of repo.manifests) {
+        manifestMaterials.push({
+          title: `${manifest.path.split('/').pop()} (${repo.owner}/${repo.repo})`,
+          kind: 'link',
+          url: rawUrlFor(repo, manifest.path, process.env.NM_GITHUB_RAW_BASE || undefined),
+        });
+      }
+    }
+    const combined = normalizeMaterialsProposal({
+      materials: [...manifestMaterials, ...materials], note,
+    });
+    const { added, skipped } = dedupeMaterials(project.materials ?? [], combined.materials);
+    // Sections: notebook URLs are validated against the declared
+    // repos, then notebooks already in the project (same repo file
+    // anywhere) are dropped.
+    const declaredRepos = sources.repos
+      .filter((r) => !r.error)
+      .map((r) => ({ owner: r.owner, repo: r.repo, branch: r.branch }));
+    const { sections, dropped: sectionsDropped } = normalizeSectionsProposal(
+      rawProposal, declaredRepos, { rawBase: process.env.NM_GITHUB_RAW_BASE || undefined },
+    );
+    const dedupedSections = dedupeSectionsByRepoPath(getSections(project), sections);
+    let responseNote = note;
+    const failures = [
+      ...sources.playlists.filter((p) => p.error).map((p) => `${p.url}: ${p.error}`),
+      ...sources.repos.filter((r) => r.error).map((r) => `${r.url}: ${r.error}`),
+    ];
+    if (failures.length) {
+      const suffix = `Could not load: ${failures.join('; ')}`;
+      responseNote = responseNote ? `${responseNote} ${suffix}` : suffix;
+    }
+    // A repo that loads but holds no notebooks says so — otherwise the
+    // empty proposal looks like a silent failure.
+    const emptyRepos = sources.repos.filter((r) => !r.error && !r.notebooks.length);
+    if (emptyRepos.length) {
+      const suffix = emptyRepos.map((r) => `${r.owner}/${r.repo}: no .ipynb files found`).join('; ');
+      responseNote = responseNote ? `${responseNote} ${suffix}` : suffix;
+    }
+    res.json({
+      materials: added,
+      dropped: modelDropped + combined.dropped + sectionsDropped,
+      skipped,
+      sections: dedupedSections.sections,
+      sectionsSkipped: dedupedSections.skipped,
+      repos: sources.repos.map((r) => ({
+        owner: r.owner, repo: r.repo, branch: r.branch, url: r.url,
+        notebookCount: r.notebooks.length, manifestCount: r.manifests.length,
+        supportFileCount: r.supportFiles.length, packages: r.packages,
+        skippedCount: r.skippedCount, error: r.error || null,
+      })),
+      missingPackages: sources.missingPackages,
+      note: responseNote,
+    });
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
     next(err);
   }
 });
 
+/** Append material entries to a project object (in-memory; the caller
+    persists with writeProject). Returns {created, skipped}. */
+function appendMaterialsToProject(project, entries) {
+  const { added, skipped } = dedupeMaterials(project.materials ?? [], entries);
+  const existing = new Set((project.materials ?? []).map((m) => m.id));
+  const created = [];
+  for (const entry of added) {
+    const base = slugify(entry.title) || (entry.kind === 'video' ? 'video' : 'link');
+    let id = base;
+    for (let n = 2; existing.has(id); n++) id = `${base}-${n}`;
+    existing.add(id);
+    const stored = entry.kind === 'video'
+      ? {
+        id, label: entry.title, kind: 'video', url: entry.url,
+        videoId: extractYoutubeVideoId(entry.url),
+      }
+      : { id, label: entry.title, kind: 'link', url: entry.url };
+    project.materials = [...(project.materials ?? []), stored];
+    created.push(stored);
+  }
+  return { created, skipped };
+}
+
 app.post('/api/projects/:slug/materials/ai/apply', async (req, res, next) => {
   try {
-    const { materials } = req.body ?? {};
-    let proposal;
+    const { materials, sections, repos, missingPackages } = req.body ?? {};
+    const rawMaterials = Array.isArray(materials) ? materials : [];
+    const rawSections = Array.isArray(sections) ? sections : [];
+    if (!rawMaterials.length && !rawSections.length) {
+      return res.status(400).json({ error: 'proposal must have materials or sections' });
+    }
+    let proposalMaterials = [];
+    if (rawMaterials.length) {
+      try {
+        proposalMaterials = validateMaterialsProposal({ materials: rawMaterials }).materials;
+      } catch (err) {
+        return res.status(400).json({ error: err.message });
+      }
+    }
+    const declaredRepos = Array.isArray(repos) ? repos : [];
+    for (const [i, r] of declaredRepos.entries()) {
+      if (!r || typeof r.owner !== 'string' || !r.owner || typeof r.repo !== 'string' || !r.repo
+        || typeof r.branch !== 'string' || !r.branch) {
+        return res.status(400).json({ error: `repos[${i}] needs owner, repo and branch` });
+      }
+    }
+    const cleanMissing = Array.isArray(missingPackages) ? missingPackages : [];
+    for (const [i, m] of cleanMissing.entries()) {
+      if (!m || typeof m.package !== 'string' || !m.package
+        || typeof m.importName !== 'string' || !m.importName) {
+        return res.status(400).json({ error: `missingPackages[${i}] needs importName and package` });
+      }
+    }
+    let cleanSections = [];
     try {
-      proposal = validateMaterialsProposal({ materials });
+      cleanSections = validateSectionsProposal(
+        { sections: rawSections }, declaredRepos,
+        { rawBase: process.env.NM_GITHUB_RAW_BASE || undefined },
+      );
     } catch (err) {
       return res.status(400).json({ error: err.message });
     }
     const project = await readProject(req.params.slug);
-    const { added, skipped } = dedupeMaterials(project.materials ?? [], proposal.materials);
-    const existing = new Set((project.materials ?? []).map((m) => m.id));
-    const created = [];
-    for (const entry of added) {
-      const base = slugify(entry.title) || (entry.kind === 'video' ? 'video' : 'link');
-      let id = base;
-      for (let n = 2; existing.has(id); n++) id = `${base}-${n}`;
-      existing.add(id);
-      const stored = entry.kind === 'video'
-        ? {
-          id, label: entry.title, kind: 'video', url: entry.url,
-          videoId: extractYoutubeVideoId(entry.url),
+    const { created, skipped } = appendMaterialsToProject(project, proposalMaterials);
+
+    // ---- sections + notebooks: download the real .ipynb bytes from
+    // raw.githubusercontent.com (URL validated against the declared
+    // repos), parse-validate them, and write them through the same
+    // storage as the section-notebook upload path. A notebook that
+    // fails to download or parse is skipped and reported, never
+    // written. ----
+    const sectionsResult = [];
+    const sectionsSkipped = [];
+    let sectionsChanged = false;
+    const projectSections = getSections(project);
+    for (const proposed of cleanSections) {
+      let section = projectSections.find((s) => slugify(s.name) === slugify(proposed.name));
+      if (!section) {
+        section = { id: sectionIdFor(proposed.name, projectSections), name: proposed.name, notebooks: [] };
+        projectSections.push(section);
+        sectionsChanged = true;
+      }
+      const addedNames = [];
+      const skippedHere = [];
+      for (const nb of proposed.notebooks) {
+        const existingEntry = section.notebooks.find(
+          (n) => n.name === nb.name || (n.repoPath && n.repoPath === nb.repoPath),
+        );
+        if (existingEntry) {
+          skippedHere.push({ name: nb.name, url: nb.url, reason: 'duplicate' });
+          continue;
         }
-        : { id, label: entry.title, kind: 'link', url: entry.url };
-      project.materials = [...(project.materials ?? []), stored];
-      created.push(stored);
+        const relPath = `${SECTION_NOTEBOOKS_DIR}/${section.id}/${nb.name}`;
+        const file = resolveProjectPath(DATA_DIR, req.params.slug, ...relPath.split('/'));
+        if (await fileExists(file)) {
+          skippedHere.push({ name: nb.name, url: nb.url, reason: 'file exists' });
+          continue;
+        }
+        let content;
+        try {
+          content = await fetchTextCapped(nb.url, MAX_NOTEBOOK_BYTES, {});
+        } catch (err) {
+          skippedHere.push({ name: nb.name, url: nb.url, reason: `download failed: ${err.message}` });
+          continue;
+        }
+        let parsed;
+        try {
+          parsed = parseNotebook(content);
+        } catch (err) {
+          skippedHere.push({ name: nb.name, url: nb.url, reason: `not a valid notebook: ${err.message}` });
+          continue;
+        }
+        await fsp.mkdir(path.dirname(file), { recursive: true });
+        await fsp.writeFile(file, JSON.stringify(parsed, null, 2), 'utf8');
+        const language = notebookLanguageOfObject(parsed);
+        section.notebooks.push({
+          name: nb.name, path: relPath,
+          ...(language ? { language } : {}),
+          repoId: nb.repoId, repoPath: nb.repoPath,
+        });
+        addedNames.push(nb.name);
+        sectionsChanged = true;
+      }
+      sectionsResult.push({ id: section.id, name: section.name, added: addedNames, skipped: skippedHere });
+      sectionsSkipped.push(...skippedHere.map((s) => ({ ...s, section: section.name })));
     }
+    if (sectionsChanged) project.sections = projectSections;
+
+    // ---- support files: re-fetch each declared repo's tree and
+    // download its small text/data files (data/*.txt, sibling .py
+    // modules) into repo-files/<repo-id>/, preserving repo-relative
+    // paths. Files already on disk are kept, never re-downloaded. ----
+    const supportFilesAdded = [];
+    const supportFilesSkipped = [];
+    const repoErrors = [];
+    for (const repo of declaredRepos) {
+      let selected;
+      try {
+        const tree = await fetchRepoTree(repo, {
+          apiBase: process.env.NM_GITHUB_API_BASE || undefined,
+        });
+        selected = selectRepoFiles(tree.tree);
+      } catch (err) {
+        repoErrors.push({ owner: repo.owner, repo: repo.repo, branch: repo.branch, error: err.message });
+        continue;
+      }
+      const repoId = repoIdFor(repo);
+      for (const f of selected.supportFiles) {
+        const dest = resolveProjectPath(DATA_DIR, req.params.slug, 'repo-files', repoId, ...f.path.split('/'));
+        if (await fileExists(dest)) {
+          supportFilesSkipped.push({ repo: `${repo.owner}/${repo.repo}`, path: f.path, reason: 'already present' });
+          continue;
+        }
+        try {
+          const content = await fetchTextCapped(
+            rawUrlFor(repo, f.path, process.env.NM_GITHUB_RAW_BASE || undefined),
+            MAX_SUPPORT_FILE_BYTES, {},
+          );
+          await fsp.mkdir(path.dirname(dest), { recursive: true });
+          await fsp.writeFile(dest, content, 'utf8');
+          supportFilesAdded.push({ repo: `${repo.owner}/${repo.repo}`, path: f.path });
+        } catch (err) {
+          supportFilesSkipped.push({ repo: `${repo.owner}/${repo.repo}`, path: f.path, reason: `download failed: ${err.message}` });
+        }
+      }
+    }
+
+    // ---- Python packages: re-check the imports the proposal found
+    // missing, pip-install what is still missing, record every
+    // success durably. An install failure never fails the apply. ----
+    let installs = [];
+    if (cleanMissing.length) {
+      let toInstall = cleanMissing;
+      try {
+        const present = await checkImportable(cleanMissing.map((m) => m.importName));
+        toInstall = cleanMissing.filter((m) => present.get(m.importName) !== true);
+      } catch {
+        toInstall = cleanMissing; // check failed — install what's listed
+      }
+      if (toInstall.length) {
+        installs = await pipInstall(toInstall);
+        const succeeded = installs.filter((r) => r.ok);
+        if (succeeded.length) {
+          await recordInstalledPackages(DATA_DIR, succeeded);
+        }
+      }
+    }
+
+    if (created.length || sectionsChanged) await writeProject(req.params.slug, project);
+    const listed = await listMaterials(req.params.slug, project);
+    res.status(201).json({
+      added: created.map((c) => listed.find((m) => m.id === c.id) || c),
+      skipped,
+      sections: sectionsResult,
+      sectionsSkipped,
+      supportFiles: { added: supportFilesAdded, skipped: supportFilesSkipped },
+      installs,
+      repos: declaredRepos.map((r) => ({
+        ...r,
+        error: repoErrors.find((e) => e.owner === r.owner && e.repo === r.repo)?.error || null,
+      })),
+    });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// Manual playlist add (+ Add YouTube with a playlist URL): expand the
+// playlist server-side and add all its videos at once, with real
+// titles. A single-video URL is NOT handled here — the normal
+// POST /materials flow covers it.
+app.post('/api/projects/:slug/materials/playlist', async (req, res, next) => {
+  try {
+    const { url } = req.body ?? {};
+    const playlistId = extractPlaylistId(typeof url === 'string' ? url : '');
+    if (!playlistId) return res.status(400).json({ error: 'not a YouTube playlist URL' });
+    let expanded;
+    try {
+      expanded = await expandPlaylist(playlistId, {
+        pageBase: process.env.NM_YT_PAGE_BASE || undefined,
+        rssBase: process.env.NM_YT_RSS_BASE || undefined,
+      });
+    } catch (err) {
+      return res.status(err.status || 502).json({ error: err.message });
+    }
+    const project = await readProject(req.params.slug);
+    const entries = expanded.videos.map((v) => ({
+      title: v.title, kind: 'video', url: `https://www.youtube.com/watch?v=${v.videoId}`,
+    }));
+    const { created, skipped } = appendMaterialsToProject(project, entries);
     if (created.length) await writeProject(req.params.slug, project);
     const listed = await listMaterials(req.params.slug, project);
     res.status(201).json({
       added: created.map((c) => listed.find((m) => m.id === c.id) || c),
       skipped,
+      total: expanded.total,
+      truncated: expanded.truncated,
+      source: expanded.source,
     });
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
@@ -2278,16 +2563,76 @@ app.get('/api/projects/:slug/assets/:file', async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Code execution — runs in a fresh temp dir, 30s timeout, dir deleted after.
-// Single-cell mode runs one snippet in isolation. Cells mode (POST
-// /api/execute with {language, cells: [{source}]}) runs cells 0..N in ONE
-// shared session via src/pythonRunner.py / src/jsRunner.mjs, returning
-// per-cell {stdout, stderr, exitCode, images, skipped}; a cell that raises
-// stops the run and later cells are skipped. Java has no cells mode.
-// v1 limitation: no network sandboxing. See README.md.
+// Code execution — runs in a fresh temp dir, 10-minute timeout, dir
+// deleted after. Single-cell mode runs one snippet in isolation. Cells
+// mode (POST /api/execute with {language, cells: [{source}]}) runs cells
+// 0..N in ONE shared session via src/pythonRunner.py / src/jsRunner.mjs,
+// returning per-cell {stdout, stderr, exitCode, images, skipped}; a cell
+// that raises stops the run and later cells are skipped. Java has no
+// cells mode. v1 limitation: no network sandboxing. See README.md.
+//
+// Python runs may carry `notebook: {slug, path}` — the section notebook
+// the cells belong to. When that notebook was imported from a GitHub
+// repo, the repo's support files are staged into the temp dir (see
+// stageNotebookRepoFiles) so relative file reads resolve as in the
+// repo. JavaScript/Java runs ignore the notebook context.
 // ---------------------------------------------------------------------------
 
 const LANGUAGES = new Set(['python', 'java', 'javascript']);
+
+/** Copy a directory tree (src → dest, contents into dest). */
+async function copyTree(src, dest) {
+  await fsp.mkdir(dest, { recursive: true });
+  for (const entry of await fsp.readdir(src, { withFileTypes: true })) {
+    const from = path.join(src, entry.name);
+    const to = path.join(dest, entry.name);
+    if (entry.isDirectory()) await copyTree(from, to);
+    else if (entry.isFile()) await fsp.copyFile(from, to);
+  }
+}
+
+/** Repo-file staging for a Python run: when the executed cells belong
+    to a section notebook imported from a GitHub repo, the repo's
+    support files (data/*.txt, sibling .py modules) are copied into the
+    temp dir at their repo-relative paths, and the run's working
+    directory becomes the notebook's own repo folder — so the
+    notebook's relative open() calls resolve exactly as in the repo
+    (e.g. a notebook in 002_makemore_Bigrams opening
+    '../data/names.txt' finds repo-files/<repo>/data/names.txt).
+    Returns {cwd} (the temp dir itself when there is nothing to
+    stage). Never throws: a staging failure just runs without the
+    files. */
+async function stageNotebookRepoFiles(dir, notebook) {
+  const fallback = { cwd: dir };
+  try {
+    if (!notebook || typeof notebook.slug !== 'string' || typeof notebook.path !== 'string') {
+      return fallback;
+    }
+    const project = await readProject(notebook.slug);
+    const sections = getSections(project);
+    let entry = null;
+    for (const s of sections) {
+      entry = (s.notebooks ?? []).find((n) => n.path === notebook.path && n.repoId && n.repoPath);
+      if (entry) break;
+    }
+    if (!entry) return fallback;
+    const repoDir = resolveProjectPath(DATA_DIR, notebook.slug, 'repo-files', entry.repoId);
+    let stat;
+    try {
+      stat = await fsp.stat(repoDir);
+    } catch {
+      return fallback;
+    }
+    if (!stat.isDirectory()) return fallback;
+    await copyTree(repoDir, dir);
+    const nbDir = path.dirname(entry.repoPath);
+    const cwd = nbDir === '.' ? dir : path.join(dir, nbDir);
+    await fsp.mkdir(cwd, { recursive: true });
+    return { cwd };
+  } catch {
+    return fallback;
+  }
+}
 
 async function runCommand(cmd, args, cwd, env = {}) {
   try {
@@ -2356,10 +2701,20 @@ app.post('/api/execute', async (req, res, next) => {
           JSON.stringify(sources.map((source) => ({ source }))),
           'utf8',
         );
+        // Python runs stage the notebook's repo files and run from the
+        // notebook's repo folder (absolute runner paths, so the staged
+        // CWD does not break the cells/results files).
+        const { cwd } = language === 'python'
+          ? await stageNotebookRepoFiles(dir, req.body?.notebook)
+          : { cwd: dir };
         const runnerName = language === 'python' ? 'pythonRunner.py' : 'jsRunner.mjs';
         const runnerPath = fileURLToPath(new URL(`./${runnerName}`, import.meta.url));
         const cmd = language === 'python' ? 'python3' : 'node';
-        const run = await runCommand(cmd, [runnerPath, 'cells.json', 'results.json'], dir, { MPLBACKEND: 'Agg' });
+        const run = await runCommand(
+          cmd,
+          [runnerPath, path.join(dir, 'cells.json'), path.join(dir, 'results.json')],
+          cwd, { MPLBACKEND: 'Agg' },
+        );
         let parsed;
         try {
           parsed = JSON.parse(await fsp.readFile(path.join(dir, 'results.json'), 'utf8'));
@@ -2391,13 +2746,19 @@ app.post('/api/execute', async (req, res, next) => {
 
     const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'note-mate-exec-'));
     try {
+      // Python runs stage the notebook's repo files and run from the
+      // notebook's repo folder (absolute solution path, so the staged
+      // CWD does not break the file lookup).
+      const { cwd: runCwd } = language === 'python'
+        ? await stageNotebookRepoFiles(dir, req.body?.notebook)
+        : { cwd: dir };
       let result;
       if (language === 'python') {
         await fsp.writeFile(path.join(dir, 'solution.py'), code, 'utf8');
-        result = await runCommand('python3', ['-u', 'solution.py'], dir, { MPLBACKEND: 'Agg' });
+        result = await runCommand('python3', ['-u', path.join(dir, 'solution.py')], runCwd, { MPLBACKEND: 'Agg' });
       } else if (language === 'javascript') {
         await fsp.writeFile(path.join(dir, 'solution.mjs'), code, 'utf8');
-        result = await runCommand('node', ['solution.mjs'], dir);
+        result = await runCommand('node', [path.join(dir, 'solution.mjs')], dir);
       } else {
         await fsp.writeFile(path.join(dir, 'Main.java'), code, 'utf8');
         const compiled = await runCommand('javac', ['Main.java'], dir);
@@ -2407,11 +2768,13 @@ app.post('/api/execute', async (req, res, next) => {
       }
 
       // Collect any PNG files the code wrote (e.g. matplotlib plt.savefig).
+      // A staged Python run writes them to its repo folder (runCwd),
+      // not to the temp dir root.
       const images = [];
       try {
-        const entries = await fsp.readdir(dir);
+        const entries = await fsp.readdir(runCwd);
         for (const name of entries.filter((n) => n.toLowerCase().endsWith('.png')).sort()) {
-          const buf = await fsp.readFile(path.join(dir, name));
+          const buf = await fsp.readFile(path.join(runCwd, name));
           images.push({ data: buf.toString('base64'), mime: 'image/png' });
         }
       } catch {
@@ -2447,6 +2810,20 @@ app.use((err, _req, res, _next) => {
 });
 
 if (process.env.NODE_ENV !== 'test') {
+  // Best-effort reinstall of runtime-installed Python packages: a
+  // plain pip install vanishes on the next `docker compose up -d
+  // --build`, and data/python-packages.json is what survives. Runs in
+  // the background — it never blocks startup or fails it; a package
+  // that still cannot be installed is retried next startup.
+  ensureRecordedPackages(DATA_DIR)
+    .then((result) => {
+      if (!result.checked) return;
+      if (result.installed.length || result.failed.length) {
+        console.log(`Python packages ensured: ${result.installed.length} installed, ${result.failed.length} failed, ${result.alreadyPresent.length} already present`);
+      }
+      for (const f of result.failed) console.warn(`Python package reinstall failed: ${f.package}: ${f.error}`);
+    })
+    .catch((err) => console.warn(`Python package ensure failed: ${err.message}`));
   app.listen(PORT, () => {
     console.log(`Note Mate listening on http://localhost:${PORT} (DATA_DIR=${DATA_DIR})`);
   });
