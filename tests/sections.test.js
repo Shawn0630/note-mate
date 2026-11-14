@@ -11,7 +11,7 @@ process.env.DATA_DIR = tmpData;
 const { default: app } = await import('../src/server.js');
 const {
   buildLabsSection, mergeSections, normalizeSections,
-  nextSectionName, sectionIdFor,
+  nextSectionName, sectionIdFor, scanLabsOnDisk,
 } = await import('../src/sections.js');
 
 let server;
@@ -115,6 +115,27 @@ test('nextSectionName and sectionIdFor', () => {
   assert.equal(sectionIdFor('My Stuff', [{ id: 'my-stuff' }]), 'my-stuff-2');
   assert.equal(sectionIdFor('My Stuff', [{ id: 'my-stuff' }, { id: 'my-stuff-2' }]), 'my-stuff-3');
   assert.equal(sectionIdFor('', []), 'project'); // slugify's empty-input fallback
+});
+
+test('scanLabsOnDisk: .ipynb files per chapter dir, sorted; missing dir reads as none', async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'nm-scan-'));
+  try {
+    await fsp.mkdir(path.join(dir, 'Chap02'), { recursive: true });
+    await fsp.mkdir(path.join(dir, 'Chap01'), { recursive: true });
+    await fsp.writeFile(path.join(dir, 'Chap02', '2_1_X.ipynb'), '{}');
+    await fsp.writeFile(path.join(dir, 'Chap01', '1_2_B.ipynb'), '{}');
+    await fsp.writeFile(path.join(dir, 'Chap01', '1_1_A.ipynb'), '{}');
+    await fsp.writeFile(path.join(dir, 'Chap01', 'readme.txt'), 'not a notebook');
+    await fsp.writeFile(path.join(dir, 'loose.ipynb'), '{}'); // top-level file, not a chapter
+    assert.deepEqual(await scanLabsOnDisk(dir), [
+      { chapter: 'Chap01', name: '1_1_A.ipynb' },
+      { chapter: 'Chap01', name: '1_2_B.ipynb' },
+      { chapter: 'Chap02', name: '2_1_X.ipynb' },
+    ]);
+    assert.deepEqual(await scanLabsOnDisk(path.join(dir, 'no-such-dir')), []);
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
 });
 
 // --- Endpoints ---

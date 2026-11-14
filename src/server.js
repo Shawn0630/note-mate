@@ -46,6 +46,7 @@ import {
   SECTION_NOTEBOOKS_DIR, SECTION_ID_RE,
   SECTION_NOTEBOOK_NAME_RE, SECTION_LANGUAGES,
   normalizeSections, findSection, nextSectionName, sectionIdFor,
+  scanLabsOnDisk, buildLabsSection, mergeSections,
 } from './sections.js';
 
 const execFileAsync = promisify(execFile);
@@ -236,6 +237,28 @@ async function migrateNotesToMaster(slug) {
     return { migrated: 'none' };
   }
   return { migrated: 'none' };
+}
+
+/* Lazy Labs-section backfill (2026-11-13): projects seeded before the
+   sections round carry no `sections[]` in project.json, so the Manage
+   page shows "No sections yet." even though the labs are on disk (the
+   Files directory still lists them via the labs API, which scans disk).
+   On project read, scan notes/labs/ and merge a Labs section in with
+   the same helpers the seed uses (scanLabsOnDisk + buildLabsSection +
+   mergeSections). Never touches user sections or user-added entries
+   inside Labs, never touches notes.md or any other project.json field.
+   A second read after the backfill is a no-op (nothing left to merge).
+   Returns the merged sections array when it wrote, else null.
+   Best-effort — callers swallow errors, never fails the read. */
+async function backfillLabsSection(slug) {
+  const labs = await scanLabsOnDisk(resolveProjectPath(DATA_DIR, slug, 'notes', 'labs'));
+  if (!labs.length) return null;
+  const project = await readProject(slug);
+  const merged = mergeSections(project.sections ?? [], buildLabsSection(labs));
+  if (JSON.stringify(merged) === JSON.stringify(normalizeSections(project.sections ?? []))) return null;
+  project.sections = merged;
+  await writeProject(slug, project);
+  return merged;
 }
 
 function publicProject(project, noteFiles) {
@@ -544,8 +567,18 @@ app.get('/api/projects/:slug', async (req, res, next) => {
     } catch (err) {
       console.warn(`notes migration for ${req.params.slug}: ${err.message}`);
     }
+    // Lazy Labs-section backfill (best-effort, never fails the read):
+    // a pre-sections project gains its Labs section from the labs on
+    // disk the first time it is read; afterwards it is a no-op.
+    let backfilledSections = null;
+    try {
+      backfilledSections = await backfillLabsSection(req.params.slug);
+    } catch (err) {
+      console.warn(`labs backfill for ${req.params.slug}: ${err.message}`);
+    }
     res.json({
       ...project,
+      ...(backfilledSections ? { sections: backfilledSections } : {}),
       materials: project.materials ?? [],
       noteFiles: await listNoteFiles(req.params.slug),
     });

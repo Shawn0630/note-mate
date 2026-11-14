@@ -24,7 +24,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { convertDeck } from '../src/convertDeck.js';
-import { buildLabsSection, mergeSections } from '../src/sections.js';
+import { buildLabsSection, mergeSections, scanLabsOnDisk } from '../src/sections.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -271,30 +271,6 @@ async function downloadLabs(labsDir) {
   console.log(`Labs: ${downloaded} downloaded, ${skipped} already present, ${failed.length} failed`);
   console.log(`Per-chapter counts: ${JSON.stringify(counts)}`);
   return { total: labPaths.length, downloaded, skipped, failed, counts };
-}
-
-/** Labs actually on disk after the download pass: [{chapter, name}].
-    The section lists what is really there, so a partial download or a
-    re-run never advertises a missing file. */
-async function scanLabsOnDisk(labsDir) {
-  const entries = [];
-  let chapters = [];
-  try {
-    chapters = (await fsp.readdir(labsDir, { withFileTypes: true }))
-      .filter((e) => e.isDirectory()).map((e) => e.name).sort();
-  } catch {
-    return entries;
-  }
-  for (const chapter of chapters) {
-    let files = [];
-    try {
-      files = (await fsp.readdir(path.join(labsDir, chapter), { withFileTypes: true }))
-        .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.ipynb'))
-        .map((e) => e.name).sort();
-    } catch { /* no files in this chapter */ }
-    for (const name of files) entries.push({ chapter, name });
-  }
-  return entries;
 }
 
 async function writeIfAbsent(file, content) {

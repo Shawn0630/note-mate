@@ -1,4 +1,6 @@
-// Static-notebook sections for the Management page — pure helpers, no I/O.
+// Static-notebook sections for the Management page — helpers, mostly
+// pure; scanLabsOnDisk is the one fs-backed helper (shared by the seed
+// and the server-side Labs backfill), and never throws.
 // A section is { id, name, notebooks: [{ name, path, chapter?, language? }] }.
 // `path` is project-relative: seeded labs live under notes/labs/<Chapter>/,
 // user-added static notebooks under notes/sections/<section-id>/. `chapter`
@@ -11,6 +13,8 @@
 // structure the UI reads and writes. The Manage page never scans
 // notes/labs/ itself; the Files directory and the lab picker keep their
 // own labs API untouched.
+import fsp from 'node:fs/promises';
+import path from 'node:path';
 import { slugify } from './util.js';
 
 export const LABS_SECTION_ID = 'labs';
@@ -36,6 +40,31 @@ export function buildLabsSection(labFiles) {
       language: 'python',
     })),
   };
+}
+
+/** Labs actually on disk: [{chapter, name}] for .ipynb files under
+    <labsDir>/<Chapter>/. The section lists what is really there, so a
+    partial set of labs never advertises a missing file. Never throws —
+    a missing labs dir reads as no labs. */
+export async function scanLabsOnDisk(labsDir) {
+  const entries = [];
+  let chapters = [];
+  try {
+    chapters = (await fsp.readdir(labsDir, { withFileTypes: true }))
+      .filter((e) => e.isDirectory()).map((e) => e.name).sort();
+  } catch {
+    return entries;
+  }
+  for (const chapter of chapters) {
+    let files = [];
+    try {
+      files = (await fsp.readdir(path.join(labsDir, chapter), { withFileTypes: true }))
+        .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.ipynb'))
+        .map((e) => e.name).sort();
+    } catch { /* no files in this chapter */ }
+    for (const name of files) entries.push({ chapter, name });
+  }
+  return entries;
 }
 
 /** Normalize stored sections: drop malformed sections and entries, keep
