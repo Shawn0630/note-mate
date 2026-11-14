@@ -653,8 +653,25 @@ function manageHintEl(text) {
   return p;
 }
 
-/* Static row: name + tag, no action (source materials and seeded labs). */
-function manageStaticRow(label, tag) {
+/* "Open" link for a Source/Materials row: opens the reader on that source
+   this once (one-shot via pendingOpenSource, consumed in openProject).
+   sourceId is 'book' or a material id; null means plain navigation — the
+   reader opens on its default source. */
+function manageOpenLink(slug, sourceId) {
+  const a = document.createElement('a');
+  a.className = 'manage-link';
+  a.href = `#/project/${encodeURIComponent(slug)}`;
+  a.textContent = 'Open';
+  a.title = 'Open in the reader';
+  a.addEventListener('click', () => {
+    if (sourceId) pendingOpenSource = { slug, sourceId };
+  });
+  return a;
+}
+
+/* Static row: name + tag, no action (source materials and seeded labs).
+   openLink, when given, is an "Open" element appended after the tag. */
+function manageStaticRow(label, tag, openLink) {
   const row = document.createElement('div');
   row.className = 'files-row';
   const name = document.createElement('span');
@@ -667,6 +684,7 @@ function manageStaticRow(label, tag) {
     t.textContent = tag;
     row.appendChild(t);
   }
+  if (openLink) row.appendChild(openLink);
   return row;
 }
 
@@ -801,6 +819,10 @@ function renderManageDom() {
     tag.className = 'files-tag';
     tag.textContent = kindLabel(p.kind);
     row.appendChild(tag);
+    // Open the reader on this source: the book PDF for a PDF project
+    // ('book'), plain navigation for any other kind — the project kind
+    // IS the source there, so the reader opens on it directly.
+    row.appendChild(manageOpenLink(slug, String(p.kind || '').toLowerCase() === 'pdf' ? 'book' : null));
     if (p.file) {
       const dl = document.createElement('a');
       dl.className = 'manage-link';
@@ -821,7 +843,12 @@ function renderManageDom() {
   const mats = state.materials || [];
   if (!mats.length) matsList.appendChild(manageHintEl('No extra materials yet.'));
   mats.forEach((m) => {
-    matsList.appendChild(manageStaticRow(m.label || m.id, kindLabel(m.kind)));
+    // Openable in the reader: a PDF or a slide deck with a file. Anything
+    // else (a download-only material) gets no Open link.
+    const kind = String(m.kind || '').toLowerCase();
+    const openable = (kind === 'pdf' || kind === 'slides') && m.hasFile !== false;
+    matsList.appendChild(manageStaticRow(m.label || m.id, kindLabel(m.kind),
+      openable ? manageOpenLink(slug, m.id) : null));
   });
   const matAdd = $('#manage-materials-add', view);
   const matBtn = document.createElement('button');
@@ -1317,7 +1344,16 @@ async function openProject(slug) {
   renderReaderShell();
   renderChapterPanel();
   await renderReadingPane();
-  await restoreReadingPosition();
+  // Management page → Open link: open the reader on that source this once
+  // (pendingOpenSource is set by the Manage page and consumed here).
+  // Anything else opens on the stored reading position, as before.
+  const openSource = pendingOpenSource?.slug === slug ? pendingOpenSource.sourceId : null;
+  pendingOpenSource = null;
+  if (openSource) {
+    await openReaderSource(openSource);
+  } else {
+    await restoreReadingPosition();
+  }
 }
 
 function renderReaderShell() {
@@ -1603,6 +1639,52 @@ async function restoreReadingPosition() {
     if (!state.pdfDoc) return; // the document failed to load — leave as is
     markPositionEstablished(sourceId);
     scrollBookToPage(storedPageFor(sourceId, state.pdfDoc.numPages), { behavior: 'auto' });
+  } finally {
+    state.restoringPosition = false;
+  }
+}
+
+/* Open the reader on a specific source, from a Management page Open link
+   (one-shot via pendingOpenSource, consumed in openProject). 'book' is the
+   main PDF; a material id is an extra PDF or a slide deck. Lands on the
+   stored page/slide for that source. Anything unresolvable — a source that
+   no longer exists, or a non-PDF project — falls back to the stored
+   reading position, so the project still opens. */
+async function openReaderSource(sourceId) {
+  state.restoringPosition = true;
+  try {
+    if (String(state.project?.kind || '').toLowerCase() !== 'pdf') return;
+    if (!sourceId || sourceId === PAGE_ANCHOR_SOURCE_BOOK) {
+      setLeftTab('pdf');
+      await ensurePdfSourceLoaded(PAGE_ANCHOR_SOURCE_BOOK);
+      if (!state.pdfDoc) return;
+      markPositionEstablished(PAGE_ANCHOR_SOURCE_BOOK);
+      scrollBookToPage(storedPageFor(PAGE_ANCHOR_SOURCE_BOOK, state.pdfDoc.numPages), { behavior: 'auto' });
+      return;
+    }
+    const target = resolveAnchorTarget(sourceId);
+    if (target.target === 'material' && target.kind === 'slides') {
+      // Pre-seed the deck choice so the Slides tab opens on this deck
+      // instead of the chapter's deck (same as restoreReadingPosition).
+      state.deckMaterialId = target.id;
+      state.deckChapter = state.activeChapter ?? null;
+      setLeftTab('slides');
+      await ensureDeckLoaded(target.id);
+      if (state.deckDoc && state.deckMaterialId === target.id) {
+        markPositionEstablished(target.id);
+        scrollDeckToPage(storedPageFor(target.id, state.deckDoc.numPages), { behavior: 'auto' });
+      }
+      return;
+    }
+    if (target.target === 'material' && target.kind === 'pdf') {
+      setLeftTab('pdf');
+      await ensurePdfSourceLoaded(target.id);
+      if (!state.pdfDoc) return;
+      markPositionEstablished(target.id);
+      scrollBookToPage(storedPageFor(target.id, state.pdfDoc.numPages), { behavior: 'auto' });
+      return;
+    }
+    await restoreReadingPosition();
   } finally {
     state.restoringPosition = false;
   }
@@ -3590,6 +3672,10 @@ let armedNoteDeleteTimer = 0;
 // Set by the Management page's Edit action: openProject then opens notes.md
 // as an editable tab for this slug (one-shot, consumed on open).
 let pendingNotesMdEditSlug = null;
+// Set by a Management page Open link: openProject then opens the reader on
+// that source for this slug (one-shot, consumed on open). sourceId is
+// 'book' (the main PDF) or a material id (an extra PDF or a slide deck).
+let pendingOpenSource = null;
 /* Activation sequence for loadNote/loadLab (see loadNote): the latest
    requested activation wins over any earlier one still in flight. */
 let activationSeq = 0;
