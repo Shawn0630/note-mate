@@ -617,6 +617,121 @@ input[type="text"].note-tab-input {
   padding: 5px 8px;
   white-space: nowrap;
 }
+/* Files toggle in the tab bar: the directory (open / hide / delete). */
+.note-tab-files {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 8px 8px 0 0;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.note-tab-files.active {
+  background: var(--paper);
+  border-color: var(--line);
+  border-bottom: none;
+  color: var(--ink);
+  margin-bottom: -1px;
+}
+
+/* Files directory: grouped list between the tab bar and the body (or in
+   the empty body when no tab is open). Same visual language as the
+   + menu's sections and rows — labels only, no prose. */
+.files-panel {
+  flex: none;
+  max-height: 42%;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper);
+  padding: 2px 4px 8px;
+}
+.notebook-body .files-panel {
+  max-height: none;
+  border-bottom: none;
+  overflow-y: visible;
+}
+.files-section {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .8px;
+  color: var(--ink-faint);
+  padding: 8px 8px 4px;
+}
+.files-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px 2px 8px;
+  border-radius: 6px;
+}
+.files-row:hover { background: rgba(138, 90, 43, .08); }
+.files-row.active { background: rgba(138, 90, 43, .12); }
+.files-row-name {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  padding: 4px 0;
+  font-size: 13px;
+  color: var(--ink);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.files-tag {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-faint);
+  background: rgba(138, 90, 43, .08);
+  border-radius: 20px;
+  padding: 1px 7px;
+  white-space: nowrap;
+}
+/* Delete × in the directory: the ONLY place a file can be deleted from
+   (AV-style two-click confirm, same as the old tab ×). */
+.files-del {
+  font-size: 11px;
+  color: var(--ink-faint);
+  border-radius: 50%;
+  padding: 0 4px;
+  line-height: 1.4;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.files-del:hover { background: var(--accent-soft); color: var(--ink); }
+.files-del.armed { color: var(--bad); font-weight: 700; background: none; padding: 0 2px; }
+/* Lab chapter group head in the directory (same as the + menu's). */
+.files-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+.files-group-head:hover { background: rgba(138, 90, 43, .08); }
+.files-count {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-faint);
+  background: rgba(138, 90, 43, .08);
+  border-radius: 20px;
+  padding: 1px 7px;
+}
 
 .save-status { font-size: 12.5px; color: var(--ink-faint); min-width: 64px; text-align: right; margin-left: auto; padding-right: 4px; }
 .save-status.dirty { color: var(--accent); }

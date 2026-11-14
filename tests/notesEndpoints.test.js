@@ -32,6 +32,11 @@ before(async () => {
   await fs.writeFile(notePath('notes.md'), '# Fixture Book\n');
   await fs.writeFile(notePath('a.md'), '# A note\n\nkeep me\n');
   await fs.writeFile(notePath('b.md'), '# B note\n');
+  const pyNb = { cells: [], metadata: { kernelspec: { language: 'python', name: 'python3' }, language_info: { name: 'python' } }, nbformat: 4, nbformat_minor: 5 };
+  await fs.writeFile(notePath('py.ipynb'), JSON.stringify(pyNb));
+  const jvNb = { cells: [], metadata: { kernelspec: { language: 'java', name: 'java' } }, nbformat: 4, nbformat_minor: 5 };
+  await fs.writeFile(notePath('jv.ipynb'), JSON.stringify(jvNb));
+  await fs.writeFile(notePath('bad.ipynb'), '{not json');
   await new Promise((resolve) => { server = app.listen(0, '127.0.0.1', resolve); });
   base = `http://127.0.0.1:${server.address().port}`;
 });
@@ -67,7 +72,7 @@ test('rename: file moves on disk, content preserved, list follows', async () => 
   assert.equal(await exists('a.md'), false);
   assert.equal(await exists('renamed.md'), true);
   assert.equal(await fs.readFile(notePath('renamed.md'), 'utf8'), '# A note\n\nkeep me\n');
-  assert.deepEqual((await listNotes()).sort(), ['b.md', 'notes.md', 'renamed.md']);
+  assert.deepEqual((await listNotes()).sort(), ['b.md', 'bad.ipynb', 'jv.ipynb', 'notes.md', 'py.ipynb', 'renamed.md']);
 });
 
 test('rename: to an existing name is 409, nothing moves', async () => {
@@ -92,7 +97,7 @@ test('delete: file is gone, list follows', async () => {
   assert.equal(r.status, 200);
   assert.equal(r.json.deleted, 'b.md');
   assert.equal(await exists('b.md'), false);
-  assert.deepEqual((await listNotes()).sort(), ['notes.md', 'renamed.md']);
+  assert.deepEqual((await listNotes()).sort(), ['bad.ipynb', 'jv.ipynb', 'notes.md', 'py.ipynb', 'renamed.md']);
 });
 
 test('delete: notes.md cannot be deleted (400); missing note is 404; bad name is 400', async () => {
@@ -111,5 +116,21 @@ test('delete: an owned .ipynb notebook deletes like a note (notes.md stays prote
   assert.equal(r.status, 200);
   assert.equal(r.json.deleted, 'scratch.ipynb');
   assert.equal(await exists('scratch.ipynb'), false);
-  assert.deepEqual((await listNotes()).sort(), ['notes.md', 'renamed.md']);
+  assert.deepEqual((await listNotes()).sort(), ['bad.ipynb', 'jv.ipynb', 'notes.md', 'py.ipynb', 'renamed.md']);
+});
+
+test('list: notebooks carry their language from metadata; md entries carry none', async () => {
+  const r = await req('GET', '/api/projects/fixture-book/notes');
+  assert.equal(r.status, 200);
+  const byName = Object.fromEntries(r.json.map((n) => [n.name, n]));
+  assert.equal(byName['py.ipynb'].kind, 'ipynb');
+  assert.equal(byName['py.ipynb'].language, 'python');
+  assert.equal(byName['jv.ipynb'].kind, 'ipynb');
+  assert.equal(byName['jv.ipynb'].language, 'java');
+  assert.equal(byName['bad.ipynb'].kind, 'ipynb');
+  assert.equal(byName['bad.ipynb'].language, null);
+  assert.equal(byName['notes.md'].kind, 'md');
+  assert.equal('language' in byName['notes.md'], false);
+  assert.equal(byName['renamed.md'].kind, 'md');
+  assert.equal('language' in byName['renamed.md'], false);
 });

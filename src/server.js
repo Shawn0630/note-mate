@@ -89,6 +89,20 @@ async function listNoteFiles(slug) {
   }
 }
 
+/* Best-effort language of a stored notebook (metadata language_info /
+   kernelspec) for the Files directory's tag — null when the file is
+   unreadable or names no language. Never throws. */
+async function notebookLanguageOf(slug, name) {
+  try {
+    const file = resolveProjectPath(DATA_DIR, slug, 'notes', name);
+    const nb = JSON.parse(await fsp.readFile(file, 'utf8'));
+    const lang = nb?.metadata?.language_info?.name || nb?.metadata?.kernelspec?.language || null;
+    return typeof lang === 'string' && lang.trim() ? lang.trim().toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Revert migration: one master notes.md (2026-11-11 reversal).
 //
@@ -802,7 +816,15 @@ app.get('/api/projects/:slug/notes', async (req, res, next) => {
   try {
     await readProject(req.params.slug);
     const names = await listNoteFiles(req.params.slug);
-    res.json(names.map((name) => ({ name, kind: name.endsWith('.ipynb') ? 'ipynb' : 'md' })));
+    const out = [];
+    for (const name of names) {
+      const entry = { name, kind: name.endsWith('.ipynb') ? 'ipynb' : 'md' };
+      // The Files directory tags notebooks with their language; read it
+      // best-effort from the notebook metadata (null when unreadable).
+      if (entry.kind === 'ipynb') entry.language = await notebookLanguageOf(req.params.slug, name);
+      out.push(entry);
+    }
+    res.json(out);
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
     next(err);
