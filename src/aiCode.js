@@ -150,9 +150,9 @@ export function parseAiCodeResponse(raw, language = 'python') {
  * `notebookCells` are already capped by the caller. `language` is the
  * notebook's language ('python' when absent — the old Python-only clients).
  */
-export async function generateAiCode({ bookTitle, chapter, sourceLabel, page, readingText, notebookCells, prompt, hasTargetCell = false, language = 'python', history = [], model } = {}) {
+export async function generateAiCode({ bookTitle, chapter, sourceLabel, page, readingText, notebookCells, prompt, hasTargetCell = false, language = 'python', history = [], model, log } = {}) {
   const lang = normalizeAiCodeLanguage(language);
   const llmPrompt = buildAiCodePrompt({ bookTitle, chapter, sourceLabel, page, readingText, notebookCells, prompt, hasTargetCell, language: lang, history });
-  const raw = await generateText(llmPrompt, { model });
+  const raw = await generateText(llmPrompt, { model, log });
   return parseAiCodeResponse(raw, lang);
 }

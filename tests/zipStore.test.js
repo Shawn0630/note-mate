@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { crc32 as zlibCrc32 } from 'node:zlib';
-import { createZip, crc32 } from '../src/zipStore.js';
+import { createZip, crc32, readZip } from '../src/zipStore.js';
 
 // Parse the central directory of a ZIP buffer → [{name, crc, size, offset}].
 function parseCentral(buf) {
@@ -72,4 +72,41 @@ test('createZip: empty zip is a valid EOCD-only archive', () => {
   const buf = createZip().toBuffer();
   assert.equal(buf.length, 22);
   assert.deepEqual(parseCentral(buf), []);
+});
+
+test('readZip: stored entries round-trip (incl. empty zip)', () => {
+  const zip = createZip();
+  zip.addFile('a/notes.md', '# Hi\n');
+  zip.addFile('a/bin.dat', Buffer.from([0, 1, 2, 255]));
+  zip.addFile('empty.txt', '');
+  const out = readZip(zip.toBuffer());
+  assert.deepEqual(out.map((e) => e.name), ['a/notes.md', 'a/bin.dat', 'empty.txt']);
+  assert.equal(out[0].data.toString('utf8'), '# Hi\n');
+  assert.deepEqual(out[1].data, Buffer.from([0, 1, 2, 255]));
+  assert.equal(out[2].data.length, 0);
+  assert.deepEqual(readZip(createZip().toBuffer()), []);
+});
+
+test('readZip: CRC mismatch, deflated entries and data descriptors are rejected', () => {
+  const zip = createZip();
+  zip.addFile('a.md', 'hello world');
+  const good = zip.toBuffer();
+  // Flip a data byte: local header starts at 0, data at 30 + nameLen(4) = 34.
+  const badCrc = Buffer.from(good);
+  badCrc[34] ^= 0xff;
+  assert.throws(() => readZip(badCrc), (e) => e.status === 400 && /checksum/.test(e.message));
+  // Method 8 (deflate) in both headers.
+  const deflated = Buffer.from(good);
+  deflated.writeUInt16LE(8, 8); // local method
+  const central = deflated.readUInt32LE(deflated.length - 22 + 16);
+  deflated.writeUInt16LE(8, central + 10); // central method
+  assert.throws(() => readZip(deflated), (e) => e.status === 400 && /stored/.test(e.message));
+  // Data descriptor flag (bit 3) in both headers.
+  const descriptor = Buffer.from(good);
+  descriptor.writeUInt16LE(0x08, 6); // local flags
+  descriptor.writeUInt16LE(0x08, central + 8); // central flags
+  assert.throws(() => readZip(descriptor), (e) => e.status === 400 && /descriptor/.test(e.message));
+  // Not a ZIP at all.
+  assert.throws(() => readZip(Buffer.from('hello')), (e) => e.status === 400);
+  assert.throws(() => readZip(Buffer.alloc(0)), (e) => e.status === 400);
 });

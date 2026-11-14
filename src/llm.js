@@ -23,6 +23,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { appendAiCall } from './aiCallLog.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV_FILE = path.resolve(__dirname, '..', 'server', '.env');
@@ -127,6 +128,9 @@ async function callGemini({ apiKey, model }, prompt, { json = false } = {}) {
  * `opts.model` overrides the configured model for this one call (the AI
  * panel's model picker); an unknown override is rejected by the caller —
  * see listModels / isAllowedModel.
+ * `opts.log` ({feature, instruction, language?}) records the call in the
+ * AI call log (src/aiCallLog.js): prompt sent, raw reply, model, status,
+ * duration. Logging never breaks the call and never records credentials.
  * @throws {LlmError} LLM_NOT_CONFIGURED (status 503) when no stub and no
  *   key+model; LLM_BAD_RESPONSE (status 502) on an API error.
  */
@@ -134,8 +138,40 @@ export async function generateText(prompt, opts = {}) {
   const { apiKey, model, stub } = getLlmConfig();
   const useModel = typeof opts.model === 'string' && opts.model.trim()
     ? opts.model.trim() : model;
-  if (stub) return stub;
-  if (apiKey && useModel) return callGemini({ apiKey, model: useModel }, prompt);
+  const log = opts.log && typeof opts.log === 'object' ? opts.log : null;
+  const t0 = Date.now();
+  const record = (status, rawResponse, error) => {
+    if (!log) return;
+    try {
+      appendAiCall({
+        ts: new Date().toISOString(),
+        feature: log.feature,
+        status,
+        model: useModel || null,
+        instruction: typeof log.instruction === 'string' ? log.instruction : '',
+        language: typeof log.language === 'string' ? log.language : null,
+        prompt: String(prompt ?? ''),
+        rawResponse: rawResponse ?? null,
+        error: error ?? null,
+        durationMs: Date.now() - t0,
+      });
+    } catch { /* logging never breaks the call */ }
+  };
+  if (stub) {
+    record('ok', stub, null);
+    return stub;
+  }
+  if (apiKey && useModel) {
+    try {
+      const text = await callGemini({ apiKey, model: useModel }, prompt);
+      record('ok', text, null);
+      return text;
+    } catch (err) {
+      record('error', err.rawText ?? null, err.message);
+      throw err;
+    }
+  }
+  record('not_configured', null, 'LLM not configured');
   throw new LlmError(
     LLM_NOT_CONFIGURED,
     'LLM not configured',
@@ -237,14 +273,40 @@ export function unwrapJsonText(text) {
  *   key+model; LLM_BAD_RESPONSE (status 400) when the model output is not
  *   parseable JSON — `err.rawText` carries the raw model text for debugging.
  */
-export async function proposeProjectData({ kind, title, text }) {
+export async function proposeProjectData({ kind, title, text }, opts = {}) {
   const { apiKey, model, stub } = getLlmConfig();
+  const prompt = buildPrompt({ kind, title, text });
+  const log = opts.log && typeof opts.log === 'object' ? opts.log : null;
+  const t0 = Date.now();
+  const record = (status, rawResponse, error) => {
+    if (!log) return;
+    try {
+      appendAiCall({
+        ts: new Date().toISOString(),
+        feature: log.feature,
+        status,
+        model: model || null,
+        instruction: typeof log.instruction === 'string' ? log.instruction : '',
+        language: null,
+        prompt,
+        rawResponse: rawResponse ?? null,
+        error: error ?? null,
+        durationMs: Date.now() - t0,
+      });
+    } catch { /* logging never breaks the call */ }
+  };
   let rawText;
   if (stub) {
     rawText = stub;
   } else if (apiKey && model) {
-    rawText = await callGemini({ apiKey, model }, buildPrompt({ kind, title, text }), { json: true });
+    try {
+      rawText = await callGemini({ apiKey, model }, prompt, { json: true });
+    } catch (err) {
+      record('error', err.rawText ?? null, err.message);
+      throw err;
+    }
   } else {
+    record('not_configured', null, 'LLM not configured');
     throw new LlmError(
       LLM_NOT_CONFIGURED,
       'LLM not configured',
@@ -255,7 +317,9 @@ export async function proposeProjectData({ kind, title, text }) {
   try {
     parsed = JSON.parse(unwrapJsonText(rawText));
   } catch {
+    record('error', rawText, 'Model output was not valid JSON');
     throw new LlmError('LLM_BAD_RESPONSE', 'Model output was not valid JSON', { status: 400, rawText });
   }
+  record('ok', rawText, null);
   return parsed;
 }

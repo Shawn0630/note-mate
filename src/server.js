@@ -39,6 +39,9 @@ import {
 } from './annotations.js';
 import { ensurePdf, isConvertibleDoc } from './convertDocument.js';
 import { createZip } from './zipStore.js';
+import { readAiCalls } from './aiCallLog.js';
+import { recordSyncLog, listSyncLog } from './syncLog.js';
+import { buildDataExport, applyDataImport } from './dataExport.js';
 import {
   SECTION_NOTEBOOKS_DIR, SECTION_ID_RE,
   SECTION_NOTEBOOK_NAME_RE, SECTION_LANGUAGES,
@@ -948,7 +951,8 @@ app.post('/api/import/ai/propose', upload.single('file'), async (req, res, next)
     }
     let proposal;
     try {
-      proposal = await proposeProjectData({ kind: 'pdf', title, text: extracted.text });
+      proposal = await proposeProjectData({ kind: 'pdf', title, text: extracted.text },
+        { log: { feature: 'ai-import', instruction: title } });
     } catch (err) {
       if (err.code === LLM_NOT_CONFIGURED) {
         return res.status(503).json({ error: 'LLM not configured', hint: err.hint });
@@ -1174,6 +1178,88 @@ app.get('/api/projects/:slug/export', async (req, res, next) => {
     res.set('Content-Disposition', `attachment; filename="${slug}-export.zip"`);
     res.set('Content-Length', String(buf.length));
     res.send(buf);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Admin — AI call log (AV admin.html model), full-data export / import,
+// and the browser-sync log. Local only; the AI call log and sync log are
+// never part of a data export.
+// ---------------------------------------------------------------------------
+
+// AI calls, newest first, paged (limit default 20, max 200).
+app.get('/api/admin/ai-calls', async (req, res, next) => {
+  try {
+    const limit = Number.parseInt(req.query.limit, 10);
+    const offset = Number.parseInt(req.query.offset, 10);
+    res.json(readAiCalls({
+      limit: Number.isFinite(limit) ? limit : 20,
+      offset: Number.isFinite(offset) ? offset : 0,
+    }, DATA_DIR));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Full-data export: one ZIP of every project (see src/dataExport.js).
+app.get('/api/admin/data/export', async (req, res, next) => {
+  try {
+    const { buffer } = await buildDataExport(DATA_DIR);
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+    res.set('Content-Type', 'application/zip');
+    res.set('Content-Disposition', `attachment; filename="note-mate-export-${stamp}.zip"`);
+    res.set('Content-Length', String(buffer.length));
+    res.send(buffer);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Full-data import: validate fully first, then restore missing projects.
+// A slug collision keeps the existing project (skipped, reported).
+// An optional `sync` form field carries a sync-download log entry (the
+// FM pattern: {direction: 'download', bytes, exported_at}).
+app.post('/api/admin/data/import', upload.single('file'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'file (a note-mate export .zip) is required' });
+    const summary = await applyDataImport(DATA_DIR, req.file.buffer);
+    if (typeof req.body?.sync === 'string') {
+      try {
+        const s = JSON.parse(req.body.sync);
+        if (s && s.direction === 'download') {
+          recordSyncLog({
+            direction: 'download',
+            status: 'ok',
+            bytes: Number.isInteger(s.bytes) ? s.bytes : null,
+            exported_at: typeof s.exported_at === 'string' ? s.exported_at : null,
+            detail: 'Downloaded from the sync folder.',
+          }, DATA_DIR);
+        }
+      } catch { /* a bad sync field never fails the import */ }
+    }
+    res.json(summary);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Browser-sync log (FM's sync_log shape, file-based).
+app.get('/api/admin/data/sync/log', async (req, res, next) => {
+  try {
+    res.json({ log: listSyncLog(50, DATA_DIR) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/admin/data/sync/log', async (req, res, next) => {
+  try {
+    const entry = recordSyncLog(req.body ?? {}, DATA_DIR);
+    res.json(entry);
   } catch (err) {
     next(err);
   }
@@ -1772,6 +1858,7 @@ app.post('/api/projects/:slug/ai-note', async (req, res, next) => {
         prompt: prompt.trim(),
         history: cleanHistory,
         model: typeof model === 'string' && model.trim() ? model.trim() : undefined,
+        log: { feature: 'ai-note', instruction: prompt.trim() },
       });
     } catch (err) {
       if (err.code === LLM_NOT_CONFIGURED) {
@@ -1865,6 +1952,11 @@ app.post('/api/projects/:slug/ai-code', async (req, res, next) => {
         language: language == null ? undefined : String(language).toLowerCase(),
         history: cleanHistory,
         model: typeof model === 'string' && model.trim() ? model.trim() : undefined,
+        log: {
+          feature: 'ai-code',
+          instruction: prompt.trim(),
+          language: language == null ? 'python' : String(language).toLowerCase(),
+        },
       });
     } catch (err) {
       if (err.code === LLM_NOT_CONFIGURED) {

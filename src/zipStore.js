@@ -110,3 +110,68 @@ export function createZip() {
     },
   };
 }
+
+/**
+ * Minimal ZIP reader for archives our own writer produces: stored entries
+ * (method 0), no data descriptors, no encryption. Used by the data import
+ * to validate an export archive BEFORE writing anything. Returns
+ * [{name, data: Buffer, crc}] in central-directory order. Throws an Error
+ * (status 400) on anything that is not such an archive.
+ */
+export function readZip(input) {
+  const fail = (msg) => {
+    const err = new Error(msg);
+    err.status = 400;
+    throw err;
+  };
+  const buf = Buffer.isBuffer(input) ? input : Buffer.from(input ?? []);
+  if (buf.length < 22) fail('not a zip archive');
+  // End of central directory: signature 0x06054b50, comment up to 64KiB.
+  let eocd = -1;
+  const scanFrom = Math.max(0, buf.length - 22 - 65536);
+  for (let i = buf.length - 22; i >= scanFrom; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd === -1) fail('not a zip archive (no end of central directory)');
+  const count = buf.readUInt16LE(eocd + 10);
+  const centralSize = buf.readUInt32LE(eocd + 12);
+  const centralOffset = buf.readUInt32LE(eocd + 16);
+  if (centralOffset + centralSize > buf.length) fail('zip central directory is truncated');
+  const entries = [];
+  let p = centralOffset;
+  for (let i = 0; i < count; i++) {
+    if (p + 46 > buf.length || buf.readUInt32LE(p) !== 0x02014b50) {
+      fail('zip central directory is corrupt');
+    }
+    const method = buf.readUInt16LE(p + 10);
+    const flags = buf.readUInt16LE(p + 8);
+    const crc = buf.readUInt32LE(p + 16);
+    const compSize = buf.readUInt32LE(p + 20);
+    const uncompSize = buf.readUInt32LE(p + 24);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const localOffset = buf.readUInt32LE(p + 42);
+    const name = buf.toString('utf8', p + 46, p + 46 + nameLen);
+    if (method !== 0) fail(`unsupported zip entry method ${method} for ${name} (stored only)`);
+    if (flags & 0x08) fail(`unsupported zip data descriptor for ${name}`);
+    if (compSize !== uncompSize) fail(`zip entry size mismatch for ${name}`);
+    if (localOffset + 30 > buf.length || buf.readUInt32LE(localOffset) !== 0x04034b50) {
+      fail(`zip local header missing for ${name}`);
+    }
+    const localNameLen = buf.readUInt16LE(localOffset + 26);
+    const localExtraLen = buf.readUInt16LE(localOffset + 28);
+    const dataStart = localOffset + 30 + localNameLen + localExtraLen;
+    if (dataStart + compSize > buf.length) fail(`zip entry truncated: ${name}`);
+    const data = buf.subarray(dataStart, dataStart + compSize);
+    if (crc32(data) !== crc) fail(`zip entry checksum mismatch: ${name}`);
+    // Same name rule as the writer: no empty / . / .. segments.
+    const parts = name.split('/');
+    if (!name || parts.some((seg) => seg === '' || seg === '.' || seg === '..')) {
+      fail(`invalid zip entry name: ${name}`);
+    }
+    entries.push({ name, data: Buffer.from(data), crc });
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}

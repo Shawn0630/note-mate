@@ -63,6 +63,10 @@ import {
 import {
   openTabsKey, restoreOpenTabs, serializeOpenTabs,
 } from './openTabs.js';
+import {
+  initSync, chooseSyncFolder, reconnectSyncFolder, forgetSyncFolder,
+  syncNow, markSyncDirty, renderSyncStatus, loadSyncLog,
+} from './dataSync.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdfjs/pdf.worker.mjs';
 
@@ -92,6 +96,12 @@ async function api(path, opts = {}) {
   if (!res.ok) {
     const msg = (data && data.error) || (data && data.message) || `Request failed (${res.status})`;
     throw new Error(msg);
+  }
+  // Browser sync: a successful write dirties the sync, so the next
+  // debounced upload carries it to the sync folder (dataSync.js). The
+  // sync engine itself uses raw fetch, never api(), so this cannot loop.
+  if ((opts.method || 'GET').toUpperCase() !== 'GET') {
+    try { markSyncDirty(); } catch { /* sync state must never fail a request */ }
   }
   return data;
 }
@@ -432,6 +442,10 @@ function resetReaderState() {
 
 function route() {
   const hash = location.hash || '#/';
+  if (hash === '#/admin' || hash.startsWith('#/admin')) {
+    renderAdminPage();
+    return;
+  }
   const mm = hash.match(/^#\/manage\/([^/?#]+)/);
   if (mm) {
     renderManagePage(decodeURIComponent(mm[1]));
@@ -446,6 +460,219 @@ function route() {
 }
 
 window.addEventListener('hashchange', route);
+
+/* ---------------- admin page (#/admin) ---------------- */
+
+// Admin: the AI call log (AV admin.html model) + full-data Export /
+// Import + browser iCloud sync (FM's browser-sync pattern). The log is
+// local-only and never part of a data export; import never destroys
+// data — a slug collision keeps the existing project and is reported.
+let adminCallsOffset = 0;
+let adminCallsLimit = 20;
+
+function adminCallFeatureLabel(feature) {
+  return { 'ai-note': 'Note AI', 'ai-code': 'Code AI', 'ai-import': 'AI import' }[feature] || feature;
+}
+
+function adminCallDetailHtml(c) {
+  const rows = [];
+  if (c.prompt != null) rows.push(`<div class="admin-detail-label">Prompt sent</div><pre class="admin-detail-pre">${esc(c.prompt)}</pre>`);
+  if (c.rawResponse != null) rows.push(`<div class="admin-detail-label">Raw response</div><pre class="admin-detail-pre">${esc(c.rawResponse)}</pre>`);
+  if (c.error) rows.push(`<div class="admin-detail-label">Error</div><pre class="admin-detail-pre">${esc(c.error)}</pre>`);
+  if (!rows.length) rows.push('<div class="manage-status">No prompt or response recorded.</div>');
+  return rows.join('');
+}
+
+async function loadAdminCalls() {
+  const host = $('#admin-calls', view);
+  if (!host) return;
+  host.innerHTML = '<p class="manage-status">Loading…</p>';
+  let data;
+  try {
+    data = await apiGet(`/api/admin/ai-calls?limit=${adminCallsLimit}&offset=${adminCallsOffset}`);
+  } catch (err) {
+    host.innerHTML = `<p class="manage-status error">Could not load AI calls: ${esc(err.message)}</p>`;
+    return;
+  }
+  const calls = Array.isArray(data.calls) ? data.calls : [];
+  const total = data.total || 0;
+  const pageEl = $('#admin-calls-page', view);
+  if (pageEl) {
+    pageEl.textContent = total
+      ? `${adminCallsOffset + 1}–${Math.min(adminCallsOffset + adminCallsLimit, total)} of ${total}`
+      : '0 calls';
+  }
+  const prev = $('#admin-calls-prev', view);
+  const next = $('#admin-calls-next', view);
+  if (prev) prev.disabled = adminCallsOffset <= 0;
+  if (next) next.disabled = adminCallsOffset + adminCallsLimit >= total;
+  if (!calls.length) {
+    host.innerHTML = '<p class="manage-status">No AI calls yet.</p>';
+    return;
+  }
+  host.innerHTML = `<table class="admin-table"><thead><tr><th>Time</th><th>Status</th><th>Feature</th><th>Model</th><th>Instruction</th><th>Duration</th></tr></thead><tbody>${
+    calls.map((c, i) => `<tr class="admin-call-row" data-i="${i}">
+      <td style="white-space:nowrap">${esc(new Date(c.ts).toLocaleString('en-CA'))}</td>
+      <td>${c.status === 'ok' ? 'OK' : c.status === 'error' ? 'Failed' : 'Not configured'}</td>
+      <td>${esc(adminCallFeatureLabel(c.feature))}</td>
+      <td>${esc(c.model || '—')}</td>
+      <td>${esc(c.instruction || '')}</td>
+      <td style="white-space:nowrap">${c.durationMs == null ? '—' : `${c.durationMs} ms`}</td>
+    </tr>
+    <tr class="admin-call-detail" data-i="${i}" hidden><td colspan="6">${adminCallDetailHtml(c)}</td></tr>`).join('')
+  }</tbody></table>`;
+  $$('.admin-call-row', host).forEach((row) => {
+    row.addEventListener('click', () => {
+      const d = host.querySelector(`.admin-call-detail[data-i="${row.dataset.i}"]`);
+      if (d) d.hidden = !d.hidden;
+    });
+  });
+}
+
+async function renderAdminPage() {
+  resetReaderState();
+  view.innerHTML = `
+  <div class="manage-page admin-page">
+    <div class="manage-head">
+      <a class="back-link" href="#/">‹ Shelf</a>
+      <h1>Admin</h1>
+    </div>
+    <div class="manage-section">
+      <h2>AI calls</h2>
+      <div class="manage-actions">
+        <button class="mini-btn" id="admin-calls-reload">Reload</button>
+        <button class="mini-btn" id="admin-models-btn">List models my key can use</button>
+        <span class="manage-status" id="admin-models-status"></span>
+      </div>
+      <div id="admin-models"></div>
+      <div id="admin-calls"><p class="manage-status">Loading…</p></div>
+      <div class="manage-actions">
+        <button class="mini-btn" id="admin-calls-prev">← Newer</button>
+        <span class="manage-status" id="admin-calls-page"></span>
+        <button class="mini-btn" id="admin-calls-next">Older →</button>
+        <label class="manage-status">per page
+          <select id="admin-calls-size">
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="50">50</option>
+          </select>
+        </label>
+      </div>
+    </div>
+    <div class="manage-section">
+      <h2>Data</h2>
+      <div class="manage-actions">
+        <button class="primary" id="admin-export-btn">Export all data</button>
+        <span class="manage-status" id="admin-data-status"></span>
+      </div>
+      <div class="manage-actions">
+        <input type="file" id="admin-import-file" accept=".zip">
+        <button id="admin-import-btn" disabled>Import</button>
+      </div>
+      <div id="admin-import-result"></div>
+      <div class="admin-subhead">Sync</div>
+      <div id="sync-unsupported" class="manage-status hidden">This browser has no folder picker (Chrome / Edge only). Use Export / Import above.</div>
+      <div id="sync-panel">
+        <div class="manage-actions">
+          <button class="mini-btn" id="sync-choose-btn">Choose folder</button>
+          <button class="mini-btn" id="sync-now-btn">Sync now</button>
+          <button class="mini-btn hidden" id="sync-reconnect-btn">Reconnect</button>
+          <button class="mini-btn" id="sync-forget-btn">Forget</button>
+        </div>
+        <div class="manage-status" id="sync-status">Not connected.</div>
+      </div>
+      <div id="sync-log"><p class="manage-status">Loading…</p></div>
+    </div>
+  </div>`;
+  $('#admin-calls-reload', view).addEventListener('click', () => { loadAdminCalls(); });
+  $('#admin-calls-prev', view).addEventListener('click', () => {
+    adminCallsOffset = Math.max(0, adminCallsOffset - adminCallsLimit);
+    loadAdminCalls();
+  });
+  $('#admin-calls-next', view).addEventListener('click', () => {
+    adminCallsOffset += adminCallsLimit;
+    loadAdminCalls();
+  });
+  $('#admin-calls-size', view).addEventListener('change', (e) => {
+    adminCallsLimit = Number(e.target.value) || 20;
+    adminCallsOffset = 0;
+    loadAdminCalls();
+  });
+  $('#admin-models-btn', view).addEventListener('click', async () => {
+    const statusEl = $('#admin-models-status', view);
+    const host = $('#admin-models', view);
+    if (statusEl) statusEl.textContent = 'Loading…';
+    try {
+      const data = await apiGet('/api/llm/models');
+      const models = Array.isArray(data.models) ? data.models : [];
+      // `configured` is a boolean on this endpoint; the configured
+      // model's name is `model` (same trap as the AI panel picker).
+      const configured = data.model || null;
+      if (statusEl) statusEl.textContent = configured ? `Configured: ${configured}` : 'No model configured.';
+      if (host) {
+        host.innerHTML = models.length
+          ? `<div class="admin-models-list">${models.map((m) => `<span class="admin-model-chip">${esc(m)}</span>`).join('')}</div>`
+          : '<p class="manage-status">No models returned.</p>';
+      }
+    } catch (err) {
+      if (statusEl) statusEl.textContent = `Could not list models: ${err.message}`;
+    }
+  });
+  $('#admin-export-btn', view).addEventListener('click', async () => {
+    const statusEl = $('#admin-data-status', view);
+    if (statusEl) statusEl.textContent = 'Preparing export…';
+    try {
+      const res = await fetch('/api/admin/data/export');
+      if (!res.ok) {
+        let msg = `Export failed (${res.status})`;
+        try { const data = await res.json(); if (data && data.error) msg = data.error; } catch { /* keep default */ }
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const d = new Date();
+      const p = (n) => String(n).padStart(2, '0');
+      downloadBlob(blob, `note-mate-export-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.zip`, 'application/zip');
+      if (statusEl) statusEl.textContent = 'Export downloaded.';
+    } catch (err) {
+      if (statusEl) statusEl.textContent = err.message;
+    }
+  });
+  const importFile = $('#admin-import-file', view);
+  const importBtn = $('#admin-import-btn', view);
+  importFile.addEventListener('change', () => { importBtn.disabled = !importFile.files.length; });
+  importBtn.addEventListener('click', async () => {
+    const file = importFile.files[0];
+    if (!file) return;
+    if (!window.confirm('Import adds the projects in this archive that are missing here. Projects that already exist are kept and skipped. Continue?')) return;
+    const statusEl = $('#admin-data-status', view);
+    const resultEl = $('#admin-import-result', view);
+    if (statusEl) statusEl.textContent = 'Importing…';
+    const form = new FormData();
+    form.append('file', file);
+    try {
+      const summary = await api('/api/admin/data/import', { method: 'POST', body: form });
+      if (statusEl) statusEl.textContent = '';
+      const imported = (summary.imported || []).map((s) => esc(s)).join(', ');
+      const skipped = (summary.skipped || []).map((s) => `${esc(s.slug)} (${esc(s.reason)})`).join(', ');
+      if (resultEl) {
+        resultEl.innerHTML = `<div class="manage-status">
+          Imported ${summary.files || 0} files, ${summary.imported ? summary.imported.length : 0} project(s)${imported ? `: ${imported}` : ''}.
+          ${skipped ? ` Skipped: ${skipped}.` : ''}</div>`;
+      }
+      importFile.value = '';
+      importBtn.disabled = true;
+    } catch (err) {
+      if (statusEl) statusEl.textContent = `Import failed: ${err.message}`;
+    }
+  });
+  $('#sync-choose-btn', view).addEventListener('click', chooseSyncFolder);
+  $('#sync-now-btn', view).addEventListener('click', syncNow);
+  $('#sync-reconnect-btn', view).addEventListener('click', reconnectSyncFolder);
+  $('#sync-forget-btn', view).addEventListener('click', forgetSyncFolder);
+  loadAdminCalls();
+  renderSyncStatus();
+  loadSyncLog();
+}
 
 // A refresh mid-scroll (or mid-flight after a chapter click) should keep
 // the last position the reader was actually on — flush the current
@@ -504,10 +731,12 @@ async function renderHome() {
         <p>Your reading projects — open one to read and take notes side by side.</p>
       </div>
       <button class="primary" id="add-project-btn">+ Add project</button>
+      <button id="admin-btn">Admin</button>
     </div>
     <div id="shelf"><p>Loading your shelf…</p></div>`;
 
   $('#add-project-btn', view).addEventListener('click', openAddProjectModal);
+  $('#admin-btn', view).addEventListener('click', () => { location.hash = '#/admin'; });
 
   try {
     const projects = await apiGet('/api/projects');
@@ -7239,4 +7468,5 @@ document.addEventListener('keydown', (e) => {
 });
 
 initThemeToggle();
+initSync();
 route();

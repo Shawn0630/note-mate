@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { proposeProjectData, parseEnvFile, unwrapJsonText } from '../src/llm.js';
 
 const STUB_PROPOSAL = {
@@ -193,5 +196,109 @@ test('isAllowedModel: configured or listed only', async () => {
       const envKey = { stub: 'LLM_STUB_RESPONSE', models: 'LLM_STUB_MODELS', model: 'LLM_MODEL', file: 'LLM_ENV_FILE' }[k];
       if (v === undefined) delete process.env[envKey]; else process.env[envKey] = v;
     }
+  }
+});
+
+test('generateText: with log, a stub call is recorded (ok) in the AI call log', async () => {
+  const { generateText } = await import('../src/llm.js');
+  const { readAiCalls } = await import('../src/aiCallLog.js');
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'nm-llm-log-'));
+  const saved = {
+    stub: process.env.LLM_STUB_RESPONSE,
+    model: process.env.LLM_MODEL,
+    file: process.env.LLM_ENV_FILE,
+    dataDir: process.env.DATA_DIR,
+  };
+  process.env.LLM_STUB_RESPONSE = 'stub reply';
+  process.env.LLM_MODEL = 'stub-model';
+  process.env.LLM_ENV_FILE = '/nonexistent/none.env';
+  process.env.DATA_DIR = dir;
+  try {
+    const out = await generateText('hello prompt', { log: { feature: 'ai-note', instruction: 'write a note' } });
+    assert.equal(out, 'stub reply');
+    const { calls } = readAiCalls({}, dir);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].feature, 'ai-note');
+    assert.equal(calls[0].status, 'ok');
+    assert.equal(calls[0].model, 'stub-model');
+    assert.equal(calls[0].instruction, 'write a note');
+    assert.equal(calls[0].prompt, 'hello prompt');
+    assert.equal(calls[0].rawResponse, 'stub reply');
+    assert.equal(calls[0].error, null);
+    assert.ok(Number.isInteger(calls[0].durationMs) && calls[0].durationMs >= 0);
+    // Without a log option, no entry is recorded.
+    await generateText('second prompt');
+    assert.equal(readAiCalls({}, dir).calls.length, 1);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      const envKey = { stub: 'LLM_STUB_RESPONSE', model: 'LLM_MODEL', file: 'LLM_ENV_FILE', dataDir: 'DATA_DIR' }[k];
+      if (v === undefined) delete process.env[envKey]; else process.env[envKey] = v;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('generateText: not-configured call is recorded, then throws 503', async () => {
+  const { generateText, LLM_NOT_CONFIGURED } = await import('../src/llm.js');
+  const { readAiCalls } = await import('../src/aiCallLog.js');
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'nm-llm-log-'));
+  const saved = {
+    stub: process.env.LLM_STUB_RESPONSE,
+    key: process.env.LLM_API_KEY,
+    model: process.env.LLM_MODEL,
+    file: process.env.LLM_ENV_FILE,
+    dataDir: process.env.DATA_DIR,
+  };
+  delete process.env.LLM_STUB_RESPONSE;
+  delete process.env.LLM_API_KEY;
+  delete process.env.LLM_MODEL;
+  process.env.LLM_ENV_FILE = '/nonexistent/none.env';
+  process.env.DATA_DIR = dir;
+  try {
+    await assert.rejects(() => generateText('hi', { log: { feature: 'ai-code', instruction: 'code it', language: 'java' } }),
+      (e) => e.code === LLM_NOT_CONFIGURED && e.status === 503);
+    const { calls } = readAiCalls({}, dir);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].status, 'not_configured');
+    assert.equal(calls[0].feature, 'ai-code');
+    assert.equal(calls[0].language, 'java');
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      const envKey = { stub: 'LLM_STUB_RESPONSE', key: 'LLM_API_KEY', model: 'LLM_MODEL', file: 'LLM_ENV_FILE', dataDir: 'DATA_DIR' }[k];
+      if (v === undefined) delete process.env[envKey]; else process.env[envKey] = v;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('proposeProjectData: with log, a stub propose is recorded as ai-import', async () => {
+  const { proposeProjectData } = await import('../src/llm.js');
+  const { readAiCalls } = await import('../src/aiCallLog.js');
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'nm-llm-log-'));
+  const saved = {
+    stub: process.env.LLM_STUB_RESPONSE,
+    model: process.env.LLM_MODEL,
+    file: process.env.LLM_ENV_FILE,
+    dataDir: process.env.DATA_DIR,
+  };
+  process.env.LLM_STUB_RESPONSE = JSON.stringify(STUB_PROPOSAL);
+  process.env.LLM_MODEL = 'stub-model';
+  process.env.LLM_ENV_FILE = '/nonexistent/none.env';
+  process.env.DATA_DIR = dir;
+  try {
+    const out = await proposeProjectData({ kind: 'pdf', title: 'Stub Book', text: '--- page 1 ---\nhello' },
+      { log: { feature: 'ai-import', instruction: 'Stub Book' } });
+    assert.deepEqual(out, STUB_PROPOSAL);
+    const { calls } = readAiCalls({}, dir);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].feature, 'ai-import');
+    assert.equal(calls[0].status, 'ok');
+    assert.equal(calls[0].instruction, 'Stub Book');
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      const envKey = { stub: 'LLM_STUB_RESPONSE', model: 'LLM_MODEL', file: 'LLM_ENV_FILE', dataDir: 'DATA_DIR' }[k];
+      if (v === undefined) delete process.env[envKey]; else process.env[envKey] = v;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
   }
 });
