@@ -317,6 +317,13 @@ const state = {
   activeTabKind: 'note',
   activeLab: null,      // {chapter, name} when a lab tab is active
   labsOpenChapters: {}, // chapter -> true when its group is expanded in the + menu (shared with the Files directory)
+  // Sections (Manage page): user-addable groups of static notebooks from
+  // project.json `sections[]`. The Labs section is one section among
+  // others. Section notebooks open as tabs like labs: activeTabKind
+  // 'note' | 'lab' | 'section' decides the save endpoint.
+  sections: [],         // [{id, name, notebooks: [{name, path, chapter?, language?}]}]
+  sectionTabs: [],      // [{sectionId, name}]
+  activeSection: null,  // {sectionId, name, path} when a section tab is active
   // Open tabs: owned notes currently on the tab bar. Hiding a tab only
   // removes its name here — the file stays on disk and re-opens from
   // the Files directory. Persisted per project (see openTabs.js).
@@ -401,6 +408,9 @@ function resetReaderState() {
   state.activeTabKind = 'note';
   state.activeLab = null;
   state.labsOpenChapters = {};
+  state.sections = [];
+  state.sectionTabs = [];
+  state.activeSection = null;
   state.openNotes = new Set();
   state.showFiles = false;
   state.coverGenerated = false;
@@ -637,12 +647,13 @@ async function renderManagePage(slug) {
     const materials = await apiGet(`/api/projects/${encodeURIComponent(slug)}/materials`);
     state.materials = Array.isArray(materials) ? materials : [];
   } catch { state.materials = []; }
-  try {
-    const labs = await apiGet(`/api/projects/${encodeURIComponent(slug)}/labs`);
-    const chapters = labs && Array.isArray(labs.chapters) ? labs.chapters
-      : (Array.isArray(labs) ? labs : []);
-    state.labs = chapters;
-  } catch { state.labs = []; }
+  // Sections come from project.json (GET /projects/:slug above) — the
+  // Manage page never scans notes/labs/ itself; the Labs section is one
+  // section in that list. Tolerate old projects without sections[].
+  state.sections = Array.isArray(project.sections)
+    ? project.sections.filter((s) => s && typeof s.id === 'string' && typeof s.name === 'string'
+      && Array.isArray(s.notebooks))
+    : [];
   renderManageDom();
 }
 
@@ -766,6 +777,186 @@ async function deleteManageNote(name) {
   setManageStatus(gone ? `Deleted ${name}.` : `Delete failed for ${name}.`, gone ? '' : 'error');
 }
 
+/* ---------- Sections (static notebooks) ---------- */
+
+/* First-free default section name: "Section 1", "Section 2", … — the
+   server applies the same rule when the name arrives empty. */
+function nextSectionName(sections) {
+  const names = new Set((sections || []).map((s) => s.name));
+  let n = 1;
+  while (names.has(`Section ${n}`)) n += 1;
+  return `Section ${n}`;
+}
+
+/* A static notebook row in a section: the name opens the notebook as a
+   tab (like a lab row in the Files directory), the tag names its
+   language. No delete — sections and their notebooks are static. */
+function manageSectionNotebookRow(section, entry) {
+  const row = document.createElement('div');
+  row.className = 'files-row';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'files-row-name';
+  btn.textContent = labDisplayName(entry.name);
+  btn.title = 'Open in the reader';
+  btn.addEventListener('click', () => {
+    pendingSectionNotebook = { slug: state.project.slug, sectionId: section.id, name: entry.name };
+    location.hash = `#/project/${encodeURIComponent(state.project.slug)}`;
+  });
+  row.appendChild(btn);
+  const lang = typeof entry.language === 'string' ? entry.language.toLowerCase() : '';
+  const tag = NB_LANG_TAG[lang] || null;
+  if (tag) {
+    const t = document.createElement('span');
+    t.className = 'files-tag';
+    t.textContent = tag;
+    row.appendChild(t);
+  }
+  return row;
+}
+
+/* One section block: header (name + count), its notebooks — entries with
+   a chapter grouped collapsibly (shared expand state with the Files
+   directory), the rest flat — then the add-notebook controls. */
+function renderManageSection(section) {
+  const block = document.createElement('div');
+  block.className = 'manage-section-block';
+  const head = document.createElement('div');
+  head.className = 'files-section';
+  head.textContent = section.name;
+  const count = document.createElement('span');
+  count.className = 'files-count';
+  count.textContent = String((section.notebooks || []).length);
+  head.appendChild(count);
+  block.appendChild(head);
+
+  const list = document.createElement('div');
+  list.className = 'files-list';
+  const entries = section.notebooks || [];
+  if (!entries.length) list.appendChild(manageHintEl('No notebooks yet.'));
+  const byChapter = new Map();
+  const flat = [];
+  entries.forEach((e) => {
+    if (e.chapter) {
+      if (!byChapter.has(e.chapter)) byChapter.set(e.chapter, []);
+      byChapter.get(e.chapter).push(e);
+    } else flat.push(e);
+  });
+  [...byChapter.entries()].sort((a, b) => a[0].localeCompare(b[0])).forEach(([chapter, files]) => {
+    if (!files.length) return;
+    const open = !!state.labsOpenChapters[chapter];
+    const headBtn = document.createElement('button');
+    headBtn.type = 'button';
+    headBtn.className = 'files-group-head';
+    const headLabel = document.createElement('span');
+    headLabel.textContent = `${open ? '▾' : '▸'} ${chapterDisplayName(chapter)}`;
+    const headCount = document.createElement('span');
+    headCount.className = 'files-count';
+    headCount.textContent = String(files.length);
+    headBtn.append(headLabel, headCount);
+    headBtn.addEventListener('click', () => {
+      state.labsOpenChapters[chapter] = !open;
+      renderManageDom();
+    });
+    list.appendChild(headBtn);
+    if (open) files.forEach((f) => list.appendChild(manageSectionNotebookRow(section, f)));
+  });
+  flat.forEach((f) => list.appendChild(manageSectionNotebookRow(section, f)));
+  block.appendChild(list);
+
+  // Add a static notebook — both ways: upload an existing .ipynb file,
+  // or create a new notebook in the section (one button per language,
+  // same as the reader's + menu).
+  const add = document.createElement('div');
+  add.className = 'manage-actions';
+  const upBtn = document.createElement('button');
+  upBtn.type = 'button';
+  upBtn.className = 'mini-btn';
+  upBtn.textContent = '+ Upload .ipynb';
+  upBtn.addEventListener('click', () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.ipynb';
+    input.addEventListener('change', async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      await manageAddSectionNotebookFile(section, file);
+    });
+    input.click();
+  });
+  add.appendChild(upBtn);
+  const newLabel = document.createElement('span');
+  newLabel.className = 'hint';
+  newLabel.textContent = 'New:';
+  add.appendChild(newLabel);
+  RUNNABLE_LANGS.forEach((lang) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'mini-btn';
+    b.textContent = LANG_DISPLAY[lang];
+    b.title = `Create a new ${LANG_DISPLAY[lang]} notebook in ${section.name}`;
+    b.addEventListener('click', () => manageCreateSectionNotebook(section, lang));
+    add.appendChild(b);
+  });
+  block.appendChild(add);
+  return block;
+}
+
+function renderManageSections(host) {
+  const sections = state.sections || [];
+  if (!sections.length) {
+    host.appendChild(manageHintEl('No sections yet.'));
+    return;
+  }
+  sections.forEach((section) => host.appendChild(renderManageSection(section)));
+}
+
+async function manageAddSection() {
+  const name = window.prompt('New section name:', nextSectionName(state.sections || []));
+  if (!name) return;
+  const clean = name.trim();
+  if (!clean) return;
+  try {
+    const created = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/sections`,
+      'POST', { name: clean });
+    await renderManagePage(state.project.slug);
+    setManageStatus(`Added section ${created.name}.`);
+  } catch (err) {
+    setManageStatus(err.message, 'error');
+  }
+}
+
+async function manageAddSectionNotebookFile(section, file) {
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const created = await api(`/api/projects/${encodeURIComponent(state.project.slug)}/sections/${encodeURIComponent(section.id)}/notebooks`,
+      { method: 'POST', body: form });
+    await renderManagePage(state.project.slug);
+    setManageStatus(`Added ${created?.name || file.name} to ${section.name}.`);
+  } catch (err) {
+    setManageStatus(err.message, 'error');
+  }
+}
+
+async function manageCreateSectionNotebook(section, lang) {
+  lang = RUNNABLE_LANGS.includes(lang) ? lang : 'python';
+  const existing = (section.notebooks || []).map((n) => n.name);
+  const name = window.prompt(`New ${LANG_DISPLAY[lang]} notebook name:`,
+    firstFreeName(existing, `${lang}-scratch`, '.ipynb'));
+  if (!name) return;
+  const clean = name.trim().endsWith('.ipynb') ? name.trim() : `${name.trim()}.ipynb`;
+  try {
+    const created = await apiJson(
+      `/api/projects/${encodeURIComponent(state.project.slug)}/sections/${encodeURIComponent(section.id)}/notebooks`,
+      'POST', { name: clean, language: lang });
+    await renderManagePage(state.project.slug);
+    setManageStatus(`Added ${created.name} to ${section.name}.`);
+  } catch (err) {
+    setManageStatus(err.message, 'error');
+  }
+}
+
 function renderManageDom() {
   const p = state.project;
   if (!p || manageSlug !== p.slug) return; // navigated away since the call was queued
@@ -780,24 +971,35 @@ function renderManageDom() {
         <button type="button" id="manage-open-reader" class="primary">Open reader</button>
         <button type="button" id="manage-export">Export Markdown</button>
       </div>
-      <section class="manage-section">
-        <h2>Source</h2>
-        <div class="files-list" id="manage-source-list"></div>
-        <div id="manage-source-add"></div>
-      </section>
-      <section class="manage-section">
-        <h2>Materials</h2>
-        <div class="files-list" id="manage-materials-list"></div>
-        <div class="manage-actions" id="manage-materials-add"></div>
-      </section>
-      <section class="manage-section">
-        <h2>Labs</h2>
-        <div class="files-list" id="manage-labs-list"></div>
-      </section>
-      <section class="manage-section">
-        <h2>Notes</h2>
-        <div class="files-list" id="manage-notes-list"></div>
-      </section>
+      <div class="manage-columns">
+        <div class="manage-col">
+          <section class="manage-section">
+            <h2>Source</h2>
+            <div class="files-list" id="manage-source-list"></div>
+            <div id="manage-source-add"></div>
+          </section>
+          <section class="manage-section">
+            <h2>Materials</h2>
+            <div class="files-list" id="manage-materials-list"></div>
+            <div class="manage-actions" id="manage-materials-add"></div>
+          </section>
+        </div>
+        <div class="manage-col">
+          <section class="manage-section">
+            <h2>Sections</h2>
+            <div id="manage-sections-list"></div>
+            <div class="manage-actions" id="manage-sections-add"></div>
+          </section>
+          <section class="manage-section">
+            <h2>Notebooks</h2>
+            <div class="files-list" id="manage-notebooks-list"></div>
+          </section>
+          <section class="manage-section">
+            <h2>Notes</h2>
+            <div class="files-list" id="manage-notes-list"></div>
+          </section>
+        </div>
+      </div>
     </div>`;
 
   $('#manage-open-reader', view).addEventListener('click', () => {
@@ -872,55 +1074,40 @@ function renderManageDom() {
   matStatus.id = 'manage-material-status';
   matAdd.appendChild(matStatus);
 
-  // --- Labs: seeded material, grouped by chapter, no delete.
-  const labsList = $('#manage-labs-list', view);
-  const labs = state.labs || [];
-  if (!labs.length) labsList.appendChild(manageHintEl('No labs.'));
-  labs.forEach((group) => {
-    const files = Array.isArray(group.files) ? group.files : [];
-    if (!files.length) return;
-    const open = !!state.labsOpenChapters[group.chapter];
-    const head = document.createElement('button');
-    head.type = 'button';
-    head.className = 'files-group-head';
-    const headLabel = document.createElement('span');
-    headLabel.textContent = `${open ? '▾' : '▸'} ${chapterDisplayName(group.chapter)}`;
-    const headCount = document.createElement('span');
-    headCount.className = 'files-count';
-    headCount.textContent = String(files.length);
-    head.append(headLabel, headCount);
-    head.addEventListener('click', () => {
-      state.labsOpenChapters[group.chapter] = !open;
-      renderManageDom();
-    });
-    labsList.appendChild(head);
-    if (open) {
-      files.forEach((f) => {
-        labsList.appendChild(manageStaticRow(labDisplayName(f.name), 'Lab'));
-      });
-    }
+  // --- Sections: user-addable groups of static notebooks. The Labs
+  // section is one section among others — no delete anywhere.
+  const sectionsHost = $('#manage-sections-list', view);
+  renderManageSections(sectionsHost);
+  const sectionsAdd = $('#manage-sections-add', view);
+  const addSectionBtn = document.createElement('button');
+  addSectionBtn.type = 'button';
+  addSectionBtn.className = 'mini-btn';
+  addSectionBtn.textContent = '+ Add section';
+  addSectionBtn.addEventListener('click', manageAddSection);
+  sectionsAdd.appendChild(addSectionBtn);
+  const sectionsStatus = document.createElement('span');
+  sectionsStatus.className = 'hint';
+  sectionsStatus.id = 'manage-sections-status';
+  sectionsAdd.appendChild(sectionsStatus);
+
+  // --- Notebooks: owned notebooks (dynamic, deletable). Created from the
+  // reader's + menu; this page manages, it does not create them.
+  const nbsList = $('#manage-notebooks-list', view);
+  const nbs = (state.notes || []).filter((n) => n.kind === 'ipynb');
+  if (!nbs.length) nbsList.appendChild(manageHintEl('No notebooks yet.'));
+  nbs.forEach((n) => {
+    const tag = n.language ? (NB_LANG_TAG[String(n.language).toLowerCase()] || String(n.language)) : null;
+    nbsList.appendChild(manageDynamicRow(n, tag));
   });
 
-  // --- Notes: notes.md (Master, Edit, no delete) + owned notes and
-  // notebooks (deletable). Notebooks stay creatable from the reader's
-  // + menu only — this page manages, it does not create them.
+  // --- Notes: notes.md (Master, Edit, no delete) + owned markdown notes
+  // (deletable).
   const notesList = $('#manage-notes-list', view);
   const mds = (state.notes || []).filter((n) => n.kind === 'md');
-  const nbs = (state.notes || []).filter((n) => n.kind === 'ipynb');
-  if (!mds.length && !nbs.length) notesList.appendChild(manageHintEl('No notes yet.'));
-  if (mds.length) {
-    notesList.appendChild(filesSection('Notes'));
-    mds.forEach((n) => {
-      notesList.appendChild(n.name === 'notes.md' ? manageMasterRow() : manageDynamicRow(n, null));
-    });
-  }
-  if (nbs.length) {
-    notesList.appendChild(filesSection('Notebooks'));
-    nbs.forEach((n) => {
-      const tag = n.language ? (NB_LANG_TAG[String(n.language).toLowerCase()] || String(n.language)) : null;
-      notesList.appendChild(manageDynamicRow(n, tag));
-    });
-  }
+  if (!mds.length) notesList.appendChild(manageHintEl('No notes yet.'));
+  mds.forEach((n) => {
+    notesList.appendChild(n.name === 'notes.md' ? manageMasterRow() : manageDynamicRow(n, null));
+  });
 }
 
 /* Add-source controls for a name-only project: a file (plain add, or
@@ -1353,6 +1540,22 @@ async function openProject(slug) {
     await openReaderSource(openSource);
   } else {
     await restoreReadingPosition();
+  }
+  // Management page → section row: open that static notebook for this
+  // slug (one-shot, consumed on open). A Labs entry opens through the
+  // labs API (it lives under notes/labs/); any other section entry opens
+  // through the section API. Anything unresolvable leaves the reader on
+  // the default note.
+  const openNb = pendingSectionNotebook?.slug === slug ? pendingSectionNotebook : null;
+  pendingSectionNotebook = null;
+  if (openNb) {
+    const section = (state.project.sections || []).find((s) => s.id === openNb.sectionId);
+    const entry = section?.notebooks?.find((n) => n.name === openNb.name);
+    if (entry?.chapter) {
+      try { await openLab(entry.chapter, entry.name); } catch { /* reader stays on the default note */ }
+    } else if (entry) {
+      try { await openSectionNotebook(openNb.sectionId, openNb.name); } catch { /* reader stays on the default note */ }
+    }
   }
 }
 
@@ -3586,10 +3789,10 @@ function persistOpenTabs() {
   } catch { /* ignore */ }
 }
 
-/* How many tabs are open (owned notes + labs) — the Files directory
-   shows by default when this is zero. */
+/* How many tabs are open (owned notes + labs + section notebooks) — the
+   Files directory shows by default when this is zero. */
 function openTabCount() {
-  return (state.openNotes?.size || 0) + (state.labTabs?.length || 0);
+  return (state.openNotes?.size || 0) + (state.labTabs?.length || 0) + (state.sectionTabs?.length || 0);
 }
 
 function filesVisible() {
@@ -3601,6 +3804,7 @@ function filesVisible() {
 function clearActiveNote() {
   state.activeTabKind = 'note';
   state.activeLab = null;
+  state.activeSection = null;
   state.activeNoteName = null;
   state.activeNoteKind = 'md';
   state.activeNoteContent = '';
@@ -3630,6 +3834,7 @@ async function loadNote(name) {
   const content = typeof data === 'string' ? data : (data.content ?? '');
   state.activeTabKind = 'note';
   state.activeLab = null;
+  state.activeSection = null;
   state.activeNoteName = name;
   state.activeNoteKind = name.toLowerCase().endsWith('.ipynb') ? 'ipynb' : 'md';
   state.activeNoteContent = content;
@@ -3676,6 +3881,10 @@ let pendingNotesMdEditSlug = null;
 // that source for this slug (one-shot, consumed on open). sourceId is
 // 'book' (the main PDF) or a material id (an extra PDF or a slide deck).
 let pendingOpenSource = null;
+// Set by a Management page section row: openProject then opens that static
+// notebook for this slug (one-shot, consumed on open). A Labs entry opens
+// through the labs API; any other section entry through the section API.
+let pendingSectionNotebook = null;
 /* Activation sequence for loadNote/loadLab (see loadNote): the latest
    requested activation wins over any earlier one still in flight. */
 let activationSeq = 0;
@@ -3905,7 +4114,7 @@ function renderNotebookPane() {
     if (e.target.closest('.tab-close')) return; // that's the close ×
     const under = document.elementFromPoint(e.clientX, e.clientY);
     const tabEl = under?.closest('.note-tab');
-    if (!tabEl || tabEl.classList.contains('lab-tab')) return;
+    if (!tabEl || tabEl.classList.contains('lab-tab') || tabEl.classList.contains('section-tab')) return;
     const name = (tabEl.querySelector('input')?.value || tabEl.textContent || '')
       .replace(/Sure\?|✕/g, '').trim();
     const note = state.notes.find((n) => n.name === name);
@@ -3930,6 +4139,31 @@ function renderNotebookPane() {
     tab.addEventListener('click', async () => {
       if (isActive) return;
       await loadLab(lab.chapter, lab.name);
+      renderNotebookPane();
+      renderChapterPanel();
+    });
+    tabs.appendChild(tab);
+  });
+  // Section notebooks opened as tabs: only the opened notebook becomes
+  // a tab, like a lab tab.
+  state.sectionTabs.forEach((sectionTab) => {
+    const isActive = state.activeTabKind === 'section' && state.activeSection
+      && state.activeSection.sectionId === sectionTab.sectionId && state.activeSection.name === sectionTab.name;
+    const tab = document.createElement('button');
+    tab.type = 'button';
+    tab.className = `note-tab section-tab${isActive ? ' active' : ''}`;
+    tab.title = `${sectionTab.sectionId}/${sectionTab.name}`;
+    const label = document.createElement('span');
+    label.textContent = labDisplayName(sectionTab.name);
+    const close = document.createElement('span');
+    close.className = 'tab-close';
+    close.textContent = '✕';
+    close.title = 'Close notebook tab';
+    close.addEventListener('click', (e) => { e.stopPropagation(); closeSectionTab(sectionTab); });
+    tab.append(label, close);
+    tab.addEventListener('click', async () => {
+      if (isActive) return;
+      await loadSectionNotebook(sectionTab.sectionId, sectionTab.name);
       renderNotebookPane();
       renderChapterPanel();
     });
@@ -4263,6 +4497,7 @@ async function loadLab(chapter, name) {
   else content = '';
   state.activeTabKind = 'lab';
   state.activeLab = { chapter, name };
+  state.activeSection = null;
   state.activeNoteName = name;
   state.activeNoteKind = 'ipynb';
   state.activeNoteContent = content;
@@ -4304,8 +4539,8 @@ async function flushActiveNoteEdits() {
 }
 
 /* After the active tab closes (or its file is deleted): activate the
-   first remaining open tab — an owned note first, else a lab — or clear
-   the pane when none is open. */
+   first remaining open tab — an owned note first, else a lab, else a
+   section notebook — or clear the pane when none is open. */
 async function activateFallbackTab() {
   const def = defaultEditorNote();
   if (def) {
@@ -4314,6 +4549,10 @@ async function activateFallbackTab() {
   const lab = (state.labTabs || [])[0];
   if (lab) {
     try { await loadLab(lab.chapter, lab.name); return; } catch { /* fall through */ }
+  }
+  const sec = (state.sectionTabs || [])[0];
+  if (sec) {
+    try { await loadSectionNotebook(sec.sectionId, sec.name); return; } catch { /* fall through */ }
   }
   clearActiveNote();
 }
@@ -4340,6 +4579,62 @@ async function closeLabTab(lab) {
     (t) => !(t.chapter === lab.chapter && t.name === lab.name));
   const wasActive = state.activeTabKind === 'lab' && state.activeLab
     && state.activeLab.chapter === lab.chapter && state.activeLab.name === lab.name;
+  if (!wasActive) { renderNotebookPane(); return; }
+  await flushActiveNoteEdits();
+  await activateFallbackTab();
+  renderNotebookPane();
+  renderChapterPanel();
+}
+
+/* Open a static notebook from a section as a tab (like openLab): the
+   section tab is session-only, like a lab tab — the file stays on disk
+   and re-opens from the Management page. */
+async function openSectionNotebook(sectionId, name) {
+  const existing = state.sectionTabs.find((t) => t.sectionId === sectionId && t.name === name);
+  if (!existing) state.sectionTabs.push({ sectionId, name });
+  try {
+    await loadSectionNotebook(sectionId, name);
+  } catch (err) {
+    window.alert(`Could not open this notebook: ${err.message}`);
+    return;
+  }
+  renderNotebookPane();
+  renderChapterPanel();
+}
+
+async function loadSectionNotebook(sectionId, name) {
+  const slug = state.project.slug;
+  // Same activation token as loadNote/loadLab: last requested wins.
+  const token = ++activationSeq;
+  const data = await apiGet(`/api/projects/${encodeURIComponent(slug)}/sections/${encodeURIComponent(sectionId)}/notebooks/${encodeURIComponent(name)}`);
+  if (token !== activationSeq) return; // superseded by a newer activation
+  // Same shape as GET labs/:chapter/:name ({name, path, content}).
+  let content;
+  if (typeof data === 'string') content = data;
+  else if (data && typeof data.content === 'string') content = data.content;
+  else if (data && Array.isArray(data.cells)) content = JSON.stringify(data);
+  else content = '';
+  state.activeTabKind = 'section';
+  state.activeLab = null;
+  state.activeSection = { sectionId, name, path: (data && data.path) || '' };
+  state.activeNoteName = name;
+  state.activeNoteKind = 'ipynb';
+  state.activeNoteContent = content;
+  state.activeNotebook = null;
+  try { state.activeNotebook = JSON.parse(content || '{"cells":[]}'); }
+  catch { state.activeNotebook = { cells: [], metadata: {}, nbformat: 4, nbformat_minor: 5 }; }
+  if (!Array.isArray(state.activeNotebook.cells)) state.activeNotebook.cells = [];
+  state.headings = headingsFromNotebook(state.activeNotebook);
+  resetExecCounter();
+}
+
+/* Close a section tab: only hides it — the notebook stays on disk and
+   re-opens from its section on the Management page. */
+async function closeSectionTab(sectionTab) {
+  state.sectionTabs = state.sectionTabs.filter(
+    (t) => !(t.sectionId === sectionTab.sectionId && t.name === sectionTab.name));
+  const wasActive = state.activeTabKind === 'section' && state.activeSection
+    && state.activeSection.sectionId === sectionTab.sectionId && state.activeSection.name === sectionTab.name;
   if (!wasActive) { renderNotebookPane(); return; }
   await flushActiveNoteEdits();
   await activateFallbackTab();
@@ -5252,6 +5547,10 @@ async function saveNotebook() {
       // Lab tabs save through the labs API, not the notes API.
       await apiJson(`/api/projects/${slug}/labs/${encodeURIComponent(state.activeLab.chapter)}/${encodeURIComponent(state.activeLab.name)}`,
         'PUT', { content: text });
+    } else if (state.activeTabKind === 'section' && state.activeSection) {
+      // Section tabs save through the sections API.
+      await apiJson(`/api/projects/${slug}/sections/${encodeURIComponent(state.activeSection.sectionId)}/notebooks/${encodeURIComponent(state.activeSection.name)}`,
+        'PUT', { content: text });
     } else {
       await apiJson(`/api/projects/${slug}/notes/${encodeURIComponent(state.activeNoteName)}`,
         'PUT', { content: text });
@@ -5768,17 +6067,21 @@ function renderCellOutputs(el, cell) {
 
 /* ---------------- on-demand AI notes + cell export ---------------- */
 
-// A stable key for the current notebook (note or lab tab): one AI thread
-// and one export selection per notebook.
+// A stable key for the current notebook (note, lab or section tab): one
+// AI thread and one export selection per notebook.
 function notebookKey() {
   if (state.activeTabKind === 'lab' && state.activeLab) {
     return `lab:${state.activeLab.chapter}/${state.activeLab.name}`;
+  }
+  if (state.activeTabKind === 'section' && state.activeSection) {
+    return `section:${state.activeSection.sectionId}/${state.activeSection.name}`;
   }
   return `note:${state.activeNoteName}`;
 }
 
 function notebookDisplayName() {
   if (state.activeTabKind === 'lab' && state.activeLab) return labDisplayName(state.activeLab.name);
+  if (state.activeTabKind === 'section' && state.activeSection) return labDisplayName(state.activeSection.name);
   return String(state.activeNoteName || 'notebook').replace(/\.(ipynb|md)$/i, '');
 }
 
@@ -6245,11 +6548,16 @@ function aiCodeLanguage() {
 }
 
 /* The current notebook's project-relative path, as the ai-code request
-   carries it: labs live under notes/labs/<Chapter>/, note notebooks under
-   notes/. */
+   carries it: labs live under notes/labs/<Chapter>/, section notebooks
+   under notes/sections/<section-id>/ (or notes/labs/ for the Labs
+   section's entries), note notebooks under notes/. */
 function notebookPath() {
   if (state.activeTabKind === 'lab' && state.activeLab) {
     return `notes/labs/${state.activeLab.chapter}/${state.activeLab.name}`;
+  }
+  if (state.activeTabKind === 'section' && state.activeSection) {
+    return state.activeSection.path
+      || `notes/sections/${state.activeSection.sectionId}/${state.activeSection.name}`;
   }
   return `notes/${state.activeNoteName}`;
 }

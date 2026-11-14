@@ -24,6 +24,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { convertDeck } from '../src/convertDeck.js';
+import { buildLabsSection, mergeSections } from '../src/sections.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -272,6 +273,30 @@ async function downloadLabs(labsDir) {
   return { total: labPaths.length, downloaded, skipped, failed, counts };
 }
 
+/** Labs actually on disk after the download pass: [{chapter, name}].
+    The section lists what is really there, so a partial download or a
+    re-run never advertises a missing file. */
+async function scanLabsOnDisk(labsDir) {
+  const entries = [];
+  let chapters = [];
+  try {
+    chapters = (await fsp.readdir(labsDir, { withFileTypes: true }))
+      .filter((e) => e.isDirectory()).map((e) => e.name).sort();
+  } catch {
+    return entries;
+  }
+  for (const chapter of chapters) {
+    let files = [];
+    try {
+      files = (await fsp.readdir(path.join(labsDir, chapter), { withFileTypes: true }))
+        .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.ipynb'))
+        .map((e) => e.name).sort();
+    } catch { /* no files in this chapter */ }
+    for (const name of files) entries.push({ chapter, name });
+  }
+  return entries;
+}
+
 async function writeIfAbsent(file, content) {
   try {
     await fsp.stat(file);
@@ -353,6 +378,13 @@ async function main() {
     console.log('Removed placeholder notes/exercises.ipynb (superseded by notes/labs/)');
   } catch { /* already gone */ }
 
+  // --- Sections: the Labs section, written through the same structure
+  // the Management page reads and writes (src/sections.js) — not a
+  // separate hardcoded path. Re-runs merge: labs found on disk are
+  // added, user sections and user-added entries inside Labs are kept.
+  const labsSection = buildLabsSection(await scanLabsOnDisk(labsDir));
+  console.log(`Sections: Labs section holds ${labsSection.notebooks.length} notebooks on disk`);
+
   // --- project.json: never overwrite user edits; only top up materials[] ---
   const now = new Date().toISOString();
   const projectFile = path.join(dir, 'project.json');
@@ -365,12 +397,16 @@ async function main() {
     const byId = new Map((existing.materials ?? []).map((m) => [m.id, m]));
     for (const m of materials) byId.set(m.id, { ...(byId.get(m.id) ?? {}), ...m });
     existing.materials = [...byId.values()];
-    if (JSON.stringify(existing.materials) !== before) {
+    const beforeSections = JSON.stringify(existing.sections ?? null);
+    existing.sections = mergeSections(existing.sections, labsSection);
+    const changed = JSON.stringify(existing.materials) !== before
+      || JSON.stringify(existing.sections) !== beforeSections;
+    if (changed) {
       existing.updatedAt = now;
       await fsp.writeFile(projectFile, JSON.stringify(existing, null, 2) + '\n', 'utf8');
-      console.log('project.json: materials[] topped up (other fields preserved)');
+      console.log('project.json: materials[] / sections[] topped up (other fields preserved)');
     } else {
-      console.log('project.json: materials[] already complete — untouched');
+      console.log('project.json: materials[] and sections[] already complete — untouched');
     }
   } else {
     const project = {
@@ -382,6 +418,11 @@ async function main() {
       file: 'source.pdf',
       cover: null,
       materials,
+      // Static-notebook sections (see src/sections.js): the Labs section
+      // is one section among others — the user can add sections and static
+      // notebooks from the Management page, and re-running the seed merges
+      // (never removes user sections or user-added entries).
+      sections: [labsSection],
       // chapterMap is the MANUAL override scheme (shared with the
       // frontend): normalized outline title -> index of its `##` heading
       // in notes.md (0-based). It starts EMPTY — headings are created on

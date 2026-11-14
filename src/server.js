@@ -39,6 +39,11 @@ import {
 } from './annotations.js';
 import { ensurePdf, isConvertibleDoc } from './convertDocument.js';
 import { createZip } from './zipStore.js';
+import {
+  SECTION_NOTEBOOKS_DIR, SECTION_ID_RE,
+  SECTION_NOTEBOOK_NAME_RE, SECTION_LANGUAGES,
+  normalizeSections, findSection, nextSectionName, sectionIdFor,
+} from './sections.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -97,15 +102,25 @@ async function listNoteFiles(slug) {
 /* Best-effort language of a stored notebook (metadata language_info /
    kernelspec) for the Files directory's tag — null when the file is
    unreadable or names no language. Never throws. */
-async function notebookLanguageOf(slug, name) {
+async function notebookLanguageAt(file) {
   try {
-    const file = resolveProjectPath(DATA_DIR, slug, 'notes', name);
     const nb = JSON.parse(await fsp.readFile(file, 'utf8'));
     const lang = nb?.metadata?.language_info?.name || nb?.metadata?.kernelspec?.language || null;
     return typeof lang === 'string' && lang.trim() ? lang.trim().toLowerCase() : null;
   } catch {
     return null;
   }
+}
+
+/* Language of a notebook object already parsed in memory (an upload
+   buffer, or a freshly built notebook) — same best-effort rule. */
+function notebookLanguageOfObject(nb) {
+  const lang = nb?.metadata?.language_info?.name || nb?.metadata?.kernelspec?.language || null;
+  return typeof lang === 'string' && lang.trim() ? lang.trim().toLowerCase() : null;
+}
+
+async function notebookLanguageOf(slug, name) {
+  return notebookLanguageAt(resolveProjectPath(DATA_DIR, slug, 'notes', name));
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +730,199 @@ app.put('/api/projects/:slug/labs/:chapter/:name', async (req, res, next) => {
     res.json({ name: req.params.name, content });
   } catch (err) {
     if (err.status === 400) return res.status(400).json({ error: err.message });
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Sections — user-addable groups of STATIC notebooks on the Management
+// page (project.json `sections[]`). The Labs section is one section among
+// others, written by the seed through the same structure. Sections and
+// the notebooks in them are NON-DELETABLE by design (his original spec):
+// there is deliberately no delete/rename/move endpoint here.
+// A section notebook is one file on disk; the entry records its
+// project-relative path, so the Labs section's entries keep pointing at
+// notes/labs/<Chapter>/ while user-added ones live under
+// notes/sections/<section-id>/.
+// ---------------------------------------------------------------------------
+
+/** Sections of a project, normalized (malformed entries dropped). */
+function getSections(project) {
+  return normalizeSections(project?.sections ?? []);
+}
+
+function validateSectionId(id) {
+  if (!SECTION_ID_RE.test(id ?? '')) {
+    const err = new Error('Invalid section id');
+    err.status = 400;
+    throw err;
+  }
+}
+
+function validateSectionNotebookName(name) {
+  if (!SECTION_NOTEBOOK_NAME_RE.test(name ?? '')) {
+    const err = new Error('Invalid notebook name: must be a .ipynb file name without path separators');
+    err.status = 400;
+    throw err;
+  }
+}
+
+/** A new notebook the way the + menu builds one: one empty code cell,
+    language in kernelspec + language_info. Same shape as the frontend's
+    createIpynbNote. */
+function newSectionNotebook(lang) {
+  return {
+    cells: [{ cell_type: 'code', execution_count: null, metadata: {}, outputs: [], source: [] }],
+    metadata: { kernelspec: { display_name: lang, language: lang, name: lang }, language_info: { name: lang } },
+    nbformat: 4,
+    nbformat_minor: 5,
+  };
+}
+
+/** The section + entry for a section-notebook request, or a 404. */
+async function sectionNotebookEntry(slug, sectionId, name) {
+  validateSectionId(sectionId);
+  validateSectionNotebookName(name);
+  const project = await readProject(slug);
+  const sections = getSections(project);
+  const section = findSection(sections, sectionId);
+  if (!section) {
+    const err = new Error('section not found');
+    err.status = 404;
+    throw err;
+  }
+  const entry = section.notebooks.find((n) => n.name === name);
+  if (!entry) {
+    const err = new Error('notebook not found in this section');
+    err.status = 404;
+    throw err;
+  }
+  return { project, sections, section, entry };
+}
+
+app.post('/api/projects/:slug/sections', async (req, res, next) => {
+  try {
+    const project = await readProject(req.params.slug);
+    const sections = getSections(project);
+    const rawName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const name = rawName || nextSectionName(sections); // default: "Section 1", "Section 2", …
+    if (name.length > 120) {
+      return res.status(400).json({ error: 'section name is too long (max 120 characters)' });
+    }
+    const section = { id: sectionIdFor(name, sections), name, notebooks: [] };
+    project.sections = [...sections, section];
+    await writeProject(req.params.slug, project);
+    res.status(201).json(section);
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// Add a static notebook to a section — BOTH ways (his answer 2026-11-13):
+// (a) multipart upload of an existing .ipynb file; (b) JSON {name,
+// language} creating a new notebook in the section. A name already in
+// the section (or a file already on disk there) is a 409, never an
+// overwrite.
+app.post('/api/projects/:slug/sections/:sectionId/notebooks', upload.single('file'), async (req, res, next) => {
+  try {
+    validateSectionId(req.params.sectionId);
+    const project = await readProject(req.params.slug);
+    const sections = getSections(project);
+    const section = findSection(sections, req.params.sectionId);
+    if (!section) return res.status(404).json({ error: 'section not found' });
+
+    let name;
+    let nb;
+    let language = null;
+    if (req.file) {
+      name = req.file.originalname || '';
+      if (!name.toLowerCase().endsWith('.ipynb')) {
+        return res.status(400).json({ error: 'only .ipynb files can be added as notebooks' });
+      }
+      validateSectionNotebookName(name);
+      try {
+        nb = parseNotebook(req.file.buffer.toString('utf8'));
+      } catch (e) {
+        return res.status(400).json({ error: `uploaded file is not a valid notebook: ${e.message}` });
+      }
+      language = notebookLanguageOfObject(nb);
+    } else {
+      const rawName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+      if (!rawName) return res.status(400).json({ error: 'name is required' });
+      name = rawName.endsWith('.ipynb') ? rawName : `${rawName}.ipynb`;
+      validateSectionNotebookName(name);
+      const lang = typeof req.body?.language === 'string' ? req.body.language.toLowerCase() : '';
+      if (!SECTION_LANGUAGES.includes(lang)) {
+        return res.status(400).json({ error: `language must be one of: ${SECTION_LANGUAGES.join(', ')}` });
+      }
+      nb = newSectionNotebook(lang);
+      language = lang;
+    }
+
+    if (section.notebooks.some((n) => n.name === name)) {
+      return res.status(409).json({ error: `a notebook named ${name} is already in this section` });
+    }
+    const relPath = `${SECTION_NOTEBOOKS_DIR}/${section.id}/${name}`;
+    const file = resolveProjectPath(DATA_DIR, req.params.slug, ...relPath.split('/'));
+    if (await fileExists(file)) {
+      return res.status(409).json({ error: `a file named ${name} already exists in this section` });
+    }
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    await fsp.writeFile(file, JSON.stringify(nb, null, 2), 'utf8');
+    const entry = { name, path: relPath, ...(language ? { language } : {}) };
+    section.notebooks.push(entry);
+    project.sections = sections;
+    await writeProject(req.params.slug, project);
+    res.status(201).json(entry);
+  } catch (err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+app.get('/api/projects/:slug/sections/:sectionId/notebooks/:name', async (req, res, next) => {
+  try {
+    const { entry } = await sectionNotebookEntry(req.params.slug, req.params.sectionId, req.params.name);
+    const file = resolveProjectPath(DATA_DIR, req.params.slug, ...entry.path.split('/'));
+    const content = await fsp.readFile(file, 'utf8');
+    try {
+      parseNotebook(content); // stored section notebooks must be valid notebooks
+    } catch (e) {
+      return res.status(400).json({ error: `stored notebook is not a valid notebook: ${e.message}` });
+    }
+    res.json({ name: entry.name, path: entry.path, content });
+  } catch (err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
+    if (err.status === 404) return res.status(404).json({ error: err.message });
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'notebook not found' });
+    next(err);
+  }
+});
+
+app.put('/api/projects/:slug/sections/:sectionId/notebooks/:name', async (req, res, next) => {
+  try {
+    const { entry } = await sectionNotebookEntry(req.params.slug, req.params.sectionId, req.params.name);
+    const { content } = req.body ?? {};
+    if (typeof content !== 'string') {
+      return res.status(400).json({ error: 'content (string) is required' });
+    }
+    try {
+      parseNotebook(content);
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+    const file = resolveProjectPath(DATA_DIR, req.params.slug, ...entry.path.split('/'));
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    await fsp.writeFile(file, content, 'utf8');
+    const project = await readProject(req.params.slug);
+    await writeProject(req.params.slug, project); // bump updatedAt
+    res.json({ name: entry.name, path: entry.path, content });
+  } catch (err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
+    if (err.status === 404) return res.status(404).json({ error: err.message });
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
     next(err);
   }

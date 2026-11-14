@@ -241,8 +241,19 @@ h1, h2, h3, .serif { font-family: Georgia, "Times New Roman", serif; }
 
 /* Project Management page (#/manage/<slug>): grouped lists reusing the
    Files directory's rows/tags/delete. Labels/numbers/buttons only. */
-.manage-page { max-width: 860px; margin: 0 auto; padding: 8px 4px 48px; }
+.manage-page { max-width: 1080px; margin: 0 auto; padding: 8px 4px 48px; }
 .manage-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+/* Two columns: LEFT = static PDF/slide (Source + Materials), RIGHT =
+   static notebooks + owned notebooks + notes. Stacked below 760px. */
+.manage-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 0 56px; align-items: start; }
+@media (max-width: 760px) {
+  .manage-columns { grid-template-columns: 1fr; }
+}
+/* One section block inside the Sections group (name + count, its
+   notebooks, its add-notebook controls). */
+.manage-section-block { margin-top: 16px; }
+.manage-section-block:first-child { margin-top: 0; }
+.manage-section-block .files-section .files-count { margin-left: 8px; }
 .manage-head h1 { margin: 0; font-size: 24px; flex: 1; min-width: 160px; }
 .manage-head .back-link { flex: none; }
 .manage-status { font-size: 12.5px; color: var(--ink-faint); }
