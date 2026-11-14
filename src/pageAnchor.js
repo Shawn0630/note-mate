@@ -9,10 +9,21 @@
 // 'book' is the project's main PDF; anything else is a material id (deck).
 // The seed already writes `<!-- p. N -->` comments; this is the same
 // convention with the source made explicit so a chip can jump back to it.
+//
+// A linked anchor additionally names the note file the entry belongs to:
+//
+//   <!-- @page 18 · source: book · note: my-note.md -->
+//
+// The `· note: <file>` part is optional: a bare anchor (no note part)
+// behaves exactly as before — its chip jumps to the page. A linked
+// anchor's chip opens the note file instead (the page is still shown on
+// the chip, and the entry is what ties a note file to its place in
+// notes.md — see src/noteLinks.js). Note names never contain spaces
+// (NOTE_NAME_RE in server.js), so the note token is one word.
 
 export const PAGE_ANCHOR_SOURCE_BOOK = 'book';
 
-export function formatPageAnchor({ page, sourceId }) {
+export function formatPageAnchor({ page, sourceId, note = null }) {
   const n = Number(page);
   if (!Number.isInteger(n) || n < 1) {
     throw new Error('page must be a positive integer');
@@ -21,16 +32,25 @@ export function formatPageAnchor({ page, sourceId }) {
   if (!src || /\s/.test(src)) {
     throw new Error('sourceId must be a non-empty token without spaces');
   }
+  if (note != null) {
+    const f = String(note).trim();
+    if (!f || /\s/.test(f) || !f.endsWith('.md')) {
+      throw new Error('note must be a .md file name without spaces');
+    }
+    return `<!-- @page ${n} · source: ${src} · note: ${f} -->`;
+  }
   return `<!-- @page ${n} · source: ${src} -->`;
 }
 
-// Scan markdown text for anchor comments. Returns [{page, sourceId, index}]
-// in document order (index = offset of the comment in the text).
+// Scan markdown text for anchor comments. Returns
+// [{page, sourceId, note, index}] in document order (index = offset of the
+// comment in the text). `note` is the linked note file name, or null for a
+// bare page anchor.
 export function parsePageAnchors(text) {
   const out = [];
-  const re = /<!--\s*@page\s+(\d+)\s*·\s*source:\s*([^\s>]+)\s*-->/g;
+  const re = /<!--\s*@page\s+(\d+)\s*·\s*source:\s*([^\s>]+)(?:\s*·\s*note:\s*([^\s>]+))?\s*-->/g;
   for (const m of String(text ?? '').matchAll(re)) {
-    out.push({ page: Number(m[1]), sourceId: m[2], index: m.index });
+    out.push({ page: Number(m[1]), sourceId: m[2], note: m[3] ?? null, index: m.index });
   }
   return out;
 }
@@ -38,18 +58,23 @@ export function parsePageAnchors(text) {
 // Chip label for an anchor. `material` is the material the anchor points
 // at ({label, kind}) or null for the book. A deck reads "Slide N", any other
 // PDF material reads "p. N · <label>" (the label disambiguates it from the
-// book), the book reads "p. N".
+// book), the book reads "p. N". A linked anchor prefixes the note file's
+// stem: "my-note · p. 18".
 export function anchorChipLabel(anchor, material) {
   if (!anchor) return '';
-  if (anchor.sourceId === PAGE_ANCHOR_SOURCE_BOOK) return `p. ${anchor.page}`;
-  // With the material in hand the kind decides. Without it, fall back to
-  // the seed's naming convention: deck ids are `slides-*`.
-  const kind = material ? String(material.kind || '').toLowerCase() : null;
-  if (kind === 'slides' || (kind == null && String(anchor.sourceId).startsWith('slides-'))) {
-    return `Slide ${anchor.page}`;
-  }
-  const label = material?.label || anchor.sourceId;
-  return `p. ${anchor.page} · ${label}`;
+  const pageLabel = (() => {
+    if (anchor.sourceId === PAGE_ANCHOR_SOURCE_BOOK) return `p. ${anchor.page}`;
+    // With the material in hand the kind decides. Without it, fall back to
+    // the seed's naming convention: deck ids are `slides-*`.
+    const kind = material ? String(material.kind || '').toLowerCase() : null;
+    if (kind === 'slides' || (kind == null && String(anchor.sourceId).startsWith('slides-'))) {
+      return `Slide ${anchor.page}`;
+    }
+    const label = material?.label || anchor.sourceId;
+    return `p. ${anchor.page} · ${label}`;
+  })();
+  if (anchor.note) return `${String(anchor.note).replace(/\.md$/i, '')} · ${pageLabel}`;
+  return pageLabel;
 }
 
 // Where does an anchor jump? 'book' is the project's main PDF; anything

@@ -29,6 +29,10 @@ import {
   dropEmptySections, stripLabsBlock, foldChapterFiles,
   INDEX_FILE, LEGACY_NOTES_FILE, MIGRATED_BACKUP_FILE, CHAPTER_BACKUP_DIR,
 } from './masterNotes.js';
+import { formatPageAnchor } from './pageAnchor.js';
+import {
+  addNoteLinkEntry, removeNoteLinkEntries, renameNoteLinkEntries,
+} from './noteLinks.js';
 import {
   ANNOTATIONS_FILE, emptyAnnotationsDoc, parseAnnotationsDoc,
   newAnnotationId, validateAnnotationInput,
@@ -894,9 +898,11 @@ app.post('/api/projects/:slug/notes/:name/rename', async (req, res, next) => {
       if (err.code !== 'ENOENT') throw err;
     }
     await fsp.rename(from, to);
+    // A rename keeps the note's link entries attached to it.
+    const notesMd = await retargetNoteLinks(req.params.slug, req.params.name, name);
     const project = await readProject(req.params.slug);
     await writeProject(req.params.slug, project); // bump updatedAt
-    res.json({ name });
+    res.json({ name, notesMd });
   } catch (err) {
     if (err.status === 400) return res.status(400).json({ error: err.message });
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
@@ -919,9 +925,150 @@ app.delete('/api/projects/:slug/notes/:name', async (req, res, next) => {
       if (err.code === 'ENOENT') return res.status(404).json({ error: 'note not found' });
       throw err;
     }
+    // Cascade: link entries pointing at the deleted file leave notes.md
+    // with it (dropping headings left empty by the removal). Bare page
+    // anchors and other notes' entries are untouched.
+    const notesMd = await cascadeNoteLinks(req.params.slug, req.params.name);
     const project = await readProject(req.params.slug);
     await writeProject(req.params.slug, project); // bump updatedAt
-    res.json({ deleted: req.params.name });
+    res.json({ deleted: req.params.name, notesMd });
+  } catch (err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// Note-link entries in notes.md (user 2026-11-13: master-note anchor →
+// note). "+ Note here" creates a note file and files a linked anchor
+// under the current chapter; the note editor's anchor control adds /
+// removes / re-points entries through these endpoints. notes.md is the
+// single source of truth — the note file itself holds no anchor data.
+// Every response carries the new notes.md text so the client can sync
+// its cache without a second round trip.
+async function readNotesMd(slug) {
+  try {
+    return await fsp.readFile(resolveProjectPath(DATA_DIR, slug, 'notes', LEGACY_NOTES_FILE), 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+async function writeNotesMd(slug, text) {
+  const notesDir = resolveProjectPath(DATA_DIR, slug, 'notes');
+  await fsp.mkdir(notesDir, { recursive: true });
+  await fsp.writeFile(path.join(notesDir, LEGACY_NOTES_FILE), text, 'utf8');
+}
+
+// Remove every link entry for a note file from notes.md (delete cascade).
+// Returns the new notes.md text, or null when the project has no notes.md.
+async function cascadeNoteLinks(slug, noteName) {
+  const current = await readNotesMd(slug);
+  if (current == null) return null;
+  const { text, removed } = removeNoteLinkEntries(current, noteName);
+  if (removed > 0) await writeNotesMd(slug, text);
+  return removed > 0 ? text : current;
+}
+
+// Retarget a renamed note's link entries. Returns the new notes.md text,
+// or null when the project has no notes.md.
+async function retargetNoteLinks(slug, from, to) {
+  const current = await readNotesMd(slug);
+  if (current == null) return null;
+  const { text, renamed } = renameNoteLinkEntries(current, from, to);
+  if (renamed > 0) await writeNotesMd(slug, text);
+  return renamed > 0 ? text : current;
+}
+
+// Add one linked entry under `heading` (created on demand). The note file
+// must already exist — "+ Note here" creates it first. `headingAnchor` is
+// the `<!-- p. N -->` chapter-start line, used only when the heading is
+// created here.
+app.post('/api/projects/:slug/note-links', async (req, res, next) => {
+  try {
+    await readProject(req.params.slug);
+    const { note, page, sourceId, heading, headingAnchor = null } = req.body ?? {};
+    validateNoteName(note);
+    if (typeof heading !== 'string' || !heading.trim()) {
+      return res.status(400).json({ error: 'heading (string) is required' });
+    }
+    try {
+      formatPageAnchor({ page, sourceId, note });
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    try {
+      await fsp.lstat(resolveProjectPath(DATA_DIR, req.params.slug, 'notes', note));
+    } catch (err) {
+      if (err.code === 'ENOENT') return res.status(404).json({ error: 'note not found' });
+      throw err;
+    }
+    let current = await readNotesMd(req.params.slug);
+    if (current == null) {
+      const project = await readProject(req.params.slug);
+      current = `# ${project.title || 'Notes'}\n`;
+    }
+    const { text, added } = addNoteLinkEntry(current, { heading, headingAnchor, page, sourceId, note });
+    if (added) await writeNotesMd(req.params.slug, text);
+    res.json({ added, notesMd: text });
+  } catch (err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// Remove one linked entry ({note, page, sourceId} — the anchor control's ×).
+app.post('/api/projects/:slug/note-links/remove', async (req, res, next) => {
+  try {
+    await readProject(req.params.slug);
+    const { note, page, sourceId } = req.body ?? {};
+    validateNoteName(note);
+    try {
+      formatPageAnchor({ page, sourceId, note });
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    const current = await readNotesMd(req.params.slug);
+    if (current == null) return res.status(404).json({ error: 'notes.md not found' });
+    const { text, removed } = removeNoteLinkEntries(current, note, { page, sourceId });
+    if (removed > 0) await writeNotesMd(req.params.slug, text);
+    res.json({ removed, notesMd: text });
+  } catch (err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// Re-point one entry at the current page, in a single notes.md write:
+// remove the old entry, add the new one under `to.heading` (created on
+// demand). 404 when the old entry is not there.
+app.post('/api/projects/:slug/note-links/repoint', async (req, res, next) => {
+  try {
+    await readProject(req.params.slug);
+    const { note, from, to } = req.body ?? {};
+    validateNoteName(note);
+    if (!from || !to || typeof to.heading !== 'string' || !to.heading.trim()) {
+      return res.status(400).json({ error: 'from, to and to.heading are required' });
+    }
+    try {
+      formatPageAnchor({ page: from.page, sourceId: from.sourceId, note });
+      formatPageAnchor({ page: to.page, sourceId: to.sourceId, note });
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    const current = await readNotesMd(req.params.slug);
+    if (current == null) return res.status(404).json({ error: 'notes.md not found' });
+    const { text: afterRemove, removed } = removeNoteLinkEntries(current, note, { page: from.page, sourceId: from.sourceId });
+    if (removed === 0) return res.status(404).json({ error: 'anchor not found' });
+    const { text, added } = addNoteLinkEntry(afterRemove, {
+      heading: to.heading, headingAnchor: to.headingAnchor ?? null,
+      page: to.page, sourceId: to.sourceId, note,
+    });
+    await writeNotesMd(req.params.slug, text);
+    res.json({ moved: true, added, notesMd: text });
   } catch (err) {
     if (err.status === 400) return res.status(400).json({ error: err.message });
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });

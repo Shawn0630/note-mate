@@ -3263,7 +3263,10 @@ async function commitNoteRename(oldName, input) {
   }
   if (state.saveTimer) { clearTimeout(state.saveTimer); state.saveTimer = null; }
   try {
-    await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/${encodeURIComponent(oldName)}/rename`, 'POST', { name });
+    const data = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/${encodeURIComponent(oldName)}/rename`, 'POST', { name });
+    // The server retargets the note's link entries in notes.md; sync the
+    // cache from the returned text.
+    if (data && typeof data.notesMd === 'string') syncNotesMdCache(data.notesMd);
   } catch (err) {
     renderNotebookPane();
     setSaveStatus(`Rename failed: ${err.message}`, 'error');
@@ -3305,7 +3308,10 @@ function armNoteDelete(name) {
 async function deleteNote(name) {
   if (state.saveTimer) { clearTimeout(state.saveTimer); state.saveTimer = null; }
   try {
-    await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/${encodeURIComponent(name)}`, 'DELETE');
+    const data = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/${encodeURIComponent(name)}`, 'DELETE');
+    // The server cascades the delete into notes.md (link entries for the
+    // file leave with it); sync the cache from the returned text.
+    if (data && typeof data.notesMd === 'string') syncNotesMdCache(data.notesMd);
   } catch (err) {
     renderNotebookPane();
     setSaveStatus(`Delete failed: ${err.message}`, 'error');
@@ -3857,23 +3863,151 @@ async function closeLabTab(lab) {
    create the heading if missing — same rule as Ask AI Apply). notes.md is
    read-only, so nothing opens in the editor: the anchor is filed by the
    API and the left preview refreshes to show it. */
+/* The notes.md heading for the chapter being read now — the heading the
+   chapter actually files under, resolved through matchHeading against the
+   master's headings — plus the `<!-- p. N -->` chapter-start line used
+   when that heading has to be created. */
+function currentChapterHeading() {
+  const ch = activeOutlineChapter();
+  const title = ch ? ch.title : 'AI notes';
+  const hit = matchHeading(title, notesMdHeadings());
+  return { heading: hit ? hit.text : title, headingAnchor: chapterPageAnchor(ch) };
+}
+
+/* "Note here": create a real anchored note. The anchor is set AT CREATION
+   to the current reading position (page/slide + source): the new .md file
+   is created, a linked anchor entry is filed under the current chapter in
+   notes.md, and the note opens as a tab. An existing name links the anchor
+   to that file instead — that is how a second anchor from another chapter
+   lands on the same note. Cancel the name prompt: nothing is written.
+   Video/YouTube sources have no reading position, so the menu item stays
+   disabled there (see openAddMenu). */
 async function addNoteAtCurrentPage() {
   const reading = currentReadingPage();
   if (!reading) return;
-  const ch = activeOutlineChapter();
-  const heading = ch ? ch.title : 'AI notes';
-  const anchor = formatPageAnchor({ page: reading.page, sourceId: reading.sourceId });
-  const { inserted } = await insertIntoNotesMd(heading, anchor, chapterPageAnchor(ch));
-  if (!inserted) {
-    setSaveStatus('A note is already anchored here — nothing added.');
-    return;
+  const { heading, headingAnchor } = currentChapterHeading();
+  const base = String(heading).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'note';
+  const name = window.prompt('New note name (ends with .md):',
+    firstFreeName(state.notes.map((n) => n.name), base, '.md'));
+  if (!name) return; // cancelled — clean abort, nothing written
+  const clean = name.trim().endsWith('.md') ? name.trim() : `${name.trim()}.md`;
+  if (!state.notes.some((n) => n.name === clean)) {
+    try {
+      await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/${encodeURIComponent(clean)}`,
+        'PUT', { content: `# ${clean.replace(/\.md$/, '')}\n` });
+    } catch (err) {
+      window.alert(`Could not create the note: ${err.message}`);
+      return;
+    }
+    state.notes.push({ name: clean, kind: 'md' });
+    state.openNotes.add(clean);
+    persistOpenTabs();
   }
+  let added = true;
+  try {
+    const data = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/note-links`,
+      'POST', { note: clean, page: reading.page, sourceId: reading.sourceId, heading, headingAnchor });
+    if (data && typeof data.notesMd === 'string') syncNotesMdCache(data.notesMd);
+    added = data ? data.added !== false : true;
+  } catch (err) {
+    window.alert(`Could not anchor the note: ${err.message}`);
+    // The file exists even when the link failed — open it so the user can
+    // anchor it from the editor's anchor control instead.
+  }
+  try {
+    await loadNote(clean);
+  } catch (err) {
+    window.alert(`Could not open ${clean}: ${err.message}`);
+  }
+  renderNotebookPane();
   renderChapterPanel();
   renderLeftPreview();
   const material = reading.sourceId === PAGE_ANCHOR_SOURCE_BOOK
     ? null
     : (state.materials || []).find((m) => m.id === reading.sourceId) || null;
-  setSaveStatus(`Note anchored at ${anchorChipLabel(reading, material)} in notes.md.`);
+  setSaveStatus(added
+    ? `Note ${clean} anchored at ${anchorChipLabel(reading, material)} in notes.md.`
+    : `${clean} is already anchored here.`);
+}
+
+/* Note-link entries pointing at one note file, from the notes.md cache
+   (fetched once when the cache is empty). notes.md is the single source of
+   truth; the note file itself holds no anchor data. */
+async function noteLinkEntries(noteName) {
+  let text = state.notesMdContent;
+  if (text == null) {
+    try {
+      const data = await apiGet(`/api/projects/${encodeURIComponent(state.project.slug)}/notes/notes.md`);
+      text = typeof data === 'string' ? data : (data.content ?? '');
+      syncNotesMdCache(text);
+    } catch {
+      return [];
+    }
+  }
+  return parsePageAnchors(text).filter((a) => a.note === noteName);
+}
+
+/* The anchor control under the quick-actions row of a markdown-note
+   editor: every notes.md entry pointing at THIS note (page + source, with
+   × to remove and ↻ to re-point at the current page) plus "+ Anchor at
+   current page". Mutations go through the note-links API; the response
+   carries the new notes.md text, so the cache, the left preview and the
+   chapter panel stay in step. Labels only, no prose. */
+async function renderAnchorControl() {
+  const host = $('#md-anchor-control', view);
+  if (!host) return;
+  const noteName = state.activeNoteName;
+  if (state.activeTabKind !== 'note' || state.activeNoteKind !== 'md' || !noteName) return;
+  const entries = await noteLinkEntries(noteName);
+  if (state.activeNoteName !== noteName || !$('#md-anchor-control', view)) return; // tab moved on
+  const reading = currentReadingPage();
+  const rows = entries.map((a) => {
+    const material = a.sourceId === PAGE_ANCHOR_SOURCE_BOOK
+      ? null
+      : (state.materials || []).find((m) => m.id === a.sourceId) || null;
+    return `<span class="anchor-entry"><span class="anchor-entry-label">${esc(anchorChipLabel(a, material))}</span><button type="button" class="anchor-entry-btn" data-page="${a.page}" data-source="${esc(a.sourceId)}" data-anchor-repoint ${reading ? '' : 'disabled'} title="Move this anchor to the current page">↻</button><button type="button" class="anchor-entry-btn" data-page="${a.page}" data-source="${esc(a.sourceId)}" data-anchor-remove title="Remove this anchor">×</button></span>`;
+  }).join('');
+  host.innerHTML = `<span class="md-anchor-label">Anchors</span>${rows}<button type="button" class="anchor-add-btn" data-anchor-add ${reading ? '' : 'disabled'} title="Anchor this note at the current page">+ Anchor at current page</button>`;
+}
+
+async function onAnchorControlClick(e) {
+  const noteName = state.activeNoteName;
+  if (!noteName) return;
+  const addBtn = e.target.closest('[data-anchor-add]');
+  const rmBtn = e.target.closest('[data-anchor-remove]');
+  const rpBtn = e.target.closest('[data-anchor-repoint]');
+  if (!addBtn && !rmBtn && !rpBtn) return;
+  const reading = currentReadingPage();
+  const slug = encodeURIComponent(state.project.slug);
+  try {
+    if (addBtn) {
+      if (!reading) return;
+      const { heading, headingAnchor } = currentChapterHeading();
+      const data = await apiJson(`/api/projects/${slug}/note-links`, 'POST',
+        { note: noteName, page: reading.page, sourceId: reading.sourceId, heading, headingAnchor });
+      if (data && typeof data.notesMd === 'string') syncNotesMdCache(data.notesMd);
+      if (data && data.added === false) setSaveStatus('This note is already anchored here.');
+    } else if (rmBtn) {
+      const data = await apiJson(`/api/projects/${slug}/note-links/remove`, 'POST',
+        { note: noteName, page: Number(rmBtn.dataset.page), sourceId: rmBtn.dataset.source });
+      if (data && typeof data.notesMd === 'string') syncNotesMdCache(data.notesMd);
+    } else {
+      if (!reading) return;
+      const { heading, headingAnchor } = currentChapterHeading();
+      const data = await apiJson(`/api/projects/${slug}/note-links/repoint`, 'POST', {
+        note: noteName,
+        from: { page: Number(rpBtn.dataset.page), sourceId: rpBtn.dataset.source },
+        to: { page: reading.page, sourceId: reading.sourceId, heading, headingAnchor },
+      });
+      if (data && typeof data.notesMd === 'string') syncNotesMdCache(data.notesMd);
+    }
+  } catch (err) {
+    setSaveStatus(`Anchor change failed: ${err.message}`, 'error');
+    return;
+  }
+  renderAnchorControl();
+  renderChapterPanel();
+  renderLeftPreview();
 }
 
 function setSaveStatus(text, cls = '') {
@@ -4390,7 +4524,7 @@ function renderNotebookBody() {
     if (a.id === 'anchor') return splitBtn(a, 'Anchor to a page you looked at recently', 'Recent pages');
     return `<button type="button" data-md-action="${a.id}" title="${esc(a.title)}">${esc(a.label)}</button>`;
   }).join('');
-  body.innerHTML = `<div class="md-quick-actions" role="toolbar" aria-label="Quick actions">${actionsHtml}</div><textarea class="md-editor" id="md-editor" spellcheck="false"></textarea>`;
+  body.innerHTML = `<div class="md-quick-actions" role="toolbar" aria-label="Quick actions">${actionsHtml}</div><div class="md-anchor-control" id="md-anchor-control"></div><textarea class="md-editor" id="md-editor" spellcheck="false"></textarea>`;
   const ta = $('#md-editor', body);
   // mousedown preventDefault keeps focus (and the selection) in the
   // editor while a quick-action button is clicked.
@@ -4432,6 +4566,10 @@ function renderNotebookBody() {
   // popup — nothing is inserted until he picks one. Text pastes are
   // untouched (no image item on the clipboard).
   ta.addEventListener('paste', (e) => handleMdEditorPaste(ta, e));
+  // The anchor control lists the notes.md entries pointing at this note.
+  const anchorHost = $('#md-anchor-control', body);
+  if (anchorHost) anchorHost.addEventListener('click', onAnchorControlClick);
+  renderAnchorControl();
 }
 
 /* Typeset LaTeX math in a rendered markdown element (notebook markdown
@@ -4484,9 +4622,9 @@ function renderMdPreview(el, text) {
   const comments = [];
   while (walker.nextNode()) comments.push(walker.currentNode);
   comments.forEach((comment) => {
-    const m = comment.textContent.match(/^\s*@page\s+(\d+)\s*·\s*source:\s*([^\s>]+)\s*$/);
+    const m = comment.textContent.match(/^\s*@page\s+(\d+)\s*·\s*source:\s*([^\s>]+)(?:\s*·\s*note:\s*([^\s>]+))?\s*$/);
     if (!m) return;
-    const anchor = { page: Number(m[1]), sourceId: m[2] };
+    const anchor = { page: Number(m[1]), sourceId: m[2], note: m[3] ?? null };
     const material = anchor.sourceId === PAGE_ANCHOR_SOURCE_BOOK
       ? null
       : (state.materials || []).find((x) => x.id === anchor.sourceId) || null;
@@ -4501,8 +4639,26 @@ function renderMdPreview(el, text) {
       : material?.kind === 'slides'
         ? `slide ${anchor.page} of ${material.label || anchor.sourceId}`
         : `p. ${anchor.page} of ${material?.label || anchor.sourceId}`;
-    chip.title = `Jump to ${jumpWord}`;
-    chip.addEventListener('click', () => jumpToAnchor(anchor.sourceId, anchor.page));
+    if (anchor.note) {
+      // A linked anchor opens its note file (master note anchor → note);
+      // the page is still shown on the chip. When the note file is gone
+      // (renamed or deleted outside the cascade), fall back to the page
+      // jump so the anchor still does something.
+      chip.classList.add('note-link-chip');
+      chip.dataset.noteLink = anchor.note;
+      chip.title = `Open ${anchor.note} (anchored at ${jumpWord})`;
+      chip.addEventListener('click', () => {
+        if ((state.notes || []).some((n) => n.name === anchor.note)) {
+          openNoteFromDirectory(anchor.note);
+        } else {
+          setSaveStatus(`${anchor.note} is gone — jumping to ${jumpWord} instead.`, 'error');
+          jumpToAnchor(anchor.sourceId, anchor.page);
+        }
+      });
+    } else {
+      chip.title = `Jump to ${jumpWord}`;
+      chip.addEventListener('click', () => jumpToAnchor(anchor.sourceId, anchor.page));
+    }
     comment.replaceWith(chip);
   });
   $$('pre', el).forEach((pre) => {
@@ -5263,34 +5419,43 @@ function insertMarkdownUnderHeading(notesText, headingTitle, markdown, headingAn
    'book' is the main PDF, anything else is a material id. */
 const PAGE_ANCHOR_SOURCE_BOOK = 'book';
 
-function formatPageAnchor({ page, sourceId }) {
+function formatPageAnchor({ page, sourceId, note = null }) {
   const n = Number(page);
   if (!Number.isInteger(n) || n < 1) throw new Error('page must be a positive integer');
   const src = String(sourceId || PAGE_ANCHOR_SOURCE_BOOK).trim();
   if (!src || /\s/.test(src)) throw new Error('sourceId must be a non-empty token without spaces');
+  if (note != null) {
+    const f = String(note).trim();
+    if (!f || /\s/.test(f) || !f.endsWith('.md')) throw new Error('note must be a .md file name without spaces');
+    return `<!-- @page ${n} · source: ${src} · note: ${f} -->`;
+  }
   return `<!-- @page ${n} · source: ${src} -->`;
 }
 
 function parsePageAnchors(text) {
   const out = [];
-  const re = /<!--\s*@page\s+(\d+)\s*·\s*source:\s*([^\s>]+)\s*-->/g;
+  const re = /<!--\s*@page\s+(\d+)\s*·\s*source:\s*([^\s>]+)(?:\s*·\s*note:\s*([^\s>]+))?\s*-->/g;
   for (const m of String(text ?? '').matchAll(re)) {
-    out.push({ page: Number(m[1]), sourceId: m[2], index: m.index });
+    out.push({ page: Number(m[1]), sourceId: m[2], note: m[3] ?? null, index: m.index });
   }
   return out;
 }
 
 function anchorChipLabel(anchor, material) {
   if (!anchor) return '';
-  if (anchor.sourceId === PAGE_ANCHOR_SOURCE_BOOK) return `p. ${anchor.page}`;
-  // With the material in hand the kind decides. Without it, fall back to
-  // the seed's naming convention: deck ids are `slides-*`.
-  const kind = material ? String(material.kind || '').toLowerCase() : null;
-  if (kind === 'slides' || (kind == null && String(anchor.sourceId).startsWith('slides-'))) {
-    return `Slide ${anchor.page}`;
-  }
-  const label = material?.label || anchor.sourceId;
-  return `p. ${anchor.page} · ${label}`;
+  const pageLabel = (() => {
+    if (anchor.sourceId === PAGE_ANCHOR_SOURCE_BOOK) return `p. ${anchor.page}`;
+    // With the material in hand the kind decides. Without it, fall back to
+    // the seed's naming convention: deck ids are `slides-*`.
+    const kind = material ? String(material.kind || '').toLowerCase() : null;
+    if (kind === 'slides' || (kind == null && String(anchor.sourceId).startsWith('slides-'))) {
+      return `Slide ${anchor.page}`;
+    }
+    const label = material?.label || anchor.sourceId;
+    return `p. ${anchor.page} · ${label}`;
+  })();
+  if (anchor.note) return `${String(anchor.note).replace(/\.md$/i, '')} · ${pageLabel}`;
+  return pageLabel;
 }
 
 /* Port of resolveAnchorTarget in src/pageAnchor.js (same rules on both

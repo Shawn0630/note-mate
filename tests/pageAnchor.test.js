@@ -69,3 +69,36 @@ test('pdfMaterials: only readable kind-pdf materials, decks excluded', () => {
   assert.deepEqual(pdfMaterials(materials).map((m) => m.id), ['extra-pdf']);
   assert.deepEqual(pdfMaterials([]), []);
 });
+
+test('formatPageAnchor: linked anchor carries the note part; bare anchor unchanged', () => {
+  assert.equal(
+    formatPageAnchor({ page: 18, sourceId: 'book', note: 'my-note.md' }),
+    '<!-- @page 18 · source: book · note: my-note.md -->');
+  assert.equal(
+    formatPageAnchor({ page: 3, sourceId: 'slides-introduction', note: 'intro.md' }),
+    '<!-- @page 3 · source: slides-introduction · note: intro.md -->');
+  assert.equal(formatPageAnchor({ page: 18, sourceId: 'book', note: null }),
+    '<!-- @page 18 · source: book -->');
+  assert.throws(() => formatPageAnchor({ page: 1, sourceId: 'book', note: 'has space.md' }), /without spaces/);
+  assert.throws(() => formatPageAnchor({ page: 1, sourceId: 'book', note: 'note.txt' }), /\.md/);
+});
+
+test('parsePageAnchors: linked anchors carry note, bare anchors carry null', () => {
+  const text = [
+    '## Introduction', '',
+    '<!-- @page 18 · source: book · note: my-note.md -->', '',
+    '<!-- @page 7 · source: book -->', '',
+    '<!-- @page 3 · source: slides-introduction · note: intro.md -->',
+  ].join('\n');
+  assert.deepEqual(parsePageAnchors(text), [
+    { page: 18, sourceId: 'book', note: 'my-note.md', index: text.indexOf('<!-- @page 18') },
+    { page: 7, sourceId: 'book', note: null, index: text.indexOf('<!-- @page 7') },
+    { page: 3, sourceId: 'slides-introduction', note: 'intro.md', index: text.indexOf('<!-- @page 3') },
+  ]);
+});
+
+test('anchorChipLabel: linked anchor shows the note stem + the page', () => {
+  assert.equal(anchorChipLabel({ page: 18, sourceId: 'book', note: 'my-note.md' }), 'my-note · p. 18');
+  assert.equal(anchorChipLabel({ page: 3, sourceId: 'slides-introduction', note: 'intro.md' }), 'intro · Slide 3');
+  assert.equal(anchorChipLabel({ page: 18, sourceId: 'book', note: null }), 'p. 18');
+});

@@ -761,6 +761,39 @@ input[type="text"].note-tab-input {
 .md-action-split .md-action-chevron {
   border-radius: 0 6px 6px 0; border-left: none; padding: 3px 6px;
 }
+/* Anchor control under the quick-actions row of a markdown-note editor:
+   the notes.md entries pointing at this note (page + source, × removes,
+   ↻ re-points at the current page) plus "+ Anchor at current page".
+   Same small-button look as the quick actions. */
+.md-anchor-control {
+  display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
+  padding: 6px 8px; border-bottom: 1px solid var(--line);
+  background: var(--paper); flex: none;
+}
+.md-anchor-control:empty { display: none; }
+.md-anchor-label { font-size: 12px; font-weight: 600; color: var(--ink-soft); margin-right: 2px; }
+.anchor-entry {
+  display: inline-flex; gap: 2px; align-items: center;
+  border: 1px solid var(--line); border-radius: 6px; padding: 1px 2px 1px 8px;
+}
+.anchor-entry-label { font-size: 12px; color: var(--accent); font-weight: 600; }
+.anchor-entry-btn {
+  font-size: 12px; line-height: 1.2; padding: 2px 6px;
+  border: none; border-radius: 4px;
+  background: transparent; color: var(--ink-soft); cursor: pointer;
+}
+.anchor-entry-btn:hover { background: var(--paper-dim); color: var(--ink); }
+.anchor-entry-btn:disabled { opacity: .4; cursor: default; }
+.anchor-add-btn {
+  font-size: 12px; line-height: 1.2; padding: 3px 8px;
+  border: 1px solid var(--line); border-radius: 6px;
+  background: transparent; color: var(--ink); cursor: pointer; white-space: nowrap;
+}
+.anchor-add-btn:hover { background: var(--paper-dim); }
+.anchor-add-btn:disabled { opacity: .4; cursor: default; }
+/* A linked anchor's chip in the Markdown preview opens its note file
+   instead of jumping to the page; same look as a page chip. */
+.note-link-chip { text-decoration-style: dashed; }
 /* Recent-impressions dropdown (Page anchor chevron): label + time rows. */
 .impression-menu { min-width: 280px; }
 /* Region-select screenshot: the overlay covers the reading pane while
