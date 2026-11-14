@@ -68,6 +68,9 @@ import {
   openTabsKey, restoreOpenTabs, serializeOpenTabs,
 } from './openTabs.js';
 import {
+  hasTabbedPaneForKind, defaultLeftTab, resolveVideoId,
+} from './readingTabs.js';
+import {
   initSync, chooseSyncFolder, reconnectSyncFolder, forgetSyncFolder,
   syncNow, markSyncDirty, renderSyncStatus, loadSyncLog,
 } from './dataSync.js';
@@ -886,16 +889,22 @@ function bookCardHtml(project) {
 /* ---------------- project management page ---------------- */
 
 /* Per-project Management page (#/manage/<slug>): the project's properties,
-   grouped — Static (source materials + seeded labs, no delete) vs Dynamic
-   (owned notes + notebooks, deletable with the same two-click arm as the
-   Files directory). notes.md is listed with no delete but an Edit action
-   that opens it as an editable tab in the reader. The page also adds the
-   main source (a name-only project has none yet) and exports the project
-   as a Markdown ZIP for Obsidian-like apps. */
+   grouped — Source (one-shot, no delete), Materials / Sections / section
+   notebooks (deletable with the same two-click arm as the Files
+   directory), and owned notes + notebooks (deletable the same way).
+   notes.md is listed with no delete but an Edit action that opens it as
+   an editable tab in the reader. The page also adds the main source (a
+   name-only project has none yet) and exports the project as a Markdown
+   ZIP for Obsidian-like apps. */
 
 let manageSlug = null; // slug of the manage page currently shown, or null
+// Two-click delete arm for the Manage page (same 2s disarm as the Files
+// directory): the armed key names the row — 'note:<name>',
+// 'material:<id>', 'section:<id>', 'section-notebook:<sectionId>:<name>'
+// — and the action runs on the confirming click.
 let armedManageDelete = null;
 let armedManageDeleteTimer = 0;
+let armedManageDeleteAction = null;
 
 function setManageStatus(message, kind) {
   const el = $('#manage-status', view);
@@ -907,7 +916,7 @@ function setManageStatus(message, kind) {
 async function renderManagePage(slug) {
   resetReaderState();
   manageSlug = slug;
-  if (armedManageDeleteTimer) { window.clearTimeout(armedManageDeleteTimer); armedManageDelete = null; }
+  if (armedManageDeleteTimer) { window.clearTimeout(armedManageDeleteTimer); armedManageDelete = null; armedManageDeleteAction = null; }
   view.innerHTML = `<div class="view-error"><p>Loading project…</p></div>`;
   let project;
   try {
@@ -958,23 +967,17 @@ function manageOpenLink(slug, sourceId) {
   return a;
 }
 
-/* Static row: name + tag, no action (source materials and seeded labs).
-   openLink, when given, is an "Open" element appended after the tag. */
-function manageStaticRow(label, tag, openLink) {
-  const row = document.createElement('div');
-  row.className = 'files-row';
-  const name = document.createElement('span');
-  name.className = 'files-row-name';
-  name.textContent = label;
-  row.appendChild(name);
-  if (tag) {
-    const t = document.createElement('span');
-    t.className = 'files-tag';
-    t.textContent = tag;
-    row.appendChild(t);
-  }
-  if (openLink) row.appendChild(openLink);
-  return row;
+/* The two-click delete control for a Manage row: ✕, then 'Sure?' while
+   armed (same 2s disarm as the Files directory). `key` names the row,
+   `action` runs on the confirming click. */
+function manageDeleteControl(key, action, title) {
+  const del = document.createElement('span');
+  const armed = armedManageDelete === key;
+  del.className = `files-del${armed ? ' armed' : ''}`;
+  del.textContent = armed ? 'Sure?' : '✕';
+  del.title = armed ? 'Click again to confirm delete' : (title || 'Delete');
+  del.addEventListener('click', (e) => { e.stopPropagation(); armManageDelete(key, action); });
+  return del;
 }
 
 /* notes.md: no delete anywhere, but an Edit action that opens it as an
@@ -1023,21 +1026,18 @@ function manageDynamicRow(note, tag) {
     t.textContent = tag;
     row.appendChild(t);
   }
-  const del = document.createElement('span');
-  del.className = `files-del${armedManageDelete === note.name ? ' armed' : ''}`;
-  del.textContent = armedManageDelete === note.name ? 'Sure?' : '✕';
-  del.title = armedManageDelete === note.name ? 'Click again to confirm delete' : 'Delete this file';
-  del.addEventListener('click', (e) => { e.stopPropagation(); armManageDelete(note.name); });
-  row.appendChild(del);
+  row.appendChild(manageDeleteControl(`note:${note.name}`, () => deleteManageNote(note.name), 'Delete this file'));
   return row;
 }
 
-function armManageDelete(name) {
-  if (armedManageDelete !== name) {
+function armManageDelete(key, action) {
+  if (armedManageDelete !== key) {
     if (armedManageDeleteTimer) window.clearTimeout(armedManageDeleteTimer);
-    armedManageDelete = name;
+    armedManageDelete = key;
+    armedManageDeleteAction = action;
     armedManageDeleteTimer = window.setTimeout(() => {
       armedManageDelete = null;
+      armedManageDeleteAction = null;
       renderManageDom();
     }, 2000);
     renderManageDom();
@@ -1045,7 +1045,9 @@ function armManageDelete(name) {
   }
   if (armedManageDeleteTimer) window.clearTimeout(armedManageDeleteTimer);
   armedManageDelete = null;
-  deleteManageNote(name);
+  const run = armedManageDeleteAction;
+  armedManageDeleteAction = null;
+  if (run) run();
 }
 
 async function deleteManageNote(name) {
@@ -1053,6 +1055,58 @@ async function deleteManageNote(name) {
   const gone = !(state.notes || []).some((n) => n.name === name);
   await renderManagePage(state.project.slug);
   setManageStatus(gone ? `Deleted ${name}.` : `Delete failed for ${name}.`, gone ? '' : 'error');
+}
+
+/* A material row: name + kind tag + Open link (as before), plus the
+   two-click delete — a file material's file goes with it (server-side).
+   The main Source is never a material row, so it can never be deleted
+   here. */
+function manageMaterialRow(m) {
+  const row = document.createElement('div');
+  row.className = 'files-row';
+  const name = document.createElement('span');
+  name.className = 'files-row-name';
+  name.textContent = m.label || m.id;
+  row.appendChild(name);
+  const t = document.createElement('span');
+  t.className = 'files-tag';
+  t.textContent = kindLabel(m.kind);
+  row.appendChild(t);
+  // Openable in the reader: a PDF or a slide deck with a file, or a
+  // YouTube video (no file — it embeds from its video id). A plain web
+  // link opens in a new browser tab instead — the reader has no tab
+  // for it. Anything else (a download-only material) gets no Open link.
+  const kind = String(m.kind || '').toLowerCase();
+  const openable = ((kind === 'pdf' || kind === 'slides') && m.hasFile !== false)
+    || kind === 'video';
+  if (kind === 'link' && m.url) {
+    const a = document.createElement('a');
+    a.className = 'manage-link';
+    a.href = m.url;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.textContent = 'Open';
+    a.title = 'Open link in a new tab';
+    row.appendChild(a);
+  } else if (openable) {
+    row.appendChild(manageOpenLink(state.project.slug, m.id));
+  }
+  row.appendChild(manageDeleteControl(
+    `material:${m.id}`,
+    () => deleteManageMaterial(m),
+    'Delete this material',
+  ));
+  return row;
+}
+
+async function deleteManageMaterial(m) {
+  try {
+    await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/materials/${encodeURIComponent(m.id)}`, 'DELETE');
+    await renderManagePage(state.project.slug);
+    setManageStatus(`Deleted ${m.label || m.id}.`);
+  } catch (err) {
+    setManageStatus(err.message, 'error');
+  }
 }
 
 /* ---------- Sections (static notebooks) ---------- */
@@ -1068,7 +1122,7 @@ function nextSectionName(sections) {
 
 /* A static notebook row in a section: the name opens the notebook as a
    tab (like a lab row in the Files directory), the tag names its
-   language. No delete — sections and their notebooks are static. */
+   language; the ✕ deletes the notebook and its file (two-click). */
 function manageSectionNotebookRow(section, entry) {
   const row = document.createElement('div');
   row.className = 'files-row';
@@ -1090,7 +1144,22 @@ function manageSectionNotebookRow(section, entry) {
     t.textContent = tag;
     row.appendChild(t);
   }
+  row.appendChild(manageDeleteControl(
+    `section-notebook:${section.id}:${entry.name}`,
+    () => deleteManageSectionNotebook(section, entry),
+    'Delete this notebook',
+  ));
   return row;
+}
+
+async function deleteManageSectionNotebook(section, entry) {
+  try {
+    await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/sections/${encodeURIComponent(section.id)}/notebooks/${encodeURIComponent(entry.name)}`, 'DELETE');
+    await renderManagePage(state.project.slug);
+    setManageStatus(`Deleted ${entry.name} from ${section.name}.`);
+  } catch (err) {
+    setManageStatus(err.message, 'error');
+  }
 }
 
 /* One section block: header (name + count), its notebooks — entries with
@@ -1106,6 +1175,14 @@ function renderManageSection(section) {
   count.className = 'files-count';
   count.textContent = String((section.notebooks || []).length);
   head.appendChild(count);
+  // The section itself deletes too (two-click): the entry and its
+  // notebook files go; for Labs that includes notes/labs/, so the
+  // section never comes back on the next read.
+  head.appendChild(manageDeleteControl(
+    `section:${section.id}`,
+    () => deleteManageSection(section),
+    `Delete section ${section.name} and its notebooks`,
+  ));
   block.appendChild(head);
 
   const list = document.createElement('div');
@@ -1187,6 +1264,16 @@ function renderManageSections(host) {
     return;
   }
   sections.forEach((section) => host.appendChild(renderManageSection(section)));
+}
+
+async function deleteManageSection(section) {
+  try {
+    await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/sections/${encodeURIComponent(section.id)}`, 'DELETE');
+    await renderManagePage(state.project.slug);
+    setManageStatus(`Deleted section ${section.name}.`);
+  } catch (err) {
+    setManageStatus(err.message, 'error');
+  }
 }
 
 async function manageAddSection() {
@@ -1317,34 +1404,13 @@ function renderManageDom() {
     renderManageSourceAdd();
   }
 
-  // --- Materials: extra PDFs / decks, no delete; + Add reuses the
-  // materials API (same file kinds as the reader's picker ＋ Add).
+  // --- Materials: extra PDFs / decks / videos / links, deletable (a file
+  // material's file goes with it); + Add reuses the materials API (same
+  // file kinds as the reader's picker ＋ Add).
   const matsList = $('#manage-materials-list', view);
   const mats = state.materials || [];
   if (!mats.length) matsList.appendChild(manageHintEl('No extra materials yet.'));
-  mats.forEach((m) => {
-    // Openable in the reader: a PDF or a slide deck with a file, or a
-    // YouTube video (no file — it embeds from its video id). A plain web
-    // link opens in a new browser tab instead — the reader has no tab
-    // for it. Anything else (a download-only material) gets no Open link.
-    const kind = String(m.kind || '').toLowerCase();
-    const openable = ((kind === 'pdf' || kind === 'slides') && m.hasFile !== false)
-      || kind === 'video';
-    let openLink = null;
-    if (kind === 'link' && m.url) {
-      const a = document.createElement('a');
-      a.className = 'manage-link';
-      a.href = m.url;
-      a.target = '_blank';
-      a.rel = 'noopener';
-      a.textContent = 'Open';
-      a.title = 'Open link in a new tab';
-      openLink = a;
-    } else if (openable) {
-      openLink = manageOpenLink(slug, m.id);
-    }
-    matsList.appendChild(manageStaticRow(m.label || m.id, kindLabel(m.kind), openLink));
-  });
+  mats.forEach((m) => matsList.appendChild(manageMaterialRow(m)));
   const matAdd = $('#manage-materials-add', view);
   const matBtn = document.createElement('button');
   matBtn.type = 'button';
@@ -1379,8 +1445,9 @@ function renderManageDom() {
   matStatus.id = 'manage-material-status';
   matAdd.appendChild(matStatus);
 
-  // --- Sections: user-addable groups of static notebooks. The Labs
-  // section is one section among others — no delete anywhere.
+  // --- Sections: user-addable groups of static notebooks, deletable
+  // with their files (the Labs section deletes notes/labs/ too, so it
+  // never comes back). The Labs section is one section among others.
   const sectionsHost = $('#manage-sections-list', view);
   renderManageSections(sectionsHost);
   const sectionsAdd = $('#manage-sections-add', view);
@@ -2098,6 +2165,14 @@ async function openProject(slug) {
   } catch {
     state.materials = [];
   }
+
+  // Default left tab for a project with no PDF main source: its videos
+  // when it has any, else the Markdown preview. PDF projects keep 'pdf'.
+  // Reading position is only saved/restored for PDF projects, so a stale
+  // stored tab can never override this default.
+  if (String(project.kind || '').toLowerCase() !== 'pdf') {
+    state.leftTab = defaultLeftTab(project.kind, videoMaterialsList().length > 0);
+  }
   try {
     const labs = await apiGet(`/api/projects/${encodeURIComponent(slug)}/labs`);
     const chapters = labs && Array.isArray(labs.chapters) ? labs.chapters
@@ -2494,7 +2569,19 @@ async function restoreReadingPosition() {
 async function openReaderSource(sourceId) {
   state.restoringPosition = true;
   try {
-    if (String(state.project?.kind || '').toLowerCase() !== 'pdf') return;
+    if (String(state.project?.kind || '').toLowerCase() !== 'pdf') {
+      // No PDF main source: a Manage Open link for a video still lands
+      // on the Video tab (the tabbed pane renders for sourceless
+      // projects). Anything else falls back to the stored position.
+      const videoMat = (state.materials || []).find((m) => String(m.id) === String(sourceId)
+        && String(m.kind || '').toLowerCase() === 'video');
+      if (videoMat && hasTabbedPaneForKind(state.project?.kind)) {
+        state.videoMaterialId = videoMat.id;
+        setLeftTab('video');
+        await ensureVideoLoaded(videoMat.id);
+      }
+      return;
+    }
     if (!sourceId || sourceId === PAGE_ANCHOR_SOURCE_BOOK) {
       setLeftTab('pdf');
       await ensurePdfSourceLoaded(PAGE_ANCHOR_SOURCE_BOOK);
@@ -2791,13 +2878,33 @@ async function renderReadingPane() {
   const fileUrl = `/api/projects/${encodeURIComponent(p.slug)}/file`;
   const sourceUrl = p.url || p.sourceUrl || '';
 
-  if (kind === 'pdf') {
+  if (hasTabbedPaneForKind(kind)) {
     // Tabbed reading pane: PDF | Slides | Video | Markdown preview. The
     // book PDF and the deck PDF live in separate containers so each tab
     // keeps its scroll position; the preview renders a markdown note the
     // user picks (the master notes.md by default). The Video tab only
-    // exists when the project has YouTube video materials.
+    // exists when the project has YouTube video materials. A project
+    // with no PDF main source (kind null — a title-only project whose
+    // materials are videos + notebooks) gets the same tabs: the PDF
+    // panel then shows the "no reader yet" note instead of the book,
+    // and the Video tab is how the course is watched.
+    const hasPdfSource = kind === 'pdf';
     const hasVideos = videoMaterialsList().length > 0;
+    // The PDF panel: the book viewer for PDF projects; for a project
+    // with no PDF main source, the "no reader yet" note (same wording
+    // as the old dead-end branch — the link is the main-source download).
+    const pdfPanel = hasPdfSource ? `
+          <div class="picker-row picker-row-dark" id="pdf-picker-row" hidden>
+            <label>PDF <select id="pdf-picker" aria-label="PDF document"></select></label>
+            <button type="button" id="pdf-add-material-btn" class="mini-btn" title="Add a PDF, Word or PowerPoint file to this project">＋ Add</button>
+          </div>
+          <div class="picker-row picker-row-dark" id="pdf-zoom-row">
+            ${zoomControlsHtml('pdf')}
+            ${annotToolsHtml()}
+          </div>
+          <div class="reading-scroll" id="pdf-scroll"><p class="reading-note">Loading PDF…</p></div>` : `
+          <div class="reading-scroll" id="pdf-scroll"><p class="reading-note">This project kind has no reader yet.
+            <a href="${esc(fileUrl)}">Download the source file</a>.</p></div>`;
     pane.innerHTML = `
       <div class="reading-tabs" id="reading-tabs" role="tablist" aria-label="Reading">
         <button type="button" class="reading-tab${state.leftTab === 'pdf' ? ' active' : ''}" data-left-tab="pdf" role="tab">PDF</button>
@@ -2807,15 +2914,7 @@ async function renderReadingPane() {
       </div>
       <div class="reading-tab-panels">
         <div class="reading-tab-panel" id="panel-pdf" ${state.leftTab === 'pdf' ? '' : 'hidden'}>
-          <div class="picker-row picker-row-dark" id="pdf-picker-row" hidden>
-            <label>PDF <select id="pdf-picker" aria-label="PDF document"></select></label>
-            <button type="button" id="pdf-add-material-btn" class="mini-btn" title="Add a PDF, Word or PowerPoint file to this project">＋ Add</button>
-          </div>
-          <div class="picker-row picker-row-dark" id="pdf-zoom-row">
-            ${zoomControlsHtml('pdf')}
-            ${annotToolsHtml()}
-          </div>
-          <div class="reading-scroll" id="pdf-scroll"><p class="reading-note">Loading PDF…</p></div>
+          ${pdfPanel}
         </div>
         <div class="reading-tab-panel" id="panel-slides" ${state.leftTab === 'slides' ? '' : 'hidden'}>
           <div class="deck-picker-row">
@@ -2852,9 +2951,12 @@ async function renderReadingPane() {
     const deckAddBtn = $('#deck-add-material-btn', pane);
     if (deckAddBtn) deckAddBtn.addEventListener('click', promptAddMaterial);
     syncPdfPicker();
-    $('#pdf-picker', pane).addEventListener('change', (e) => {
-      ensurePdfSourceLoaded(e.target.value === 'book' ? PAGE_ANCHOR_SOURCE_BOOK : e.target.value);
-    });
+    const pdfPicker = $('#pdf-picker', pane);
+    if (pdfPicker) {
+      pdfPicker.addEventListener('change', (e) => {
+        ensurePdfSourceLoaded(e.target.value === 'book' ? PAGE_ANCHOR_SOURCE_BOOK : e.target.value);
+      });
+    }
     const pdfAddBtn = $('#pdf-add-material-btn', pane);
     if (pdfAddBtn) pdfAddBtn.addEventListener('click', promptAddMaterial);
     syncVideoPicker();
@@ -2874,7 +2976,9 @@ async function renderReadingPane() {
     $('#preview-export-btn', pane).addEventListener('click', exportPreviewedNote);
     bindZoomControls(pane);
     bindAnnotTools(pane);
-    await loadPdf(fileUrl, sourceUrl);
+    // No book to load without a PDF main source — the PDF panel already
+    // shows the "no reader yet" note.
+    if (hasPdfSource) await loadPdf(fileUrl, sourceUrl);
     applyLeftTab();
     return;
   }
@@ -3081,6 +3185,10 @@ function handleVideoStateChange(playerState) {
    a plain embed iframe starting at the stored position — only position
    saving needs the API. */
 async function ensureVideoLoaded(materialId) {
+  // A video deleted from Manage while the reader still names it (a
+  // stored position, or the tab it was on) falls back to the first
+  // remaining video instead of showing nothing.
+  materialId = resolveVideoId(materialId, videoMaterialsList().map((m) => m.id));
   if (!materialId) return;
   const mat = videoMaterialsList().find((m) => String(m.id) === String(materialId));
   // The player is keyed by YouTube video id, the caller by material id —

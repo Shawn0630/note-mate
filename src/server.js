@@ -62,6 +62,7 @@ import { buildDataExport, applyDataImport } from './dataExport.js';
 import {
   SECTION_NOTEBOOKS_DIR, SECTION_ID_RE,
   SECTION_NOTEBOOK_NAME_RE, SECTION_LANGUAGES,
+  LABS_SECTION_ID,
   normalizeSections, findSection, nextSectionName, sectionIdFor,
   scanLabsOnDisk, buildLabsSection, mergeSections,
 } from './sections.js';
@@ -786,6 +787,32 @@ app.post('/api/projects/:slug/materials', upload.single('file'), async (req, res
   }
 });
 
+// Delete one material (Manage page, two-click confirm on the client).
+// A video/link material drops the entry only; a file material also
+// deletes its file — and its source document when it has one (a Word /
+// PowerPoint material's converted PDF is the `file`, the original is
+// the `sourceFile`). The main Source is not a material and can never be
+// deleted here. Returns the updated materials list.
+app.delete('/api/projects/:slug/materials/:id', async (req, res, next) => {
+  try {
+    const project = await readProject(req.params.slug);
+    const idx = (project.materials ?? []).findIndex((m) => m.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'material not found' });
+    const [removed] = project.materials.splice(idx, 1);
+    await writeProject(req.params.slug, project);
+    for (const rel of [removed.file, removed.sourceFile]) {
+      if (typeof rel !== 'string' || !rel) continue;
+      try {
+        await fsp.rm(resolveProjectPath(DATA_DIR, req.params.slug, rel), { force: true });
+      } catch { /* already gone — the entry is what matters */ }
+    }
+    res.json({ deleted: req.params.id, materials: await listMaterials(req.params.slug, project) });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Fill with AI for Materials — the Manage page's "✨ Fill with AI".
 // A conversation proposes URL-based materials (YouTube videos + plain web
@@ -1204,11 +1231,15 @@ app.put('/api/projects/:slug/labs/:chapter/:name', async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Sections — user-addable groups of STATIC notebooks on the Management
-// page (project.json `sections[]`). The Labs section is one section among
+// Sections — user-addable groups of notebooks on the Management page
+// (project.json `sections[]`). The Labs section is one section among
 // others, written by the seed through the same structure. Sections and
-// the notebooks in them are NON-DELETABLE by design (his original spec):
-// there is deliberately no delete/rename/move endpoint here.
+// the notebooks in them ARE deletable from the Manage page (his call
+// 2026-11-14, overriding the original non-deletable spec): DELETE
+// /sections/:sectionId and DELETE /sections/:sectionId/notebooks/:name
+// remove the entry and its file; the Labs delete also removes
+// notes/labs/ so the lazy backfill never resurrects it. There is no
+// rename/move endpoint.
 // A section notebook is one file on disk; the entry records its
 // project-relative path, so the Labs section's entries keep pointing at
 // notes/labs/<Chapter>/ while user-added ones live under
@@ -1269,6 +1300,21 @@ async function sectionNotebookEntry(slug, sectionId, name) {
   return { project, sections, section, entry };
 }
 
+/** Remove one section notebook's file — but only when its stored path
+    sits under the section dirs (notes/labs/ or notes/sections/). A path
+    pointing anywhere else (notes.md, repo-files/, …) is never deleted,
+    whatever the entry claims. Missing files are fine. */
+async function removeSectionNotebookFile(slug, relPath) {
+  if (typeof relPath !== 'string' || !relPath) return;
+  const parts = relPath.split('/');
+  const underLabs = parts[0] === 'notes' && parts[1] === 'labs';
+  const underSections = parts[0] === 'notes' && parts[1] === 'sections';
+  if (!underLabs && !underSections) return;
+  try {
+    await fsp.rm(resolveProjectPath(DATA_DIR, slug, ...parts), { force: true });
+  } catch { /* already gone — the entry is what matters */ }
+}
+
 app.post('/api/projects/:slug/sections', async (req, res, next) => {
   try {
     const project = await readProject(req.params.slug);
@@ -1283,6 +1329,44 @@ app.post('/api/projects/:slug/sections', async (req, res, next) => {
     await writeProject(req.params.slug, project);
     res.status(201).json(section);
   } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// Delete one section (Manage page, two-click confirm on the client):
+// the entry goes, and so do its notebook files — every entry's file,
+// plus the section directory itself. For the Labs section that also
+// means removing notes/labs/ entirely; otherwise the lazy backfill
+// would resurrect the section from the files left on disk on the next
+// project read. Nothing under repo-files/ is ever touched (a
+// notebook's repoId/repoPath is just a reference to shared staging),
+// and notes.md is never touched. Returns the updated sections.
+app.delete('/api/projects/:slug/sections/:sectionId', async (req, res, next) => {
+  try {
+    validateSectionId(req.params.sectionId);
+    const project = await readProject(req.params.slug);
+    const sections = getSections(project);
+    const section = findSection(sections, req.params.sectionId);
+    if (!section) return res.status(404).json({ error: 'section not found' });
+    project.sections = sections.filter((s) => s.id !== section.id);
+    await writeProject(req.params.slug, project);
+    for (const entry of section.notebooks) {
+      await removeSectionNotebookFile(req.params.slug, entry.path);
+    }
+    await fsp.rm(
+      resolveProjectPath(DATA_DIR, req.params.slug, SECTION_NOTEBOOKS_DIR, section.id),
+      { recursive: true, force: true },
+    );
+    if (section.id === LABS_SECTION_ID) {
+      await fsp.rm(
+        resolveProjectPath(DATA_DIR, req.params.slug, 'notes', 'labs'),
+        { recursive: true, force: true },
+      );
+    }
+    res.json({ deleted: section.id, sections: project.sections });
+  } catch (err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
     next(err);
   }
@@ -1392,6 +1476,28 @@ app.put('/api/projects/:slug/sections/:sectionId/notebooks/:name', async (req, r
     if (err.status === 400) return res.status(400).json({ error: err.message });
     if (err.status === 404) return res.status(404).json({ error: err.message });
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// Delete one notebook inside a section (Manage page, two-click confirm
+// on the client): the entry goes, and so does its file — same guard as
+// the section delete, so repo-files/ and notes.md are never touched.
+// Returns the updated sections.
+app.delete('/api/projects/:slug/sections/:sectionId/notebooks/:name', async (req, res, next) => {
+  try {
+    const { project, sections, section, entry } = await sectionNotebookEntry(
+      req.params.slug, req.params.sectionId, req.params.name,
+    );
+    section.notebooks = section.notebooks.filter((n) => n.name !== entry.name);
+    project.sections = sections;
+    await writeProject(req.params.slug, project);
+    await removeSectionNotebookFile(req.params.slug, entry.path);
+    res.json({ deleted: entry.name, section: section.id, sections: project.sections });
+  } catch (err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
+    if (err.status === 404) return res.status(404).json({ error: err.message });
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'notebook not found' });
     next(err);
   }
 });
