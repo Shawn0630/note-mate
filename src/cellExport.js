@@ -77,6 +77,24 @@ export function cellStreams(cell) {
  *   should write it to (content-hash deduped). The markdown references the
  *   files as `assets/<fileName>` — relative to notes/notes.md.
  */
+/** Render one code cell as markdown: a `### Cell N` heading, the source
+ * as a fenced block, stdout/stderr as output blocks, and plot images as
+ * relative `![...](assets/...)` links. Returns {text, images}. */
+export function renderCodeCellMarkdown({ cell, idx, lang, base }) {
+  const images = [];
+  const parts = [`### Cell ${idx + 1}`, '', `\`\`\`${lang}`, cellSource(cell).trimEnd(), '```'];
+  const { stdout, stderr } = cellStreams(cell);
+  if (stdout.trim()) parts.push('', '```', stdout.trimEnd(), '```');
+  if (stderr.trim()) parts.push('', '**stderr:**', '', '```', stderr.trimEnd(), '```');
+  for (const base64 of cellImages(cell)) {
+    const hash = pngHash(base64);
+    const fileName = assetFileName(base, idx, hash);
+    images.push({ cellIndex: idx, base64, fileName });
+    parts.push('', `![Cell ${idx + 1} plot](assets/${fileName})`);
+  }
+  return { text: parts.join('\n'), images };
+}
+
 export function cellsToMarkdown({ notebook, name, indices }) {
   if (!notebook || !Array.isArray(notebook.cells)) {
     const err = new Error('notebook must be a parsed notebook object with a cells array');
@@ -105,17 +123,9 @@ export function cellsToMarkdown({ notebook, name, indices }) {
       throw err;
     }
     if (cell.cell_type !== 'code') continue; // markdown/raw cells are skipped
-    const parts = [`### Cell ${idx + 1}`, '', `\`\`\`${lang}`, cellSource(cell).trimEnd(), '```'];
-    const { stdout, stderr } = cellStreams(cell);
-    if (stdout.trim()) parts.push('', '```', stdout.trimEnd(), '```');
-    if (stderr.trim()) parts.push('', '**stderr:**', '', '```', stderr.trimEnd(), '```');
-    for (const base64 of cellImages(cell)) {
-      const hash = pngHash(base64);
-      const fileName = assetFileName(base, idx, hash);
-      images.push({ cellIndex: idx, base64, fileName });
-      parts.push('', `![Cell ${idx + 1} plot](assets/${fileName})`);
-    }
-    blocks.push(parts.join('\n'));
+    const { text, images: cellImagesOut } = renderCodeCellMarkdown({ cell, idx, lang, base });
+    images.push(...cellImagesOut);
+    blocks.push(text);
   }
   if (!blocks.length) {
     const err = new Error('no code cells among the selected cells');
@@ -123,4 +133,45 @@ export function cellsToMarkdown({ notebook, name, indices }) {
     throw err;
   }
   return { markdown: blocks.join('\n\n'), images };
+}
+
+/**
+ * Convert a WHOLE notebook to markdown, cells in order — the project
+ * export's notebook rendering (cellsToMarkdown only covers selected code
+ * cells). Markdown cells go in verbatim; code cells render like the cell
+ * export; raw cells go in verbatim. A `# <title>` heading leads. An empty
+ * notebook yields just the heading. Returns {markdown, images} with the
+ * same assets/... references as cellsToMarkdown.
+ */
+export function notebookToMarkdown({ notebook, name }) {
+  if (!notebook || !Array.isArray(notebook.cells)) {
+    const err = new Error('notebook must be a parsed notebook object with a cells array');
+    err.status = 400;
+    throw err;
+  }
+  if (notebook.cells.length > MAX_EXPORT_CELLS) {
+    const err = new Error(`at most ${MAX_EXPORT_CELLS} cells per export`);
+    err.status = 400;
+    throw err;
+  }
+  const lang = fenceLanguage(notebook);
+  const base = String(name || notebook?.metadata?.exportName || 'notebook').replace(/\.ipynb$/i, '');
+  const title = base || 'notebook';
+  const blocks = [`# ${title}`];
+  const images = [];
+  notebook.cells.forEach((cell, idx) => {
+    if (cell?.cell_type === 'markdown') {
+      const src = cellSource(cell).trim();
+      if (src) blocks.push(src);
+    } else if (cell?.cell_type === 'code') {
+      const { text, images: cellImagesOut } = renderCodeCellMarkdown({ cell, idx, lang, base });
+      images.push(...cellImagesOut);
+      blocks.push(text);
+    } else if (cell?.cell_type === 'raw') {
+      const src = cellSource(cell).trim();
+      if (src) blocks.push(src);
+    }
+    // Unknown cell types are skipped, never invented.
+  });
+  return { markdown: `${blocks.join('\n\n')}\n`, images };
 }

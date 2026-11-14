@@ -23,7 +23,7 @@ import {
 import {
   generateAiCode, AI_CODE_LANGUAGES, MAX_AI_CODE_PROMPT_CHARS, MAX_AI_CODE_CELLS_CHARS,
 } from './aiCode.js';
-import { cellsToMarkdown } from './cellExport.js';
+import { cellsToMarkdown, notebookToMarkdown } from './cellExport.js';
 import {
   isChapterFile, chapterFileNumber, splitSections, sectionHasContent,
   dropEmptySections, stripLabsBlock, foldChapterFiles,
@@ -38,6 +38,7 @@ import {
   newAnnotationId, validateAnnotationInput,
 } from './annotations.js';
 import { ensurePdf, isConvertibleDoc } from './convertDocument.js';
+import { createZip } from './zipStore.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -456,16 +457,23 @@ app.post('/api/projects', upload.single('file'), async (req, res, next) => {
       ({ title, kind, url: sourceUrl } = req.body ?? {});
       title = (title || '').trim();
       if (!title) return res.status(400).json({ error: 'title is required' });
-      if (!sourceUrl || typeof sourceUrl !== 'string') {
-        return res.status(400).json({ error: 'url is required for URL projects' });
+      if (!sourceUrl) {
+        // Name-only project (user 2026-11-13): no source yet — the
+        // Management page adds it. kind stays null, sourceType 'none'.
+        kind = null;
+        sourceType = 'none';
+      } else {
+        if (typeof sourceUrl !== 'string') {
+          return res.status(400).json({ error: 'url is required for URL projects' });
+        }
+        try {
+          new URL(sourceUrl);
+        } catch {
+          return res.status(400).json({ error: 'url is not a valid URL' });
+        }
+        sourceType = 'url';
+        kind = kind || inferKindFromUrl(sourceUrl) || 'pdf';
       }
-      try {
-        new URL(sourceUrl);
-      } catch {
-        return res.status(400).json({ error: 'url is not a valid URL' });
-      }
-      sourceType = 'url';
-      kind = kind || inferKindFromUrl(sourceUrl) || 'pdf';
     }
 
     const slug = await uniqueSlug(slugify(title));
@@ -484,7 +492,7 @@ app.post('/api/projects', upload.single('file'), async (req, res, next) => {
       author: null,
       kind,
       sourceType,
-      ...(sourceType === 'file' ? { file: fileName } : { sourceUrl }),
+      ...(sourceType === 'file' ? { file: fileName } : sourceType === 'url' ? { sourceUrl } : {}),
       cover: null,
       materials: [],
       chapterMap: {},
@@ -811,6 +819,153 @@ app.post('/api/import/ai/apply', upload.single('file'), async (req, res, next) =
       ? proposal.noteSkeleton : `${proposal.noteSkeleton}\n`;
     await fsp.writeFile(path.join(notesDir, 'notes.md'), skeleton, 'utf8');
     res.status(201).json({ project: { ...project, noteFiles: ['notes.md'] } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Whether notes.md still holds only what project creation wrote — the guard
+// that lets AI import apply into a name-only project without ever
+// overwriting the user's own writing.
+function isDefaultNotesMd(text, title) {
+  if (text == null) return true;
+  const trimmed = text.trim();
+  return trimmed === '' || trimmed === `# ${title}` || trimmed === `# ${title}\n\n## Notes`;
+}
+
+// Set the main source of a name-only project (Management page). One-shot:
+// once a source exists the endpoint refuses (409) — the source defines the
+// project and is not swapped from inside it.
+app.post('/api/projects/:slug/source', upload.single('file'), async (req, res, next) => {
+  try {
+    const project = await readProject(req.params.slug);
+    if (project.file || project.sourceUrl) {
+      return res.status(409).json({ error: 'project already has a source' });
+    }
+    let kind;
+    if (req.file) {
+      const ext = path.extname(req.file.originalname || '').toLowerCase();
+      if (!/\.(pdf|docx|doc|mp4|webm|mov|mkv|m4v|ppt|pptx|key)$/i.test(ext)) {
+        return res.status(400).json({ error: 'unsupported file type' });
+      }
+      kind = inferKindFromExt(ext);
+      const fileName = `source${ext}`;
+      await fsp.writeFile(resolveProjectPath(DATA_DIR, req.params.slug, fileName), req.file.buffer);
+      project.file = fileName;
+    } else if (req.body?.url) {
+      const sourceUrl = String(req.body.url);
+      try {
+        new URL(sourceUrl);
+      } catch {
+        return res.status(400).json({ error: 'url is not a valid URL' });
+      }
+      kind = inferKindFromUrl(sourceUrl) || 'pdf';
+      project.sourceUrl = sourceUrl;
+    } else {
+      return res.status(400).json({ error: 'file upload or url is required' });
+    }
+    project.kind = kind;
+    project.sourceType = req.file ? 'file' : 'url';
+    await writeProject(req.params.slug, project);
+    res.status(200).json(project);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// AI import into an EXISTING name-only project: same proposal validation and
+// skeleton-only write as the create-flow apply, but it sets the source on
+// the project instead of creating one. Refuses (409) if the project already
+// has a source, or if notes.md holds anything beyond the creation default.
+app.post('/api/projects/:slug/import/ai/apply', upload.single('file'), async (req, res, next) => {
+  try {
+    const project = await readProject(req.params.slug);
+    if (project.file || project.sourceUrl) {
+      return res.status(409).json({ error: 'project already has a source' });
+    }
+    if (!req.file) return res.status(400).json({ error: 'file (PDF) is required' });
+    if (!req.file.buffer.subarray(0, 5).equals(Buffer.from('%PDF-'))) {
+      return res.status(400).json({ error: 'file must be a PDF' });
+    }
+    let rawProposal;
+    try {
+      rawProposal = JSON.parse(req.body.proposal || '');
+    } catch {
+      return res.status(400).json({ error: 'proposal is not valid JSON' });
+    }
+    let proposal;
+    try {
+      proposal = validateProposal(rawProposal);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    const current = await readNotesMd(req.params.slug);
+    if (!isDefaultNotesMd(current, project.title)) {
+      return res.status(409).json({ error: 'notes.md already has content' });
+    }
+    const dir = path.join(projectsDir(), req.params.slug);
+    const notesDir = path.join(dir, 'notes');
+    await fsp.mkdir(notesDir, { recursive: true });
+    await fsp.writeFile(path.join(dir, 'source.pdf'), req.file.buffer);
+    project.kind = 'pdf';
+    project.sourceType = 'file';
+    project.file = 'source.pdf';
+    project.outline = proposal.outline;
+    project.chapterMap = proposal.chapterMap;
+    await writeProject(req.params.slug, project);
+    // notes.md IS the skeleton: headings with empty bodies, nothing else.
+    const skeleton = proposal.noteSkeleton.endsWith('\n')
+      ? proposal.noteSkeleton : `${proposal.noteSkeleton}\n`;
+    await fsp.writeFile(path.join(notesDir, 'notes.md'), skeleton, 'utf8');
+    res.status(200).json({ project: { ...project, noteFiles: ['notes.md'] } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Project Markdown export: one ZIP with a top folder named after the slug —
+// notes.md + owned markdown notes verbatim (anchor comment lines stay in
+// place), owned notebooks converted to markdown, and the notes/assets/
+// folder so `assets/<file>` links resolve in Obsidian. Seeded lab
+// notebooks and source PDFs/decks are NOT bundled (see SUMMARY).
+app.get('/api/projects/:slug/export', async (req, res, next) => {
+  try {
+    const slug = req.params.slug;
+    await readProject(slug);
+    const zip = createZip();
+    const root = slug;
+    const notesMd = await readNotesMd(slug);
+    if (notesMd != null) zip.addFile(`${root}/notes.md`, notesMd);
+    for (const name of await listNoteFiles(slug)) {
+      if (name === LEGACY_NOTES_FILE) continue;
+      const filePath = resolveProjectPath(DATA_DIR, slug, 'notes', name);
+      if (name.endsWith('.md')) {
+        zip.addFile(`${root}/${name}`, await fsp.readFile(filePath, 'utf8'));
+      } else if (name.endsWith('.ipynb')) {
+        const nb = parseNotebook(await fsp.readFile(filePath, 'utf8'));
+        const stem = name.replace(/\.ipynb$/i, '');
+        const { markdown, images } = notebookToMarkdown({ notebook: nb, name });
+        zip.addFile(`${root}/${stem}.md`, markdown);
+        for (const img of images) {
+          zip.addFile(`${root}/assets/${img.fileName}`, Buffer.from(img.base64, 'base64'));
+        }
+      }
+    }
+    const assetsDir = resolveProjectPath(DATA_DIR, slug, 'notes', 'assets');
+    try {
+      const assetNames = (await fsp.readdir(assetsDir))
+        .filter((n) => /\.(png|jpe?g)$/i.test(n)).sort();
+      for (const n of assetNames) {
+        zip.addFile(`${root}/assets/${n}`, await fsp.readFile(path.join(assetsDir, n)));
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+    const buf = zip.toBuffer();
+    res.set('Content-Type', 'application/zip');
+    res.set('Content-Disposition', `attachment; filename="${slug}-export.zip"`);
+    res.set('Content-Length', String(buf.length));
+    res.send(buf);
   } catch (err) {
     next(err);
   }

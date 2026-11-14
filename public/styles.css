@@ -227,6 +227,51 @@ h1, h2, h3, .serif { font-family: Georgia, "Times New Roman", serif; }
 .book-author { font-size: 12.5px; color: var(--ink-soft); margin: 0 0 8px; min-height: 18px; }
 .book-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-faint); }
 
+.book-actions { margin-top: 8px; }
+.book-manage {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.book-manage:hover { background: var(--accent-soft); color: var(--ink); }
+
+/* Project Management page (#/manage/<slug>): grouped lists reusing the
+   Files directory's rows/tags/delete. Labels/numbers/buttons only. */
+.manage-page { max-width: 860px; margin: 0 auto; padding: 8px 4px 48px; }
+.manage-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.manage-head h1 { margin: 0; font-size: 24px; flex: 1; min-width: 160px; }
+.manage-head .back-link { flex: none; }
+.manage-status { font-size: 12.5px; color: var(--ink-faint); }
+.manage-status.error { color: var(--bad); }
+.manage-section { margin-top: 28px; }
+.manage-section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .8px; color: var(--ink-faint); margin: 0 0 4px; }
+.manage-section .files-list { padding: 0; }
+.manage-section .files-row { padding-left: 0; }
+.manage-section .files-row-name { cursor: default; }
+.manage-section button.files-row-name { cursor: pointer; }
+.manage-actions { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.manage-add-source { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 4px; }
+.manage-source-actions { display: inline-flex; gap: 8px; }
+.manage-source-actions[hidden] { display: none; }
+.manage-url-row { display: flex; gap: 8px; width: 100%; margin-top: 4px; }
+.manage-url-row input { flex: 1; min-width: 0; }
+.manage-link { font-size: 12.5px; color: var(--accent); white-space: nowrap; }
+.manage-edit-btn {
+  font-size: 12px;
+  padding: 2px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.manage-edit-btn:hover { background: var(--accent-soft); color: var(--ink); }
+
 .badge {
   display: inline-block;
   font-size: 11px;
@@ -1310,6 +1355,11 @@ input[type="text"].note-tab-input {
   font-size: 12.5px;
   flex: none;
 }
+/* A flex display beats the `hidden` attribute — without this the PDF
+   picker row shows even with no extra PDFs (the row is hidden by
+   syncPdfPicker until a material is added). Same pattern as
+   .reading-tab-panel[hidden] above. */
+.picker-row[hidden] { display: none; }
 .picker-row-dark { background: #2f2f31; color: #ddd; }
 .picker-row-paper { background: var(--paper-dim); color: var(--ink-soft); border-bottom: 1px solid var(--line); }
 .picker-row label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }

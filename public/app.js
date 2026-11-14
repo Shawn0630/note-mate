@@ -281,6 +281,7 @@ const state = {
   deckMaterialId: null, // material id of the deck currently shown
   deckChapter: null, // normalized chapter the current deck was chosen for (see loadDeckPdf)
   notesMdContent: null, // cached notes.md text for the left Preview tab
+  notesMdEditing: false, // true while notes.md is open as an editable tab (Manage → Edit)
   // Multi-source reader (v1.1): materials[] from GET .../materials.
   // activeSourceId null = the project's main (Book) source. It mirrors the
   // left tab (pdf -> null, slides -> the deck id) so the chapter panel's
@@ -387,6 +388,7 @@ function resetReaderState() {
   state.deckMaterialId = null;
   state.deckChapter = null;
   state.notesMdContent = null;
+  state.notesMdEditing = false;
   state.materials = [];
   state.activeSourceId = null;
   state.pdfSourceId = 'book';
@@ -420,6 +422,11 @@ function resetReaderState() {
 
 function route() {
   const hash = location.hash || '#/';
+  const mm = hash.match(/^#\/manage\/([^/?#]+)/);
+  if (mm) {
+    renderManagePage(decodeURIComponent(mm[1]));
+    return;
+  }
   const m = hash.match(/^#\/project\/([^/?#]+)/);
   if (m) {
     openProject(decodeURIComponent(m[1]));
@@ -510,8 +517,7 @@ async function renderHome() {
     shelf.innerHTML = `
       <div class="empty-state">
         <h2>Your shelf is empty</h2>
-        <p>Add your first project — a PDF, a video, a slide deck or a presentation —
-           and start taking notes next to it.</p>
+        <p>Add your first project — name it, then add the book or slides from its Management page.</p>
         <button class="primary" id="empty-add-btn">+ Add your first project</button>
       </div>`;
     $('#empty-add-btn', shelf).addEventListener('click', openAddProjectModal);
@@ -538,6 +544,12 @@ async function renderHome() {
   $$('.book-card[data-slug]', shelf).forEach((card) => {
     card.addEventListener('click', () => {
       location.hash = `#/project/${encodeURIComponent(card.dataset.slug)}`;
+    });
+  });
+  $$('.book-manage', shelf).forEach((btn) => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      location.hash = `#/manage/${encodeURIComponent(btn.dataset.slug)}`;
     });
   });
   const addCard = $('#add-card-btn', shelf);
@@ -576,8 +588,425 @@ function bookCardHtml(project) {
           <span class="badge">${esc(kindLabel(project.kind))}</span>
           <span>${noteCountOf(project)} note${noteCountOf(project) === 1 ? '' : 's'}</span>
         </div>
+        <div class="book-actions">
+          <button type="button" class="book-manage" data-slug="${esc(project.slug)}">Manage</button>
+        </div>
       </div>
     </article>`;
+}
+
+/* ---------------- project management page ---------------- */
+
+/* Per-project Management page (#/manage/<slug>): the project's properties,
+   grouped — Static (source materials + seeded labs, no delete) vs Dynamic
+   (owned notes + notebooks, deletable with the same two-click arm as the
+   Files directory). notes.md is listed with no delete but an Edit action
+   that opens it as an editable tab in the reader. The page also adds the
+   main source (a name-only project has none yet) and exports the project
+   as a Markdown ZIP for Obsidian-like apps. */
+
+let manageSlug = null; // slug of the manage page currently shown, or null
+let armedManageDelete = null;
+let armedManageDeleteTimer = 0;
+
+function setManageStatus(message, kind) {
+  const el = $('#manage-status', view);
+  if (!el) return;
+  el.textContent = message || '';
+  el.className = `manage-status${kind === 'error' ? ' error' : ''}`;
+}
+
+async function renderManagePage(slug) {
+  resetReaderState();
+  manageSlug = slug;
+  if (armedManageDeleteTimer) { window.clearTimeout(armedManageDeleteTimer); armedManageDelete = null; }
+  view.innerHTML = `<div class="view-error"><p>Loading project…</p></div>`;
+  let project;
+  try {
+    project = await apiGet(`/api/projects/${encodeURIComponent(slug)}`);
+  } catch (err) {
+    showError('Could not open this project.', err.message);
+    return;
+  }
+  state.project = project;
+  try {
+    const notes = await apiGet(`/api/projects/${encodeURIComponent(slug)}/notes`);
+    state.notes = Array.isArray(notes) ? notes : [];
+  } catch { state.notes = []; }
+  try {
+    const materials = await apiGet(`/api/projects/${encodeURIComponent(slug)}/materials`);
+    state.materials = Array.isArray(materials) ? materials : [];
+  } catch { state.materials = []; }
+  try {
+    const labs = await apiGet(`/api/projects/${encodeURIComponent(slug)}/labs`);
+    const chapters = labs && Array.isArray(labs.chapters) ? labs.chapters
+      : (Array.isArray(labs) ? labs : []);
+    state.labs = chapters;
+  } catch { state.labs = []; }
+  renderManageDom();
+}
+
+function manageHintEl(text) {
+  const p = document.createElement('p');
+  p.className = 'hint';
+  p.textContent = text;
+  return p;
+}
+
+/* Static row: name + tag, no action (source materials and seeded labs). */
+function manageStaticRow(label, tag) {
+  const row = document.createElement('div');
+  row.className = 'files-row';
+  const name = document.createElement('span');
+  name.className = 'files-row-name';
+  name.textContent = label;
+  row.appendChild(name);
+  if (tag) {
+    const t = document.createElement('span');
+    t.className = 'files-tag';
+    t.textContent = tag;
+    row.appendChild(t);
+  }
+  return row;
+}
+
+/* notes.md: no delete anywhere, but an Edit action that opens it as an
+   editable tab in the reader (one-shot via pendingNotesMdEditSlug). */
+function manageMasterRow() {
+  const row = document.createElement('div');
+  row.className = 'files-row';
+  const name = document.createElement('span');
+  name.className = 'files-row-name';
+  name.textContent = 'notes.md';
+  row.appendChild(name);
+  const t = document.createElement('span');
+  t.className = 'files-tag';
+  t.textContent = 'Master';
+  row.appendChild(t);
+  const edit = document.createElement('button');
+  edit.type = 'button';
+  edit.className = 'manage-edit-btn';
+  edit.textContent = 'Edit';
+  edit.title = 'Open notes.md as an editable tab in the reader';
+  edit.addEventListener('click', () => {
+    pendingNotesMdEditSlug = state.project.slug;
+    location.hash = `#/project/${encodeURIComponent(state.project.slug)}`;
+  });
+  row.appendChild(edit);
+  return row;
+}
+
+/* Dynamic row: name opens the reader, tag names the kind, delete is the
+   Files directory's two-click arm (Manage-local state, same 2s disarm). */
+function manageDynamicRow(note, tag) {
+  const row = document.createElement('div');
+  row.className = 'files-row';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'files-row-name';
+  btn.textContent = note.name;
+  btn.title = 'Open in the reader';
+  btn.addEventListener('click', () => {
+    location.hash = `#/project/${encodeURIComponent(state.project.slug)}`;
+  });
+  row.appendChild(btn);
+  if (tag) {
+    const t = document.createElement('span');
+    t.className = 'files-tag';
+    t.textContent = tag;
+    row.appendChild(t);
+  }
+  const del = document.createElement('span');
+  del.className = `files-del${armedManageDelete === note.name ? ' armed' : ''}`;
+  del.textContent = armedManageDelete === note.name ? 'Sure?' : '✕';
+  del.title = armedManageDelete === note.name ? 'Click again to confirm delete' : 'Delete this file';
+  del.addEventListener('click', (e) => { e.stopPropagation(); armManageDelete(note.name); });
+  row.appendChild(del);
+  return row;
+}
+
+function armManageDelete(name) {
+  if (armedManageDelete !== name) {
+    if (armedManageDeleteTimer) window.clearTimeout(armedManageDeleteTimer);
+    armedManageDelete = name;
+    armedManageDeleteTimer = window.setTimeout(() => {
+      armedManageDelete = null;
+      renderManageDom();
+    }, 2000);
+    renderManageDom();
+    return;
+  }
+  if (armedManageDeleteTimer) window.clearTimeout(armedManageDeleteTimer);
+  armedManageDelete = null;
+  deleteManageNote(name);
+}
+
+async function deleteManageNote(name) {
+  await deleteNote(name); // shared cascade into notes.md; reader renders are no-ops here
+  const gone = !(state.notes || []).some((n) => n.name === name);
+  await renderManagePage(state.project.slug);
+  setManageStatus(gone ? `Deleted ${name}.` : `Delete failed for ${name}.`, gone ? '' : 'error');
+}
+
+function renderManageDom() {
+  const p = state.project;
+  if (!p || manageSlug !== p.slug) return; // navigated away since the call was queued
+  const slug = p.slug;
+  const hasSource = !!(p.file || p.sourceUrl);
+  view.innerHTML = `
+    <div class="manage-page">
+      <div class="manage-head">
+        <a class="back-link" href="#/">‹ Shelf</a>
+        <h1>${esc(p.title || 'Untitled')}</h1>
+        <span class="manage-status" id="manage-status"></span>
+        <button type="button" id="manage-open-reader" class="primary">Open reader</button>
+        <button type="button" id="manage-export">Export Markdown</button>
+      </div>
+      <section class="manage-section">
+        <h2>Source</h2>
+        <div class="files-list" id="manage-source-list"></div>
+        <div id="manage-source-add"></div>
+      </section>
+      <section class="manage-section">
+        <h2>Materials</h2>
+        <div class="files-list" id="manage-materials-list"></div>
+        <div class="manage-actions" id="manage-materials-add"></div>
+      </section>
+      <section class="manage-section">
+        <h2>Labs</h2>
+        <div class="files-list" id="manage-labs-list"></div>
+      </section>
+      <section class="manage-section">
+        <h2>Notes</h2>
+        <div class="files-list" id="manage-notes-list"></div>
+      </section>
+    </div>`;
+
+  $('#manage-open-reader', view).addEventListener('click', () => {
+    location.hash = `#/project/${encodeURIComponent(slug)}`;
+  });
+  $('#manage-export', view).addEventListener('click', exportProject);
+
+  // --- Source: one row, no delete. A name-only project has none yet —
+  // the add controls below replace it.
+  const sourceList = $('#manage-source-list', view);
+  if (hasSource) {
+    const row = document.createElement('div');
+    row.className = 'files-row';
+    const name = document.createElement('span');
+    name.className = 'files-row-name';
+    name.textContent = p.file || p.sourceUrl;
+    row.appendChild(name);
+    const tag = document.createElement('span');
+    tag.className = 'files-tag';
+    tag.textContent = kindLabel(p.kind);
+    row.appendChild(tag);
+    if (p.file) {
+      const dl = document.createElement('a');
+      dl.className = 'manage-link';
+      dl.href = `/api/projects/${encodeURIComponent(slug)}/file`;
+      dl.download = '';
+      dl.textContent = 'Download';
+      row.appendChild(dl);
+    }
+    sourceList.appendChild(row);
+  } else {
+    sourceList.appendChild(manageHintEl('No source yet.'));
+    renderManageSourceAdd();
+  }
+
+  // --- Materials: extra PDFs / decks, no delete; + Add reuses the
+  // materials API (same file kinds as the reader's picker ＋ Add).
+  const matsList = $('#manage-materials-list', view);
+  const mats = state.materials || [];
+  if (!mats.length) matsList.appendChild(manageHintEl('No extra materials yet.'));
+  mats.forEach((m) => {
+    matsList.appendChild(manageStaticRow(m.label || m.id, kindLabel(m.kind)));
+  });
+  const matAdd = $('#manage-materials-add', view);
+  const matBtn = document.createElement('button');
+  matBtn.type = 'button';
+  matBtn.className = 'mini-btn';
+  matBtn.textContent = '+ Add material';
+  matBtn.addEventListener('click', () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.pdf,.docx,.doc,.pptx,.ppt';
+    input.addEventListener('change', async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      await manageAddMaterialFile(file);
+    });
+    input.click();
+  });
+  matAdd.appendChild(matBtn);
+  const matStatus = document.createElement('span');
+  matStatus.className = 'hint';
+  matStatus.id = 'manage-material-status';
+  matAdd.appendChild(matStatus);
+
+  // --- Labs: seeded material, grouped by chapter, no delete.
+  const labsList = $('#manage-labs-list', view);
+  const labs = state.labs || [];
+  if (!labs.length) labsList.appendChild(manageHintEl('No labs.'));
+  labs.forEach((group) => {
+    const files = Array.isArray(group.files) ? group.files : [];
+    if (!files.length) return;
+    const open = !!state.labsOpenChapters[group.chapter];
+    const head = document.createElement('button');
+    head.type = 'button';
+    head.className = 'files-group-head';
+    const headLabel = document.createElement('span');
+    headLabel.textContent = `${open ? '▾' : '▸'} ${chapterDisplayName(group.chapter)}`;
+    const headCount = document.createElement('span');
+    headCount.className = 'files-count';
+    headCount.textContent = String(files.length);
+    head.append(headLabel, headCount);
+    head.addEventListener('click', () => {
+      state.labsOpenChapters[group.chapter] = !open;
+      renderManageDom();
+    });
+    labsList.appendChild(head);
+    if (open) {
+      files.forEach((f) => {
+        labsList.appendChild(manageStaticRow(labDisplayName(f.name), 'Lab'));
+      });
+    }
+  });
+
+  // --- Notes: notes.md (Master, Edit, no delete) + owned notes and
+  // notebooks (deletable). Notebooks stay creatable from the reader's
+  // + menu only — this page manages, it does not create them.
+  const notesList = $('#manage-notes-list', view);
+  const mds = (state.notes || []).filter((n) => n.kind === 'md');
+  const nbs = (state.notes || []).filter((n) => n.kind === 'ipynb');
+  if (!mds.length && !nbs.length) notesList.appendChild(manageHintEl('No notes yet.'));
+  if (mds.length) {
+    notesList.appendChild(filesSection('Notes'));
+    mds.forEach((n) => {
+      notesList.appendChild(n.name === 'notes.md' ? manageMasterRow() : manageDynamicRow(n, null));
+    });
+  }
+  if (nbs.length) {
+    notesList.appendChild(filesSection('Notebooks'));
+    nbs.forEach((n) => {
+      const tag = n.language ? (NB_LANG_TAG[String(n.language).toLowerCase()] || String(n.language)) : null;
+      notesList.appendChild(manageDynamicRow(n, tag));
+    });
+  }
+}
+
+/* Add-source controls for a name-only project: a file (plain add, or
+   ✨ Import with AI for PDFs — same preview → Apply as before, applied
+   into this project), or a URL link. */
+function renderManageSourceAdd() {
+  const host = $('#manage-source-add', view);
+  if (!host) return;
+  host.innerHTML = `
+    <div class="manage-add-source">
+      <button type="button" class="mini-btn" id="manage-source-file-btn">Add file</button>
+      <span class="hint" id="manage-source-file-hint"></span>
+      <span class="manage-source-actions" id="manage-source-actions" hidden>
+        <button type="button" class="mini-btn" id="manage-source-add">Add as source</button>
+        <button type="button" class="mini-btn" id="manage-source-ai" disabled>✨ Import with AI</button>
+      </span>
+      <span class="form-error" id="manage-source-status"></span>
+      <div class="manage-url-row">
+        <input type="url" id="manage-source-url" placeholder="https://docs.google.com/presentation/d/… or https://www.youtube.com/watch?v=…">
+        <button type="button" class="mini-btn" id="manage-source-url-add">Add link</button>
+      </div>
+    </div>`;
+  let pendingFile = null;
+  $('#manage-source-file-btn', host).addEventListener('click', () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.pdf,.docx,.doc,.mp4,.webm,.mov,.mkv,.m4v,.ppt,.pptx,.key';
+    input.addEventListener('change', () => {
+      const f = input.files?.[0];
+      if (!f) return;
+      pendingFile = f;
+      const hint = $('#manage-source-file-hint', host);
+      const kind = kindFromExtension(f.name);
+      hint.textContent = kind ? `Detected kind: ${kindLabel(kind)} — ${f.name}` : f.name;
+      $('#manage-source-actions', host).hidden = false;
+      const aiBtn = $('#manage-source-ai', host);
+      const isPdf = /\.pdf$/i.test(f.name);
+      aiBtn.disabled = !isPdf;
+      aiBtn.title = isPdf ? '' : 'AI import needs a PDF file';
+    });
+    input.click();
+  });
+  $('#manage-source-add', host).addEventListener('click', async () => {
+    if (!pendingFile) return;
+    const statusEl = $('#manage-source-status', host);
+    statusEl.textContent = '';
+    const form = new FormData();
+    form.append('file', pendingFile);
+    try {
+      await api(`/api/projects/${encodeURIComponent(state.project.slug)}/source`, { method: 'POST', body: form });
+      await renderManagePage(state.project.slug);
+      setManageStatus(`Added ${pendingFile.name} as the source.`);
+    } catch (err) {
+      statusEl.textContent = err.message;
+    }
+  });
+  $('#manage-source-ai', host).addEventListener('click', () => {
+    if (!pendingFile) return;
+    proposeAiImport({
+      file: pendingFile,
+      title: state.project.title,
+      applyToSlug: state.project.slug,
+      statusEl: $('#manage-source-status', host),
+      button: $('#manage-source-ai', host),
+    });
+  });
+  $('#manage-source-url-add', host).addEventListener('click', async () => {
+    const url = $('#manage-source-url', host).value.trim();
+    const statusEl = $('#manage-source-status', host);
+    statusEl.textContent = '';
+    if (!url) { statusEl.textContent = 'Paste a URL first.'; return; }
+    try {
+      await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/source`, 'POST', { url });
+      await renderManagePage(state.project.slug);
+      setManageStatus('Added the link as the source.');
+    } catch (err) {
+      statusEl.textContent = err.message;
+    }
+  });
+}
+
+async function manageAddMaterialFile(file) {
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const created = await api(`/api/projects/${encodeURIComponent(state.project.slug)}/materials`, { method: 'POST', body: form });
+    await renderManagePage(state.project.slug);
+    setManageStatus(`Added ${created?.label || file.name}.`);
+  } catch (err) {
+    const el = $('#manage-material-status', view);
+    if (el) el.textContent = err.message;
+  }
+}
+
+/* Project Markdown export: GET the ZIP the server builds (notes.md +
+   owned notes verbatim, owned notebooks converted, assets/ bundled) and
+   download it as <slug>-export.zip. */
+async function exportProject() {
+  const slug = state.project.slug;
+  setManageStatus('Preparing export…');
+  try {
+    const res = await fetch(`/api/projects/${encodeURIComponent(slug)}/export`);
+    if (!res.ok) {
+      let msg = `Export failed (${res.status})`;
+      try { const data = await res.json(); if (data && data.error) msg = data.error; } catch { /* keep default */ }
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    downloadBlob(blob, `${slug}-export.zip`, 'application/zip');
+    setManageStatus('Export downloaded.');
+  } catch (err) {
+    setManageStatus(err.message, 'error');
+  }
 }
 
 /* ---------------- add project modal ---------------- */
@@ -590,29 +1019,10 @@ function openAddProjectModal() {
   overlay.innerHTML = `
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="add-project-title">
       <h2 id="add-project-title">Add a project</h2>
-      <p class="modal-sub">Upload a file, or paste a link to a Google Slides deck,
-         a YouTube video, or a PDF on the web.</p>
+      <p class="modal-sub">Name it first — you add the book, slides, or video from its Management page.</p>
       <form id="add-project-form">
         <label for="ap-title">Title</label>
         <input type="text" id="ap-title" name="title" placeholder="e.g. Machine Learning — Lecture 1" required>
-
-        <label for="ap-file">File (PDF, Word, video, or PowerPoint)</label>
-        <input type="file" id="ap-file" name="file"
-               accept=".pdf,.docx,.doc,.mp4,.webm,.mov,.mkv,.m4v,.ppt,.pptx,.key">
-        <div class="hint" id="ap-file-hint"></div>
-
-        <div class="ai-import-row" id="ap-ai-row" hidden>
-          <button type="button" id="ap-ai-btn" disabled>✨ Import with AI</button>
-          <span class="hint">AI drafts the chapter outline and blank note headings — you write the notes.</span>
-        </div>
-        <div class="form-error" id="ap-ai-status"></div>
-
-        <div class="or-divider">or link a URL instead</div>
-
-        <label for="ap-url">URL</label>
-        <input type="url" id="ap-url" name="url"
-               placeholder="https://docs.google.com/presentation/d/… or https://www.youtube.com/watch?v=…">
-        <div class="hint" id="ap-url-hint"></div>
 
         <div class="form-error" id="ap-error"></div>
         <div class="modal-actions">
@@ -623,49 +1033,8 @@ function openAddProjectModal() {
     </div>`;
   document.body.appendChild(overlay);
 
-  const fileInput = $('#ap-file', overlay);
-  const urlInput = $('#ap-url', overlay);
-  const fileHint = $('#ap-file-hint', overlay);
-  const urlHint = $('#ap-url-hint', overlay);
-
-  fileInput.addEventListener('change', () => {
-    const f = fileInput.files[0];
-    const aiRow = $('#ap-ai-row', overlay);
-    const aiBtn = $('#ap-ai-btn', overlay);
-    if (!f) {
-      fileHint.textContent = '';
-      aiRow.hidden = true;
-      aiBtn.disabled = true;
-      return;
-    }
-    const kind = kindFromExtension(f.name);
-    fileHint.textContent = kind
-      ? `Detected kind: ${kindLabel(kind)} — ${f.name}`
-      : 'Could not detect the kind from this file name.';
-    // AI import needs a PDF. Show the row whenever a file is chosen; enable
-    // the button only for PDFs so the plain Create path is never blocked.
-    aiRow.hidden = false;
-    const isPdf = /\.pdf$/i.test(f.name);
-    aiBtn.disabled = !isPdf;
-    aiBtn.title = isPdf ? '' : 'AI import needs a PDF file';
-    if (f) urlInput.value = '';
-  });
-  urlInput.addEventListener('input', () => {
-    const v = urlInput.value.trim();
-    if (!v) { urlHint.textContent = ''; return; }
-    const kind = kindFromUrl(v);
-    urlHint.textContent = kind
-      ? `Detected kind: ${kindLabel(kind)}`
-      : 'Kind could not be detected — add a Google Slides, YouTube, or PDF link.';
-    if (v) fileInput.value = '';
-  });
   overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
   $('#ap-cancel', overlay).addEventListener('click', closeModal);
-  $('#ap-ai-btn', overlay).addEventListener('click', () => {
-    const file = fileInput.files[0];
-    if (!file) return;
-    proposeAiImport(overlay, file, $('#ap-title', overlay).value.trim());
-  });
 
   $('#add-project-form', overlay).addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -673,26 +1042,16 @@ function openAddProjectModal() {
     const submitBtn = $('#ap-submit', overlay);
     errBox.textContent = '';
     const title = $('#ap-title', overlay).value.trim();
-    const file = fileInput.files[0];
-    const url = urlInput.value.trim();
     if (!title) { errBox.textContent = 'Please give the project a title.'; return; }
-    if (!file && !url) { errBox.textContent = 'Upload a file or paste a URL.'; return; }
     submitBtn.disabled = true;
     submitBtn.textContent = 'Adding…';
     try {
-      let created;
-      if (file) {
-        const form = new FormData();
-        form.append('title', title);
-        form.append('file', file);
-        created = await api('/api/projects', { method: 'POST', body: form });
-      } else {
-        const kind = kindFromUrl(url) || 'pdf';
-        created = await apiJson('/api/projects', 'POST', { title, kind, url });
-      }
+      // Name-only creation (user 2026-11-13): no file or URL at this step.
+      // The new project lands on its Management page, where the source goes.
+      const created = await apiJson('/api/projects', 'POST', { title });
       closeModal();
       if (created && created.slug) {
-        location.hash = `#/project/${encodeURIComponent(created.slug)}`;
+        location.hash = `#/manage/${encodeURIComponent(created.slug)}`;
       } else {
         renderHome();
       }
@@ -715,14 +1074,13 @@ function closeModal() {
 
 /* Ask the backend to draft an outline + note skeleton for the chosen PDF.
    Nothing is written by this call. A 503 (LLM unconfigured) or 400 (bad PDF)
-   shows inline in the Add-project modal and leaves the plain Create path
-   working. */
-async function proposeAiImport(overlay, file, title) {
-  const statusEl = $('#ap-ai-status', overlay);
-  const btn = $('#ap-ai-btn', overlay);
+   shows inline and leaves the plain path working. `applyToSlug` targets an
+   existing name-only project (Management page); without it the preview
+   creates a new project. */
+async function proposeAiImport({ file, title, applyToSlug, statusEl, button }) {
   statusEl.textContent = '';
-  btn.disabled = true;
-  btn.textContent = 'Asking AI…';
+  button.disabled = true;
+  button.textContent = 'Asking AI…';
   const form = new FormData();
   form.append('file', file);
   if (title) form.append('title', title);
@@ -742,14 +1100,14 @@ async function proposeAiImport(overlay, file, title) {
       outline: raw.outline,
       noteSkeleton: raw.noteSkeleton,
       chapterMap: raw.chapterMap,
-    });
+    }, { applyToSlug });
   } catch (err) {
     statusEl.textContent = /not configured/i.test(err.message)
       ? 'LLM not configured — add LLM_API_KEY and LLM_MODEL to server/.env'
       : err.message;
   } finally {
-    btn.disabled = false;
-    btn.textContent = '✨ Import with AI';
+    button.disabled = false;
+    button.textContent = '✨ Import with AI';
   }
 }
 
@@ -759,8 +1117,11 @@ function closeAiPreviewModal() {
 }
 
 /* Preview what the AI drafted, before anything is written. The note skeleton
-   is headings only — blank sections for the user to write in himself. */
-function openAiPreviewModal(file, title, proposal) {
+   is headings only — blank sections for the user to write in himself.
+   `opts.applyToSlug` applies into an existing name-only project instead of
+   creating one (the title field is then hidden — the project already has one). */
+function openAiPreviewModal(file, title, proposal, opts = {}) {
+  const applyToSlug = opts.applyToSlug || null;
   closeAiPreviewModal();
   const outline = Array.isArray(proposal.outline) ? proposal.outline : [];
   const skeleton = typeof proposal.noteSkeleton === 'string' ? proposal.noteSkeleton : '';
@@ -799,14 +1160,16 @@ function openAiPreviewModal(file, title, proposal) {
       <h3>Chapter → note mapping</h3>
       ${mapHtml}
 
+      ${applyToSlug ? '' : `
       <label for="ai-title">Project title</label>
       <input type="text" id="ai-title" value="${esc(title || '')}"
              placeholder="e.g. Machine Learning — Lecture 1">
+      `}
 
       <div class="form-error" id="ai-apply-error"></div>
       <div class="modal-actions">
         <button type="button" id="ai-cancel">Cancel</button>
-        <button type="button" class="primary" id="ai-apply">Apply — create project</button>
+        <button type="button" class="primary" id="ai-apply">${applyToSlug ? 'Apply to this project' : 'Apply — create project'}</button>
       </div>
     </div>`;
   document.body.appendChild(overlay);
@@ -822,24 +1185,40 @@ function openAiPreviewModal(file, title, proposal) {
     const errBox = $('#ai-apply-error', overlay);
     const applyBtn = $('#ai-apply', overlay);
     errBox.textContent = '';
-    const currentTitle = ($('#ai-title', overlay).value || '').trim();
-    if (!currentTitle) {
-      errBox.textContent = 'Give the project a title, then Apply.';
-      return;
+    let currentTitle = title || '';
+    if (!applyToSlug) {
+      currentTitle = ($('#ai-title', overlay).value || '').trim();
+      if (!currentTitle) {
+        errBox.textContent = 'Give the project a title, then Apply.';
+        return;
+      }
     }
     applyBtn.disabled = true;
-    applyBtn.textContent = 'Creating…';
+    applyBtn.textContent = 'Applying…';
     try {
       const form = new FormData();
       form.append('file', file);
       form.append('proposal', JSON.stringify(proposal));
-      form.append('title', currentTitle);
-      const created = await api('/api/import/ai/apply', { method: 'POST', body: form });
+      let created;
+      if (applyToSlug) {
+        created = await api(`/api/projects/${encodeURIComponent(applyToSlug)}/import/ai/apply`, { method: 'POST', body: form });
+      } else {
+        form.append('title', currentTitle);
+        created = await api('/api/import/ai/apply', { method: 'POST', body: form });
+      }
       closeAiPreviewModal();
       closeModal();
       const project = created && created.project ? created.project : created;
       if (project && project.slug) {
-        location.hash = `#/project/${encodeURIComponent(project.slug)}`;
+        if (applyToSlug) {
+          // Back to the Management page — re-render in place when already
+          // there (setting the same hash is a no-op).
+          const target = `#/manage/${encodeURIComponent(project.slug)}`;
+          if (location.hash === target) renderManagePage(project.slug);
+          else location.hash = target;
+        } else {
+          location.hash = `#/project/${encodeURIComponent(project.slug)}`;
+        }
       } else {
         renderHome();
       }
@@ -848,7 +1227,7 @@ function openAiPreviewModal(file, title, proposal) {
         ? 'A project with this title already exists — pick a different title.'
         : err.message;
       applyBtn.disabled = false;
-      applyBtn.textContent = 'Apply — create project';
+      applyBtn.textContent = applyToSlug ? 'Apply to this project' : 'Apply — create project';
     }
   });
 }
@@ -906,17 +1285,28 @@ async function openProject(slug) {
   loadReadingPosition();
   state.restoringPosition = true;
 
-  // Default note: the first editable note — notes.md is read-only and
-  // never opens in the right pane (it lives in the left preview).
-  const def = defaultEditorNote();
-  if (def) {
-    try { await loadNote(def.name); }
-    catch { /* notebook pane renders empty; tabs still work */ }
+  // Management page → Edit notes.md: open it as an editable tab this once
+  // (pendingNotesMdEditSlug is set by the Manage page and consumed here).
+  // Otherwise the default note is the first editable note — notes.md is
+  // read-only and never opens in the right pane (it lives in the left preview).
+  const editMaster = pendingNotesMdEditSlug === slug;
+  pendingNotesMdEditSlug = null;
+  if (editMaster && state.notes.some((n) => n.name === 'notes.md')) {
+    state.notesMdEditing = true;
+    try { await loadNote('notes.md'); }
+    catch { state.notesMdEditing = false; }
+  } else {
+    const def = defaultEditorNote();
+    if (def) {
+      try { await loadNote(def.name); }
+      catch { /* notebook pane renders empty; tabs still work */ }
+    }
   }
 
-  // notes.md never opens in the editor, but the chapter panel resolves
-  // chapters against its ## headings — keep the cache warm so the
-  // resolution works from the first render.
+  // notes.md opens in the editor only via the Management page's Edit
+  // action; the chapter panel resolves chapters against its ## headings
+  // either way — keep the cache warm so the resolution works from the
+  // first render.
   if (state.notes.some((n) => n.name === 'notes.md')) {
     try {
       const data = await apiGet(`/api/projects/${encodeURIComponent(slug)}/notes/notes.md`);
@@ -955,6 +1345,7 @@ function renderReaderShell() {
         <button type="button" id="chapter-toggle" aria-pressed="${state.panels.nav ? 'true' : 'false'}"
                 title="Show or hide the chapter panel">Chapters</button>
         <h1>${esc(p.title || 'Untitled')}</h1>
+        <button type="button" id="manage-top" title="Manage this project — sources, notes, export">Manage</button>
         <button type="button" id="layout-menu-btn" title="Layout — presets and panels">▦ Layout</button>
         ${switcher}
         <span class="topbar-split">
@@ -983,6 +1374,9 @@ function renderReaderShell() {
 
   $('#layout-menu-btn', view).addEventListener('click', (e) => {
     openLayoutMenu(e.currentTarget);
+  });
+  $('#manage-top', view).addEventListener('click', () => {
+    location.hash = `#/manage/${encodeURIComponent(state.project.slug)}`;
   });
   $('#screenshot-top', view).addEventListener('click', onTopbarScreenshot);
   $('#screenshot-top-chevron', view).addEventListener('click', (e) => {
@@ -2777,7 +3171,7 @@ function resolvedChapterHeading(chapter) {
   // The index counts ## headings only (h2Headings): ### sub-headings must
   // not shift it — see h2Headings.
   // Chapters resolve against notes.md's headings (the master), never the
-  // open note's — notes.md never opens in the editor.
+  // open note's — notes.md opens in the editor only via Manage → Edit.
   const h2 = h2Headings(notesMdHeadings());
   const override = state.chapterMap[normalizeHeading(chapter.title)];
   if (typeof override === 'number' && h2[override]) {
@@ -3071,7 +3465,7 @@ function scrollNotebookToHeading(heading) {
 
   // Edit mode: scroll the textarea so the heading line is visible — but
   // only when the open note actually has that heading (chapters resolve
-  // against notes.md, which never opens in the editor).
+  // against notes.md, which opens in the editor only via Manage → Edit).
   const ta = $('.md-editor', body);
   if (!ta) return;
   const match = (state.headings || []).find((hh) => hh.norm === heading.norm);
@@ -3121,7 +3515,7 @@ function filesVisible() {
 }
 
 /* No editable note is open: clear the editor state so the right pane
-   shows its empty state (notes.md never opens here). */
+   shows its empty state (notes.md opens here only via Manage → Edit). */
 function clearActiveNote() {
   state.activeTabKind = 'note';
   state.activeLab = null;
@@ -3133,9 +3527,11 @@ function clearActiveNote() {
 }
 
 async function loadNote(name) {
-  // notes.md is read-only: it never opens in the right pane. Show it in
-  // the left preview instead and leave the editor alone.
-  if (name === 'notes.md') {
+  // notes.md is read-only: it never opens in the right pane — EXCEPT when
+  // the Management page's Edit action asked for it (state.notesMdEditing).
+  // Then it loads as a normal editable tab. Otherwise show it in the left
+  // preview instead and leave the editor alone.
+  if (name === 'notes.md' && !state.notesMdEditing) {
     state.previewNoteName = 'notes.md';
     renderLeftPreview();
     return;
@@ -3186,10 +3582,14 @@ function resetExecCounter() {
    the name (AV AutosizeInput equivalent), so a long name is never cut
    off. Enter/blur commits, Escape cancels. Delete is two-click: the
    first click arms the tab's × for 2s, the second confirms. notes.md —
-   the master filing home — has no tab at all, and the server refuses
-   to rename or delete it. */
+   the master filing home — has no tab at all (except while the Management
+   page's Edit action has it open), and the server refuses to rename or
+   delete it. */
 let armedNoteDelete = null;
 let armedNoteDeleteTimer = 0;
+// Set by the Management page's Edit action: openProject then opens notes.md
+// as an editable tab for this slug (one-shot, consumed on open).
+let pendingNotesMdEditSlug = null;
 /* Activation sequence for loadNote/loadLab (see loadNote): the latest
    requested activation wins over any earlier one still in flight. */
 let activationSeq = 0;
@@ -3357,10 +3757,12 @@ function renderNotebookPane() {
   const tabs = $('#notebook-tabs', pane);
   state.notes.forEach((n) => {
     // notes.md is read-only: it has no editor tab (browse + preview it
-    // from the left pane's Markdown preview picker). A note whose tab
-    // was closed stays out of the bar until it is re-opened from Files.
-    if (n.name === 'notes.md') return;
-    if (!state.openNotes.has(n.name)) return;
+    // from the left pane's Markdown preview picker) — UNLESS the
+    // Management page's Edit action opened it (state.notesMdEditing).
+    // A note whose tab was closed stays out of the bar until it is
+    // re-opened from Files.
+    if (n.name === 'notes.md' && !state.notesMdEditing) return;
+    if (n.name !== 'notes.md' && !state.openNotes.has(n.name)) return;
     const isActive = state.activeTabKind === 'note' && n.name === state.activeNoteName;
     const tab = document.createElement('button');
     tab.type = 'button';
@@ -3421,7 +3823,7 @@ function renderNotebookPane() {
     const name = (tabEl.querySelector('input')?.value || tabEl.textContent || '')
       .replace(/Sure\?|✕/g, '').trim();
     const note = state.notes.find((n) => n.name === name);
-    if (note?.kind === 'md') enterNoteRename(note.name);
+    if (note?.kind === 'md' && note.name !== 'notes.md') enterNoteRename(note.name);
   });
   // Labs opened as tabs (v1.1): only the opened lab becomes a tab.
   state.labTabs.forEach((lab) => {
@@ -3617,8 +4019,8 @@ function refreshFilesLists() {
 
 /* Open a file from the Files directory: add it to the open tabs (a
    closed tab re-opens), then load it — or do nothing when it is already
-   the active tab. notes.md never opens in the editor: it shows in the
-   left preview instead (loadNote handles that). */
+   the active tab. notes.md opens in the editor only via Manage → Edit:
+   from here it shows in the left preview instead (loadNote handles that). */
 async function openNoteFromDirectory(name) {
   if (state.activeTabKind === 'note' && state.activeNoteName === name) return;
   state.openNotes.add(name);
@@ -3836,6 +4238,7 @@ async function activateFallbackTab() {
 async function closeNoteTab(name) {
   const wasActive = state.activeTabKind === 'note' && state.activeNoteName === name;
   if (wasActive) await flushActiveNoteEdits();
+  if (name === 'notes.md') state.notesMdEditing = false; // the Edit session ends with the tab
   state.openNotes.delete(name);
   persistOpenTabs();
   if (!wasActive) { renderNotebookPane(); return; }
@@ -3958,6 +4361,10 @@ async function renderAnchorControl() {
   if (!host) return;
   const noteName = state.activeNoteName;
   if (state.activeTabKind !== 'note' || state.activeNoteKind !== 'md' || !noteName) return;
+  // notes.md has no Anchors control: it IS the filing home — its own
+  // headings carry the anchor lines, and re-pointing them from here would
+  // be self-referential.
+  if (noteName === 'notes.md') { host.innerHTML = ''; return; }
   const entries = await noteLinkEntries(noteName);
   if (state.activeNoteName !== noteName || !$('#md-anchor-control', view)) return; // tab moved on
   const reading = currentReadingPage();
@@ -4499,9 +4906,10 @@ function renderNotebookBody() {
   if (!body) return;
   body.classList.remove('has-quick-actions'); // re-added below for md notes
   if (state.activeTabKind === 'note' && !state.activeNoteName) {
-    // No editable note is open (notes.md never opens here): one line,
-    // then the Files directory — the way back in. (With a tab open the
-    // directory lives in its panel above the body instead, so the list
+    // No editable note is open (notes.md opens here only via Manage →
+    // Edit): one line, then the Files directory — the way back in. (With
+    // a tab open the directory lives in its panel above the body instead,
+    // so the list
     // is never rendered twice.)
     body.innerHTML = `<div class="notebook-empty">No note open — pick a file below, or press + to create one.</div>${openTabCount() === 0 ? '<div class="files-panel" id="files-panel"></div>' : ''}`;
     const filesPanel = $('#files-panel', body);

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   fenceLanguage, cellSource, pngHash, assetFileName, cellImages, cellStreams,
-  cellsToMarkdown,
+  cellsToMarkdown, notebookToMarkdown,
 } from '../src/cellExport.js';
 
 // A 1x1 transparent PNG (valid PNG bytes, 68 bytes when decoded).
@@ -108,5 +108,46 @@ test('cellsToMarkdown: validation — empty selection, out of range, bad noteboo
   assert.throws(
     () => cellsToMarkdown({ notebook: null, name: 'a.ipynb', indices: [0] }),
     (err) => err.status === 400,
+  );
+});
+
+test('notebookToMarkdown: whole notebook in order — markdown verbatim, code fenced, outputs + plots', () => {
+  const notebook = nb([
+    mdCell('# Intro\n\nSome **text**.'),
+    codeCell('x = 1', [
+      { output_type: 'stream', name: 'stdout', text: '1\n' },
+      { output_type: 'display_data', data: { 'image/png': PNG_1X1 }, metadata: {} },
+    ]),
+    mdCell(''),
+    { cell_type: 'raw', metadata: {}, source: 'raw line' },
+  ]);
+  const { markdown, images } = notebookToMarkdown({ notebook, name: 'lab.ipynb' });
+  assert.ok(markdown.startsWith('# lab\n\n# Intro\n\nSome **text**.\n\n### Cell 2\n\n```python\nx = 1\n```'));
+  assert.match(markdown, /```\n1\n```/); // stdout block
+  assert.match(markdown, /!\[Cell 2 plot\]\(assets\/lab-cell-2-[0-9a-f]{8}\.png\)/);
+  assert.equal(markdown.trimEnd().endsWith('raw line'), true);
+  assert.equal(images.length, 1);
+  assert.equal(images[0].base64, PNG_1X1);
+  assert.match(images[0].fileName, /^lab-cell-2-[0-9a-f]{8}\.png$/);
+});
+
+test('notebookToMarkdown: markdown-only notebook exports the text; empty notebook is just the title', () => {
+  const mdOnly = notebookToMarkdown({ notebook: nb([mdCell('## Notes\n\nhello')]), name: 'a.ipynb' });
+  assert.equal(mdOnly.markdown, '# a\n\n## Notes\n\nhello\n');
+  assert.deepEqual(mdOnly.images, []);
+  const empty = notebookToMarkdown({ notebook: nb([]), name: 'b.ipynb' });
+  assert.equal(empty.markdown, '# b\n');
+  assert.deepEqual(empty.images, []);
+});
+
+test('notebookToMarkdown: validation — bad notebook, too many cells', () => {
+  assert.throws(
+    () => notebookToMarkdown({ notebook: null, name: 'a.ipynb' }),
+    (err) => err.status === 400,
+  );
+  const many = nb(Array.from({ length: 201 }, () => mdCell('x')));
+  assert.throws(
+    () => notebookToMarkdown({ notebook: many, name: 'a.ipynb' }),
+    (err) => err.status === 400 && /at most 200/.test(err.message),
   );
 });
