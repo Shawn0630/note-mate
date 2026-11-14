@@ -469,6 +469,7 @@ window.addEventListener('hashchange', route);
 // data — a slug collision keeps the existing project and is reported.
 let adminCallsOffset = 0;
 let adminCallsLimit = 20;
+let adminTab = 'calls'; // 'calls' | 'data' — in-memory only, default AI calls.
 
 function adminCallFeatureLabel(feature) {
   return { 'ai-note': 'Note AI', 'ai-code': 'Code AI', 'ai-import': 'AI import' }[feature] || feature;
@@ -537,8 +538,12 @@ async function renderAdminPage() {
       <a class="back-link" href="#/">‹ Shelf</a>
       <h1>Admin</h1>
     </div>
-    <div class="manage-section">
-      <h2>AI calls</h2>
+    <div class="admin-tabs" role="tablist">
+      <button type="button" class="admin-tab${adminTab === 'calls' ? ' active' : ''}" id="admin-tab-calls-btn" role="tab" aria-selected="${adminTab === 'calls'}">AI calls</button>
+      <button type="button" class="admin-tab${adminTab === 'data' ? ' active' : ''}" id="admin-tab-data-btn" role="tab" aria-selected="${adminTab === 'data'}">Data</button>
+    </div>
+    <div class="admin-card">
+    <div class="manage-section admin-panel" id="admin-panel-calls" role="tabpanel"${adminTab === 'calls' ? '' : ' hidden'}>
       <div class="manage-actions">
         <button class="mini-btn" id="admin-calls-reload">Reload</button>
         <button class="mini-btn" id="admin-models-btn">List models my key can use</button>
@@ -546,11 +551,11 @@ async function renderAdminPage() {
       </div>
       <div id="admin-models"></div>
       <div id="admin-calls"><p class="manage-status">Loading…</p></div>
-      <div class="manage-actions">
+      <div class="admin-pager">
         <button class="mini-btn" id="admin-calls-prev">← Newer</button>
         <span class="manage-status" id="admin-calls-page"></span>
         <button class="mini-btn" id="admin-calls-next">Older →</button>
-        <label class="manage-status">per page
+        <label class="admin-per-page">per page
           <select id="admin-calls-size">
             <option value="10">10</option>
             <option value="20" selected>20</option>
@@ -559,15 +564,16 @@ async function renderAdminPage() {
         </label>
       </div>
     </div>
-    <div class="manage-section">
-      <h2>Data</h2>
+    <div class="manage-section admin-panel" id="admin-panel-data" role="tabpanel"${adminTab === 'data' ? '' : ' hidden'}>
       <div class="manage-actions">
         <button class="primary" id="admin-export-btn">Export all data</button>
         <span class="manage-status" id="admin-data-status"></span>
       </div>
       <div class="manage-actions">
-        <input type="file" id="admin-import-file" accept=".zip">
-        <button id="admin-import-btn" disabled>Import</button>
+        <input type="file" id="admin-import-file" class="admin-file-input" accept=".zip">
+        <button type="button" class="mini-btn" id="admin-import-pick">Choose file</button>
+        <span class="manage-status admin-import-name" id="admin-import-name">No file chosen</span>
+        <button type="button" class="primary" id="admin-import-btn" disabled>Import</button>
       </div>
       <div id="admin-import-result"></div>
       <div class="admin-subhead">Sync</div>
@@ -583,7 +589,19 @@ async function renderAdminPage() {
       </div>
       <div id="sync-log"><p class="manage-status">Loading…</p></div>
     </div>
+    </div>
   </div>`;
+  const setAdminTab = (tab) => {
+    adminTab = tab;
+    $('#admin-tab-calls-btn', view).classList.toggle('active', tab === 'calls');
+    $('#admin-tab-data-btn', view).classList.toggle('active', tab === 'data');
+    $('#admin-tab-calls-btn', view).setAttribute('aria-selected', String(tab === 'calls'));
+    $('#admin-tab-data-btn', view).setAttribute('aria-selected', String(tab === 'data'));
+    $('#admin-panel-calls', view).hidden = tab !== 'calls';
+    $('#admin-panel-data', view).hidden = tab !== 'data';
+  };
+  $('#admin-tab-calls-btn', view).addEventListener('click', () => setAdminTab('calls'));
+  $('#admin-tab-data-btn', view).addEventListener('click', () => setAdminTab('data'));
   $('#admin-calls-reload', view).addEventListener('click', () => { loadAdminCalls(); });
   $('#admin-calls-prev', view).addEventListener('click', () => {
     adminCallsOffset = Math.max(0, adminCallsOffset - adminCallsLimit);
@@ -639,7 +657,12 @@ async function renderAdminPage() {
   });
   const importFile = $('#admin-import-file', view);
   const importBtn = $('#admin-import-btn', view);
-  importFile.addEventListener('change', () => { importBtn.disabled = !importFile.files.length; });
+  const importName = $('#admin-import-name', view);
+  $('#admin-import-pick', view).addEventListener('click', () => importFile.click());
+  importFile.addEventListener('change', () => {
+    importBtn.disabled = !importFile.files.length;
+    if (importName) importName.textContent = importFile.files.length ? importFile.files[0].name : 'No file chosen';
+  });
   importBtn.addEventListener('click', async () => {
     const file = importFile.files[0];
     if (!file) return;
@@ -661,6 +684,7 @@ async function renderAdminPage() {
       }
       importFile.value = '';
       importBtn.disabled = true;
+      if (importName) importName.textContent = 'No file chosen';
     } catch (err) {
       if (statusEl) statusEl.textContent = `Import failed: ${err.message}`;
     }
@@ -731,12 +755,10 @@ async function renderHome() {
         <p>Your reading projects — open one to read and take notes side by side.</p>
       </div>
       <button class="primary" id="add-project-btn">+ Add project</button>
-      <button id="admin-btn">Admin</button>
     </div>
     <div id="shelf"><p>Loading your shelf…</p></div>`;
 
   $('#add-project-btn', view).addEventListener('click', openAddProjectModal);
-  $('#admin-btn', view).addEventListener('click', () => { location.hash = '#/admin'; });
 
   try {
     const projects = await apiGet('/api/projects');
@@ -1821,6 +1843,7 @@ function renderReaderShell() {
         </span>
         <button type="button" id="ai-toggle-top" class="${state.panels.ai ? 'active' : ''}"
                 title="Ask the AI — opens the AI panel">✨ Ask AI</button>
+        <button type="button" id="admin-top" title="Admin — AI call log, data export/import, sync">Admin</button>
         <button type="button" id="theme-toggle-top" class="theme-toggle"
                 title="Switch to dark theme" aria-label="Switch to dark theme">🌙</button>
       </header>
@@ -1851,6 +1874,7 @@ function renderReaderShell() {
     openScreenshotMenu(e.currentTarget, () => activeMdEditor());
   });
   $('#ai-toggle-top', view).addEventListener('click', toggleAiPanel);
+  $('#admin-top', view).addEventListener('click', () => { location.hash = '#/admin'; });
   $('#theme-toggle-top', view).addEventListener('click', toggleTheme);
   syncThemeToggle();
   $('#chapter-toggle', view).addEventListener('click', () => {
@@ -3230,6 +3254,16 @@ async function loadPdf(fileUrl, sourceUrl, sourceId = 'book') {
     isCurrent: () => myToken === pdfLoadToken,
   });
   if (myToken !== pdfLoadToken) return; // superseded mid-mount — leave the newer load's scroll alone
+  // Left the reader while this document was still loading (the Admin
+  // button / back link): the project is gone and the container is
+  // detached — drop the document instead of mounting into nothing
+  // (the state.project.cover check below would throw on the null
+  // project, surfacing as an uncaught page error).
+  if (!state.project) {
+    try { pdf.destroy(); } catch { /* ignore */ }
+    if (state.pdfDoc === pdf) state.pdfDoc = null;
+    return;
+  }
 
   // A source switch reloads the container: the old document's scroll offset
   // must not carry over numerically into the new one (it would land on
