@@ -4742,26 +4742,31 @@ function renderIpynbBody(body) {
     wrap.appendChild(addRow);
   });
 
-  const bottomRow = document.createElement('div');
-  bottomRow.className = 'nb-add-row';
-  bottomRow.innerHTML = `
-    <button type="button" id="nb-add-md-bottom">+ Markdown cell</button>
-    <button type="button" id="nb-add-code-bottom">+ Code cell</button>`;
-  $('#nb-add-md-bottom', bottomRow).addEventListener('click', () => {
-    const newCell = { cell_type: 'markdown', metadata: {}, source: '' };
-    nb.cells.push(newCell);
-    commitAllNbEdits();
-    pushUndoEntry(nbUndoStack(), addUndoEntry({ cell: newCell }));
-    saveNotebook().then(() => renderNotebookBody());
-  });
-  $('#nb-add-code-bottom', bottomRow).addEventListener('click', () => {
-    const newCell = { cell_type: 'code', execution_count: null, metadata: {}, outputs: [], source: '' };
-    nb.cells.push(newCell);
-    commitAllNbEdits();
-    pushUndoEntry(nbUndoStack(), addUndoEntry({ cell: newCell }));
-    saveNotebook().then(() => renderNotebookBody());
-  });
-  wrap.appendChild(bottomRow);
+  // No bottom add row: it duplicated the last cell's per-cell row (the
+  // last cell's "add after" IS "append at the end"). The only notebook
+  // with no per-cell row is an empty one (every cell deleted) — keep a
+  // single add row there, or the notebook would have no way to grow.
+  if (!nb.cells.length) {
+    const emptyRow = document.createElement('div');
+    emptyRow.className = 'nb-add-row';
+    const addFirstCell = (cellType) => {
+      const newCell = cellType === 'markdown'
+        ? { cell_type: 'markdown', metadata: {}, source: '' }
+        : { cell_type: 'code', execution_count: null, metadata: {}, outputs: [], source: '' };
+      nb.cells.push(newCell);
+      commitAllNbEdits();
+      pushUndoEntry(nbUndoStack(), addUndoEntry({ cell: newCell }));
+      saveNotebook().then(() => renderNotebookBody());
+    };
+    for (const [label, cellType] of [['+ Markdown cell', 'markdown'], ['+ Code cell', 'code']]) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = label;
+      btn.addEventListener('click', () => addFirstCell(cellType));
+      emptyRow.appendChild(btn);
+    }
+    wrap.appendChild(emptyRow);
+  }
   // Fit every cell editor NOW that the cells are in the DOM: measuring
   // scrollHeight before appendChild returns 0, so the per-cell fit
   // above could never run at render time — only the input listener
