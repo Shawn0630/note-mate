@@ -161,3 +161,190 @@ test('GET /projects/:slug/file: a Word document as the main source converts on f
   const st = await fs.stat(path.join(docxDir, 'source.pdf'));
   assert.ok(st.size > 0);
 });
+
+const postYoutubeMaterial = async (slug, body) => {
+  const r = await fetch(`${base}/api/projects/${slug}/materials`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { status: r.status, json: await r.json() };
+};
+
+test('POST /materials: a YouTube URL becomes a kind-video material with its video id', async () => {
+  const created = await postYoutubeMaterial('fixture-book', {
+    url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+    label: 'Lecture 1',
+  });
+  assert.equal(created.status, 201);
+  assert.equal(created.json.kind, 'video');
+  assert.equal(created.json.label, 'Lecture 1');
+  assert.equal(created.json.videoId, 'dQw4w9WgXcQ');
+  assert.equal(created.json.hasFile, false);
+  // A second video (youtu.be form, another id) is allowed alongside it.
+  const second = await postYoutubeMaterial('fixture-book', {
+    url: 'https://youtu.be/9bZkp7q19f0',
+    label: 'Lecture 2',
+  });
+  assert.equal(second.status, 201);
+  assert.equal(second.json.videoId, '9bZkp7q19f0');
+  // GET /materials lists both, with their video ids and no file.
+  const list = await getJson('/api/projects/fixture-book/materials');
+  const videos = list.json.filter((m) => m.kind === 'video');
+  assert.equal(videos.length, 2);
+  assert.deepEqual(videos.map((m) => m.videoId), ['dQw4w9WgXcQ', '9bZkp7q19f0']);
+  // The video has no file to serve.
+  const file = await get('/api/projects/fixture-book/materials/lecture-1/file');
+  assert.equal(file.status, 404);
+});
+
+test('POST /materials: a non-YouTube URL is 400 and writes nothing', async () => {
+  const before = await getJson('/api/projects/fixture-book/materials');
+  const bad = await postYoutubeMaterial('fixture-book', { url: 'https://vimeo.com/123456789', label: 'Nope' });
+  assert.equal(bad.status, 400);
+  const noId = await postYoutubeMaterial('fixture-book', { url: 'https://www.youtube.com/watch', label: 'Nope' });
+  assert.equal(noId.status, 400);
+  const gone = await postYoutubeMaterial('no-such-project', { url: 'https://youtu.be/dQw4w9WgXcQ', label: 'Nope' });
+  assert.equal(gone.status, 404);
+  const after = await getJson('/api/projects/fixture-book/materials');
+  assert.equal(after.json.length, before.json.length);
+});
+
+// --- Fill with AI for Materials (propose/apply) + kind 'link' ---
+
+function withLlmEnv(vars, fn) {
+  const saved = {};
+  for (const k of Object.keys(vars)) { saved[k] = process.env[k]; }
+  const savedFile = process.env.LLM_ENV_FILE;
+  process.env.LLM_ENV_FILE = '/nonexistent/none.env';
+  for (const [k, v] of Object.entries(vars)) {
+    if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+  return Promise.resolve()
+    .then(fn)
+    .finally(() => {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+      if (savedFile === undefined) delete process.env.LLM_ENV_FILE; else process.env.LLM_ENV_FILE = savedFile;
+    });
+}
+
+const postJson = async (p, body) => {
+  const r = await fetch(`${base}${p}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { status: r.status, json: await r.json().catch(() => null) };
+};
+
+const MATERIALS_STUB = JSON.stringify({
+  materials: [
+    { title: 'Lecture 1', kind: 'video', url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' },
+    { title: 'Big Buck Bunny', kind: 'video', url: 'https://youtu.be/aqz-KE-bpKQ' },
+    { title: 'Bad', kind: 'video', url: 'https://vimeo.com/1' },
+    { title: 'Proposed Guide', kind: 'link', url: 'https://example.com/proposed-guide' },
+  ],
+  note: 'Four items.',
+});
+
+test('POST /materials: a plain link becomes a kind-link material and has no file', async () => {
+  const created = await postYoutubeMaterial('fixture-book', {
+    url: 'https://example.com/guide', label: 'Guide', kind: 'link',
+  });
+  assert.equal(created.status, 201);
+  assert.equal(created.json.kind, 'link');
+  assert.equal(created.json.label, 'Guide');
+  assert.equal(created.json.url, 'https://example.com/guide');
+  assert.equal(created.json.hasFile, false);
+  const list = await getJson('/api/projects/fixture-book/materials');
+  const link = list.json.find((m) => m.kind === 'link');
+  assert.equal(link.url, 'https://example.com/guide');
+  const file = await get('/api/projects/fixture-book/materials/guide/file');
+  assert.equal(file.status, 404);
+});
+
+test('POST /materials/ai/propose: stub proposal is normalized and deduped against existing materials', async () => {
+  await withLlmEnv({ LLM_STUB_RESPONSE: MATERIALS_STUB }, async () => {
+    const r = await postJson('/api/projects/fixture-book/materials/ai/propose', {
+      messages: [{ role: 'user', content: 'Add the lecture videos and the guide' }],
+    });
+    assert.equal(r.status, 200);
+    // Lecture 1 is already in fixture-book (the YouTube round added it) —
+    // it is skipped, not proposed again. The bad video entry is dropped.
+    assert.deepEqual(r.json.materials.map((m) => m.title), ['Big Buck Bunny', 'Proposed Guide']);
+    assert.equal(r.json.materials[0].kind, 'video');
+    assert.equal(r.json.materials[0].url, 'https://www.youtube.com/watch?v=aqz-KE-bpKQ');
+    assert.equal(r.json.materials[1].kind, 'link');
+    assert.equal(r.json.dropped, 1);
+    assert.equal(r.json.skipped.length, 1);
+    assert.equal(r.json.skipped[0].title, 'Lecture 1');
+    assert.equal(r.json.skipped[0].reason, 'duplicate');
+    assert.equal(r.json.note, 'Four items.');
+    // Nothing was written by propose.
+    const list = await getJson('/api/projects/fixture-book/materials');
+    assert.equal(list.json.some((m) => m.label === 'Big Buck Bunny'), false);
+  });
+});
+
+test('POST /materials/ai/propose: 503 when the LLM is unconfigured; 400 on a bad thread; 404 on an unknown project', async () => {
+  await withLlmEnv({ LLM_STUB_RESPONSE: undefined, LLM_API_KEY: undefined, LLM_MODEL: undefined }, async () => {
+    const r = await postJson('/api/projects/fixture-book/materials/ai/propose', {
+      messages: [{ role: 'user', content: 'Add videos' }],
+    });
+    assert.equal(r.status, 503);
+    assert.match(r.json.error, /not configured/i);
+  });
+  await withLlmEnv({ LLM_STUB_RESPONSE: MATERIALS_STUB }, async () => {
+    const empty = await postJson('/api/projects/fixture-book/materials/ai/propose', { messages: [] });
+    assert.equal(empty.status, 400);
+    const noUser = await postJson('/api/projects/fixture-book/materials/ai/propose', {
+      messages: [{ role: 'assistant', content: 'hi' }],
+    });
+    assert.equal(noUser.status, 400);
+    const gone = await postJson('/api/projects/no-such-project/materials/ai/propose', {
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(gone.status, 404);
+  });
+});
+
+test('POST /materials/ai/apply: adds new materials, dedupes on a second apply', async () => {
+  const proposal = [
+    { title: 'Apply Video', kind: 'video', url: 'https://youtu.be/M7lc1UVf-VE' },
+    { title: 'Apply Doc', kind: 'link', url: 'https://example.com/apply-doc' },
+  ];
+  const first = await postJson('/api/projects/fixture-book/materials/ai/apply', { materials: proposal });
+  assert.equal(first.status, 201);
+  assert.equal(first.json.added.length, 2);
+  assert.deepEqual(first.json.added.map((m) => m.kind), ['video', 'link']);
+  assert.equal(first.json.added[0].videoId, 'M7lc1UVf-VE');
+  assert.equal(first.json.skipped.length, 0);
+  const list = await getJson('/api/projects/fixture-book/materials');
+  assert.equal(list.json.some((m) => m.label === 'Apply Video'), true);
+  assert.equal(list.json.some((m) => m.label === 'Apply Doc'), true);
+  // Applying the same proposal again adds nothing — both are skipped.
+  const second = await postJson('/api/projects/fixture-book/materials/ai/apply', { materials: proposal });
+  assert.equal(second.status, 201);
+  assert.equal(second.json.added.length, 0);
+  assert.equal(second.json.skipped.length, 2);
+  assert.ok(second.json.skipped.every((s) => s.reason === 'duplicate'));
+});
+
+test('POST /materials/ai/apply: a bad entry fails the whole apply and writes nothing', async () => {
+  const before = await getJson('/api/projects/fixture-book/materials');
+  const bad = await postJson('/api/projects/fixture-book/materials/ai/apply', {
+    materials: [
+      { title: 'Good', kind: 'video', url: 'https://youtu.be/dQw4w9WgXcQ' },
+      { title: 'Bad', kind: 'video', url: 'https://vimeo.com/1' },
+    ],
+  });
+  assert.equal(bad.status, 400);
+  const after = await getJson('/api/projects/fixture-book/materials');
+  assert.equal(after.json.length, before.json.length);
+  const gone = await postJson('/api/projects/no-such-project/materials/ai/apply', {
+    materials: [{ title: 'Good', kind: 'video', url: 'https://youtu.be/dQw4w9WgXcQ' }],
+  });
+  assert.equal(gone.status, 404);
+});

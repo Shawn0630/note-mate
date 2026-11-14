@@ -10,6 +10,7 @@ import {
   cellsOf,
   applyCellOutput,
   resolveProjectPath,
+  extractYoutubeVideoId,
 } from '../src/util.js';
 
 test('slugify: lowercase, dashes, trims, fallback', () => {
@@ -112,4 +113,34 @@ test('resolveProjectPath: resolves inside the project, throws on traversal', () 
   assert.throws(() => resolveProjectPath(dataDir, 'My Book', 'x'), /Invalid project slug/);
   assert.throws(() => resolveProjectPath(dataDir, 'my-book', '..', '..', 'etc', 'passwd'), /escapes project/);
   assert.throws(() => resolveProjectPath(dataDir, 'my-book', 'notes', '../../secret'), /escapes project/);
+});
+
+test('extractYoutubeVideoId: watch, short, shorts, live, embed, v forms', () => {
+  const id = 'dQw4w9WgXcQ';
+  assert.equal(extractYoutubeVideoId(`https://www.youtube.com/watch?v=${id}`), id);
+  assert.equal(extractYoutubeVideoId(`https://youtube.com/watch?v=${id}&list=PL123&t=42s`), id);
+  assert.equal(extractYoutubeVideoId(`https://music.youtube.com/watch?v=${id}`), id);
+  assert.equal(extractYoutubeVideoId(`https://youtu.be/${id}`), id);
+  assert.equal(extractYoutubeVideoId(`https://youtu.be/${id}?t=30`), id);
+  assert.equal(extractYoutubeVideoId(`https://www.youtube.com/shorts/${id}`), id);
+  assert.equal(extractYoutubeVideoId(`https://www.youtube.com/live/${id}`), id);
+  assert.equal(extractYoutubeVideoId(`https://www.youtube.com/embed/${id}`), id);
+  assert.equal(extractYoutubeVideoId(`https://www.youtube.com/v/${id}`), id);
+  assert.equal(extractYoutubeVideoId(`https://www.youtube-nocookie.com/embed/${id}`), id);
+  // Missing scheme is tolerated.
+  assert.equal(extractYoutubeVideoId(`youtube.com/watch?v=${id}`), id);
+  assert.equal(extractYoutubeVideoId(`youtu.be/${id}`), id);
+});
+
+test('extractYoutubeVideoId: rejects non-YouTube URLs and bad ids', () => {
+  assert.equal(extractYoutubeVideoId('https://vimeo.com/123456789'), null);
+  assert.equal(extractYoutubeVideoId('https://www.youtube.com/watch'), null);
+  assert.equal(extractYoutubeVideoId('https://www.youtube.com/watch?v=short'), null);
+  assert.equal(extractYoutubeVideoId('https://www.youtube.com/watch?v=dQw4w9WgXcQ&v=other'), 'dQw4w9WgXcQ');
+  assert.equal(extractYoutubeVideoId('https://youtube.com.evil.com/watch?v=dQw4w9WgXcQ'), null);
+  assert.equal(extractYoutubeVideoId('https://www.youtube.com/playlist?list=PL123'), null);
+  assert.equal(extractYoutubeVideoId('https://youtu.be/'), null);
+  assert.equal(extractYoutubeVideoId(''), null);
+  assert.equal(extractYoutubeVideoId(null), null);
+  assert.equal(extractYoutubeVideoId('not a url'), null);
 });

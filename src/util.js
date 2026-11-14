@@ -30,6 +30,45 @@ export function normalizeHeading(text) {
 }
 
 /**
+ * Extract the YouTube video ID from a pasted URL, or null when the URL is
+ * not a YouTube video link. Accepted forms: youtube.com/watch?v=…,
+ * youtu.be/…, youtube.com/shorts/…, /live/…, /embed/…, /v/… (any
+ * youtube.com subdomain, youtube-nocookie.com, youtu.be). Video IDs are
+ * exactly 11 chars ([A-Za-z0-9_-]); a missing scheme is tolerated
+ * ("youtube.com/watch?v=…" works). The ?t= start offset, playlists and
+ * other params are ignored — the stored position, not the pasted link,
+ * decides where playback resumes.
+ */
+export function extractYoutubeVideoId(rawUrl) {
+  let s = String(rawUrl ?? '').trim();
+  if (!s) return null;
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = `https://${s}`;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  const host = u.hostname.toLowerCase();
+  const isYoutube = host === 'youtube.com' || host.endsWith('.youtube.com')
+    || host === 'youtube-nocookie.com' || host.endsWith('.youtube-nocookie.com');
+  const isShort = host === 'youtu.be';
+  if (!isYoutube && !isShort) return null;
+  const id = (v) => (typeof v === 'string' && /^[A-Za-z0-9_-]{11}$/.test(v) ? v : null);
+  if (isShort) {
+    // youtu.be/<id> — the first path segment, query/fragment stripped.
+    return id(u.pathname.split('/').filter(Boolean)[0]);
+  }
+  const fromQuery = id(u.searchParams.get('v'));
+  if (fromQuery) return fromQuery;
+  const segments = u.pathname.split('/').filter(Boolean);
+  if (segments.length >= 2 && ['shorts', 'live', 'embed', 'v'].includes(segments[0])) {
+    return id(segments[1]);
+  }
+  return null;
+}
+
+/**
  * Match each outline title to the best note heading.
  * Returns an array aligned with `outlineTitles`: the index of the best
  * matching heading, or null when nothing matches.

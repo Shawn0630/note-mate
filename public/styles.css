@@ -1107,7 +1107,7 @@ input[type="text"].note-tab-input {
 .reading-tab-panels { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .reading-tab-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .reading-tab-panel[hidden] { display: none; }
-.deck-picker-row {
+.deck-picker-row, .video-picker-row {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -1117,7 +1117,11 @@ input[type="text"].note-tab-input {
   font-size: 12.5px;
   flex: none;
 }
-.deck-picker-row select { font-size: 13px; padding: 4px 6px; background: var(--paper); }
+.deck-picker-row select, .video-picker-row select { font-size: 13px; padding: 4px 6px; background: var(--paper); }
+/* The YT player div fills the video wrap (align-self stretches it past
+   the wrap's centered alignment) so the API reads a real size at
+   creation; the iframe itself is 100% via the .video-wrap iframe rule. */
+.video-wrap #video-player { flex: 1 1 auto; align-self: stretch; width: 100%; min-height: 0; }
 .deck-page-indicator { color: #bbb; font-size: 12.5px; }
 /* The Markdown preview tab renders on paper, not on the dark reader bg. */
 #panel-preview .reading-scroll { background: var(--paper); }
@@ -1169,6 +1173,16 @@ input[type="text"].note-tab-input {
 .ai-import-row button:disabled { opacity: .45; }
 
 .modal-overlay.ai-preview-overlay { z-index: 60; }
+.modal-overlay.ai-materials-overlay { z-index: 60; }
+.ai-materials-overlay .ai-thread { max-height: 260px; }
+.ai-materials-input-row { display: flex; gap: 8px; margin: 6px 0; }
+.ai-materials-input-row input { flex: 1; min-width: 0; }
+.ai-proposal-list { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; }
+.ai-proposal-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.ai-proposal-url { font-size: 12.5px; color: var(--ink-soft); word-break: break-all; }
+/* The apply status is information ("2 added"), not an error — it must not
+   wear the red .form-error colour. Errors go to #ai-materials-error. */
+#ai-materials-apply-status { color: var(--ink-soft); }
 .modal.modal-wide { width: min(720px, 94vw); max-height: 86vh; overflow-y: auto; }
 .modal.modal-wide h3 { margin: 18px 0 6px; font-size: 16px; }
 .modal.modal-wide label { display: block; font-weight: 600; font-size: 13.5px; margin: 14px 0 5px; }

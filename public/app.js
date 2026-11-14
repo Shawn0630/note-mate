@@ -42,8 +42,12 @@ import {
 } from './recentImpressions.js';
 import {
   emptyReadingPosition, parseReadingPosition, recordReadingPosition,
-  storedPageOrDefault,
+  storedPageOrDefault, recordVideoPosition, videoPositionFor,
 } from './readingPosition.js';
+import {
+  ensureYoutubeApi, createVideoPlayer, youtubeEmbedUrlWithStart,
+  YT_PLAYER_STATES, VIDEO_POSITION_SAVE_MS,
+} from './youtubePlayer.js';
 import {
   imageMarkdownRef, appendImageEdit, embedAssetsInMarkdown,
 } from './pasteImage.js';
@@ -183,6 +187,7 @@ function kindLabel(kind) {
   if (k === 'video') return 'Video';
   if (k === 'slides') return 'Slides';
   if (k === 'ppt') return 'PPT';
+  if (k === 'link') return 'Link';
   return kind ? String(kind).toUpperCase() : 'File';
 }
 
@@ -208,7 +213,8 @@ function kindFromUrl(url) {
 function youtubeEmbedUrl(url) {
   const u = String(url || '');
   let m = u.match(/[?&]v=([\w-]{6,})/) || u.match(/youtu\.be\/([\w-]{6,})/)
-    || u.match(/\/embed\/([\w-]{6,})/) || u.match(/\/shorts\/([\w-]{6,})/);
+    || u.match(/\/embed\/([\w-]{6,})/) || u.match(/\/shorts\/([\w-]{6,})/)
+    || u.match(/\/live\/([\w-]{6,})/);
   return m ? `https://www.youtube.com/embed/${m[1]}` : null;
 }
 
@@ -281,8 +287,9 @@ const state = {
   selectedAnnotationId: null, // pin whose editor popover is open
   // Left (reading) pane tabs — PDF projects only. pdf = the book PDF,
   // slides = the current chapter's slide deck, preview = the rendered
-  // notes.md preview following the current chapter.
-  leftTab: 'pdf',       // 'pdf' | 'slides' | 'preview'
+  // notes.md preview following the current chapter, video = a YouTube
+  // video material (only when the project has one).
+  leftTab: 'pdf',       // 'pdf' | 'slides' | 'preview' | 'video'
   // The deck PDF shown in the Slides tab lives in its own container so
   // each tab keeps its scroll position (the book PDF is never unloaded).
   deckDoc: null,
@@ -302,6 +309,18 @@ const state = {
   // The book is the default; the picker appears only when the project has
   // extra PDFs (see syncPdfPicker).
   pdfSourceId: 'book',
+  // YouTube videos (kind 'video' materials) in the Video tab. One YT
+  // player per session, reused across videos via loadVideoById; the
+  // per-video position lives in the reading-position store (see
+  // public/readingPosition.js videoPositions). videoHasPlayed guards the
+  // save: a video opened at its stored position but never played must
+  // not have that position overwritten with 0.
+  videoMaterialId: null, // material id of the video currently shown
+  videoPlayer: null,     // youtubePlayer controller, or null before load
+  videoPlayerVideoId: null, // YouTube id the player is showing
+  videoSaveTimer: null,  // interval id while a video plays (5s saves)
+  videoHasPlayed: false, // this video has actually played in this session
+  videoLoadPromise: null, // {materialId, promise} while a video loads
   // Recent impressions: pages/slides looked at in the last 5 minutes,
   // session-only. The Page anchor quick action offers them in a dropdown.
   recentImpressions: [],
@@ -373,6 +392,13 @@ const state = {
 function resetReaderState() {
   if (state.pdfDoc) { try { state.pdfDoc.destroy(); } catch { /* ignore */ } }
   if (state.deckDoc) { try { state.deckDoc.destroy(); } catch { /* ignore */ } }
+  if (state.videoSaveTimer) { window.clearInterval(state.videoSaveTimer); state.videoSaveTimer = null; }
+  if (state.videoPlayer) { try { state.videoPlayer.destroy(); } catch { /* ignore */ } }
+  state.videoPlayer = null;
+  state.videoPlayerVideoId = null;
+  state.videoMaterialId = null;
+  state.videoHasPlayed = false;
+  state.videoLoadPromise = null;
   state.project = null;
   state.notes = [];
   state.activeNoteName = null;
@@ -472,7 +498,7 @@ let adminCallsLimit = 20;
 let adminTab = 'calls'; // 'calls' | 'data' — in-memory only, default AI calls.
 
 function adminCallFeatureLabel(feature) {
-  return { 'ai-note': 'Note AI', 'ai-code': 'Code AI', 'ai-import': 'AI import' }[feature] || feature;
+  return { 'ai-note': 'Note AI', 'ai-code': 'Code AI', 'ai-import': 'AI import', 'ai-material': 'Fill with AI' }[feature] || feature;
 }
 
 function adminCallDetailHtml(c) {
@@ -703,6 +729,7 @@ async function renderAdminPage() {
 // position before the page goes away. Synchronous localStorage write.
 window.addEventListener('beforeunload', () => {
   try { saveReadingPosition(); } catch { /* ignore */ }
+  try { saveVideoPosition(); } catch { /* ignore */ }
 });
 
 /* Zoom shortcuts (bound once): Cmd/Ctrl + +/- zooms the reading pane's
@@ -1296,12 +1323,27 @@ function renderManageDom() {
   const mats = state.materials || [];
   if (!mats.length) matsList.appendChild(manageHintEl('No extra materials yet.'));
   mats.forEach((m) => {
-    // Openable in the reader: a PDF or a slide deck with a file. Anything
-    // else (a download-only material) gets no Open link.
+    // Openable in the reader: a PDF or a slide deck with a file, or a
+    // YouTube video (no file — it embeds from its video id). A plain web
+    // link opens in a new browser tab instead — the reader has no tab
+    // for it. Anything else (a download-only material) gets no Open link.
     const kind = String(m.kind || '').toLowerCase();
-    const openable = (kind === 'pdf' || kind === 'slides') && m.hasFile !== false;
-    matsList.appendChild(manageStaticRow(m.label || m.id, kindLabel(m.kind),
-      openable ? manageOpenLink(slug, m.id) : null));
+    const openable = ((kind === 'pdf' || kind === 'slides') && m.hasFile !== false)
+      || kind === 'video';
+    let openLink = null;
+    if (kind === 'link' && m.url) {
+      const a = document.createElement('a');
+      a.className = 'manage-link';
+      a.href = m.url;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.textContent = 'Open';
+      a.title = 'Open link in a new tab';
+      openLink = a;
+    } else if (openable) {
+      openLink = manageOpenLink(slug, m.id);
+    }
+    matsList.appendChild(manageStaticRow(m.label || m.id, kindLabel(m.kind), openLink));
   });
   const matAdd = $('#manage-materials-add', view);
   const matBtn = document.createElement('button');
@@ -1320,6 +1362,18 @@ function renderManageDom() {
     input.click();
   });
   matAdd.appendChild(matBtn);
+  const matYtBtn = document.createElement('button');
+  matYtBtn.type = 'button';
+  matYtBtn.className = 'mini-btn';
+  matYtBtn.textContent = '+ Add YouTube';
+  matYtBtn.addEventListener('click', () => promptAddYoutube({ manage: true }));
+  matAdd.appendChild(matYtBtn);
+  const matAiBtn = document.createElement('button');
+  matAiBtn.type = 'button';
+  matAiBtn.className = 'mini-btn';
+  matAiBtn.textContent = '✨ Fill with AI';
+  matAiBtn.addEventListener('click', () => openAiMaterialsModal(slug));
+  matAdd.appendChild(matAiBtn);
   const matStatus = document.createElement('span');
   matStatus.className = 'hint';
   matStatus.id = 'manage-material-status';
@@ -1579,6 +1633,223 @@ async function proposeAiImport({ file, title, applyToSlug, statusEl, button }) {
 function closeAiPreviewModal() {
   const existing = document.getElementById('ai-preview-modal');
   if (existing) existing.remove();
+}
+
+/* Fill with AI for Materials — a conversation that proposes URL-based
+   materials (YouTube videos + plain links). The thread lives only while
+   the modal is open. A new proposal REPLACES the pending one in the
+   preview (the old one is gone — only the latest can be applied); Apply
+   writes only the pending proposal (deduped server-side) and the thread
+   stays open, so the user can keep refining with follow-ups. */
+let aiMaterialsState = null; // {slug, messages, proposal} while the modal is open
+
+function closeAiMaterialsModal() {
+  const existing = document.getElementById('ai-materials-modal');
+  if (existing) existing.remove();
+  aiMaterialsState = null;
+}
+
+/* The thread as sent to the server: the last 6 turns, with each
+   assistant turn carrying its proposal inline — so a follow-up like
+   "only the first 6" has the previous proposal in context. */
+function aiMaterialsThreadForSend() {
+  return aiMaterialsState.messages.slice(-6).map((m) => {
+    if (m.role !== 'assistant' || !m.proposal) return { role: m.role, content: m.content };
+    const lines = m.proposal.map((p) => `- ${p.title} (${p.kind}): ${p.url}`).join('\n');
+    return { role: 'assistant', content: `${m.content}\nMaterials proposed:\n${lines}` };
+  });
+}
+
+function renderAiMaterialsThread() {
+  const thread = document.getElementById('ai-materials-thread');
+  if (!thread || !aiMaterialsState) return;
+  thread.innerHTML = '';
+  aiMaterialsState.messages.forEach((msg) => {
+    const el = document.createElement('div');
+    el.className = `ai-msg ai-msg-${msg.role}`;
+    el.textContent = msg.content;
+    thread.appendChild(el);
+  });
+  thread.scrollTop = thread.scrollHeight;
+}
+
+function renderAiMaterialsProposal() {
+  const host = document.getElementById('ai-materials-proposal');
+  const applyBtn = document.getElementById('ai-materials-apply');
+  const statusEl = document.getElementById('ai-materials-apply-status');
+  if (!host || !aiMaterialsState) return;
+  const proposal = aiMaterialsState.proposal;
+  host.innerHTML = '';
+  if (!proposal) {
+    host.appendChild(manageHintEl('No proposal yet — describe the materials you want.'));
+    if (applyBtn) applyBtn.disabled = true;
+    return;
+  }
+  if (!proposal.materials.length) {
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = proposal.skipped?.length
+      ? 'No new materials — the proposed items are already in the project.'
+      : 'The AI proposed no usable materials.';
+    host.appendChild(p);
+    if (applyBtn) applyBtn.disabled = true;
+    return;
+  }
+  const list = document.createElement('div');
+  list.className = 'ai-proposal-list';
+  proposal.materials.forEach((m) => {
+    const row = document.createElement('div');
+    row.className = 'ai-proposal-row';
+    const name = document.createElement('span');
+    name.className = 'files-row-name';
+    name.textContent = m.title;
+    const tag = document.createElement('span');
+    tag.className = 'files-tag';
+    tag.textContent = kindLabel(m.kind);
+    const link = document.createElement('a');
+    link.className = 'ai-proposal-url';
+    link.href = m.url;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.textContent = m.url;
+    row.append(name, tag, link);
+    list.appendChild(row);
+  });
+  host.appendChild(list);
+  if (applyBtn) {
+    applyBtn.disabled = !!proposal.applied;
+    applyBtn.textContent = proposal.applied
+      ? 'Applied ✓'
+      : `Apply — add ${proposal.materials.length} material${proposal.materials.length === 1 ? '' : 's'}`;
+  }
+  if (statusEl && !proposal.applied) {
+    const bits = [];
+    if (proposal.dropped) bits.push(`${proposal.dropped} dropped (invalid URL)`);
+    if (proposal.skipped?.length) bits.push(`${proposal.skipped.length} already in the project`);
+    statusEl.textContent = bits.join(' · ');
+  }
+}
+
+function openAiMaterialsModal(slug) {
+  closeAiMaterialsModal();
+  aiMaterialsState = { slug, messages: [], proposal: null };
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay ai-materials-overlay';
+  overlay.id = 'ai-materials-modal';
+  overlay.innerHTML = `
+    <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="ai-materials-title">
+      <h2 id="ai-materials-title">Fill with AI — materials</h2>
+      <div class="ai-thread" id="ai-materials-thread"></div>
+      <div class="ai-materials-input-row">
+        <input type="text" id="ai-materials-input" placeholder="e.g. Add the lecture videos for chapters 1–12, or paste URLs">
+        <button type="button" class="primary" id="ai-materials-send">Send</button>
+      </div>
+      <div class="form-error" id="ai-materials-error"></div>
+      <h3>Proposal</h3>
+      <div id="ai-materials-proposal"></div>
+      <div class="form-error" id="ai-materials-apply-status"></div>
+      <div class="modal-actions">
+        <button type="button" id="ai-materials-close">Close</button>
+        <button type="button" class="primary" id="ai-materials-apply" disabled>Apply</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  renderAiMaterialsThread();
+  renderAiMaterialsProposal();
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeAiMaterialsModal(); });
+  $('#ai-materials-close', overlay).addEventListener('click', closeAiMaterialsModal);
+  const send = () => sendAiMaterialsMessage();
+  $('#ai-materials-send', overlay).addEventListener('click', send);
+  $('#ai-materials-input', overlay).addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      send();
+    }
+  });
+  $('#ai-materials-apply', overlay).addEventListener('click', applyAiMaterialsProposal);
+  $('#ai-materials-input', overlay).focus();
+}
+
+async function sendAiMaterialsMessage() {
+  const overlay = document.getElementById('ai-materials-modal');
+  if (!overlay || !aiMaterialsState) return;
+  const input = $('#ai-materials-input', overlay);
+  const errBox = $('#ai-materials-error', overlay);
+  const sendBtn = $('#ai-materials-send', overlay);
+  const text = (input.value || '').trim();
+  errBox.textContent = '';
+  if (!text) return;
+  if (text.length > 2000) {
+    errBox.textContent = 'Keep the request under 2000 characters.';
+    return;
+  }
+  aiMaterialsState.messages.push({ role: 'user', content: text });
+  input.value = '';
+  renderAiMaterialsThread();
+  sendBtn.disabled = true;
+  sendBtn.textContent = 'Asking…';
+  try {
+    const data = await apiJson(
+      `/api/projects/${encodeURIComponent(aiMaterialsState.slug)}/materials/ai/propose`,
+      'POST',
+      { messages: aiMaterialsThreadForSend() },
+    );
+    const materials = Array.isArray(data?.materials) ? data.materials : [];
+    const note = typeof data?.note === 'string' && data.note.trim() ? data.note.trim() : '';
+    const assistantText = note
+      || (materials.length
+        ? `Proposed ${materials.length} material${materials.length === 1 ? '' : 's'}.`
+        : 'No usable materials proposed.');
+    aiMaterialsState.messages.push({ role: 'assistant', content: assistantText, proposal: materials });
+    // A new proposal replaces the pending one — only the latest applies.
+    aiMaterialsState.proposal = {
+      materials,
+      dropped: data?.dropped || 0,
+      skipped: Array.isArray(data?.skipped) ? data.skipped : [],
+      note,
+      applied: false,
+    };
+    renderAiMaterialsThread();
+    renderAiMaterialsProposal();
+  } catch (err) {
+    errBox.textContent = /not configured/i.test(err.message)
+      ? 'LLM not configured — add LLM_API_KEY and LLM_MODEL to server/.env'
+      : err.message;
+  } finally {
+    sendBtn.disabled = false;
+    sendBtn.textContent = 'Send';
+  }
+}
+
+async function applyAiMaterialsProposal() {
+  const overlay = document.getElementById('ai-materials-modal');
+  if (!overlay || !aiMaterialsState?.proposal?.materials?.length) return;
+  const proposal = aiMaterialsState.proposal;
+  if (proposal.applied) return;
+  const applyBtn = $('#ai-materials-apply', overlay);
+  const statusEl = $('#ai-materials-apply-status', overlay);
+  const errBox = $('#ai-materials-error', overlay);
+  applyBtn.disabled = true;
+  applyBtn.textContent = 'Applying…';
+  try {
+    const data = await apiJson(
+      `/api/projects/${encodeURIComponent(aiMaterialsState.slug)}/materials/ai/apply`,
+      'POST',
+      { materials: proposal.materials },
+    );
+    const added = Array.isArray(data?.added) ? data.added : [];
+    const skipped = Array.isArray(data?.skipped) ? data.skipped : [];
+    proposal.applied = true;
+    statusEl.textContent = `${added.length} added${skipped.length ? ` · ${skipped.length} skipped (already in the project)` : ''}`;
+    renderAiMaterialsProposal();
+    // Refresh the Materials list behind the modal (the modal itself is
+    // body-level, so the re-render leaves it open for follow-ups).
+    renderManagePage(aiMaterialsState.slug);
+  } catch (err) {
+    errBox.textContent = err.message;
+    applyBtn.disabled = false;
+    applyBtn.textContent = `Apply — add ${proposal.materials.length} material${proposal.materials.length === 1 ? '' : 's'}`;
+  }
 }
 
 /* Preview what the AI drafted, before anything is written. The note skeleton
@@ -1974,6 +2245,13 @@ function saveReadingPosition() {
   let next = state.readingPosition;
   if (state.leftTab === 'preview') {
     next = recordReadingPosition(next, { tab: 'preview' });
+  } else if (state.leftTab === 'video') {
+    // The video tab records the tab + video only — the seconds are saved
+    // by saveVideoPosition (poll / pause / tab switch / unload).
+    const vid = state.videoMaterialId;
+    next = vid
+      ? recordReadingPosition(next, { sourceId: vid, tab: 'video' })
+      : recordReadingPosition(next, { tab: 'video' });
   } else {
     const reading = currentReadingPage();
     if (!reading) return;
@@ -2043,6 +2321,18 @@ async function restoreReadingPosition() {
   try {
     if (String(state.project?.kind || '').toLowerCase() !== 'pdf') return;
     const stored = state.readingPosition;
+    if (stored.activeTab === 'video') {
+      const mat = videoMaterialsList().find((m) => String(m.id) === String(stored.activeSource));
+      if (mat) {
+        state.videoMaterialId = mat.id;
+        setLeftTab('video');
+        await ensureVideoLoaded(mat.id);
+        return;
+      }
+      // Stale video (removed from the project): fall through to the PDF
+      // default below — the stale-source branch lands on the book at
+      // page 1, not on a page that belonged to another source.
+    }
     if (stored.activeTab === 'slides') {
       const target = resolveAnchorTarget(stored.activeSource, state.materials);
       if (target.target === 'material' && target.kind === 'slides') {
@@ -2116,6 +2406,14 @@ async function openReaderSource(sourceId) {
       if (!state.pdfDoc) return;
       markPositionEstablished(PAGE_ANCHOR_SOURCE_BOOK);
       scrollBookToPage(storedPageFor(PAGE_ANCHOR_SOURCE_BOOK, state.pdfDoc.numPages), { behavior: 'auto' });
+      return;
+    }
+    const videoMat = (state.materials || []).find((m) => String(m.id) === String(sourceId)
+      && String(m.kind || '').toLowerCase() === 'video');
+    if (videoMat) {
+      state.videoMaterialId = videoMat.id;
+      setLeftTab('video');
+      await ensureVideoLoaded(videoMat.id);
       return;
     }
     const target = resolveAnchorTarget(sourceId);
@@ -2399,14 +2697,17 @@ async function renderReadingPane() {
   const sourceUrl = p.url || p.sourceUrl || '';
 
   if (kind === 'pdf') {
-    // Tabbed reading pane: PDF | Slides | Markdown preview. The book PDF
-    // and the deck PDF live in separate containers so each tab keeps its
-    // scroll position; the preview renders a markdown note the user picks
-    // (the master notes.md by default).
+    // Tabbed reading pane: PDF | Slides | Video | Markdown preview. The
+    // book PDF and the deck PDF live in separate containers so each tab
+    // keeps its scroll position; the preview renders a markdown note the
+    // user picks (the master notes.md by default). The Video tab only
+    // exists when the project has YouTube video materials.
+    const hasVideos = videoMaterialsList().length > 0;
     pane.innerHTML = `
       <div class="reading-tabs" id="reading-tabs" role="tablist" aria-label="Reading">
         <button type="button" class="reading-tab${state.leftTab === 'pdf' ? ' active' : ''}" data-left-tab="pdf" role="tab">PDF</button>
         <button type="button" class="reading-tab${state.leftTab === 'slides' ? ' active' : ''}" data-left-tab="slides" role="tab">Slides</button>
+        ${hasVideos ? `<button type="button" class="reading-tab${state.leftTab === 'video' ? ' active' : ''}" data-left-tab="video" role="tab">Video</button>` : ''}
         <button type="button" class="reading-tab${state.leftTab === 'preview' ? ' active' : ''}" data-left-tab="preview" role="tab">Markdown preview</button>
       </div>
       <div class="reading-tab-panels">
@@ -2431,6 +2732,13 @@ async function renderReadingPane() {
           </div>
           <div class="reading-scroll" id="deck-scroll"><p class="reading-note">${state.materials.length ? 'Open the Slides tab to read a deck.' : 'No slide decks in this project.'}</p></div>
         </div>
+        ${hasVideos ? `<div class="reading-tab-panel" id="panel-video" ${state.leftTab === 'video' ? '' : 'hidden'}>
+          <div class="video-picker-row">
+            <label>Video <select id="video-picker" aria-label="YouTube video"></select></label>
+            <button type="button" id="video-add-youtube-btn" class="mini-btn" title="Add a YouTube video to this project">＋ Add YouTube</button>
+          </div>
+          <div class="video-wrap" id="video-wrap"><p class="reading-note">Open the Video tab to watch.</p></div>
+        </div>` : ''}
         <div class="reading-tab-panel" id="panel-preview" ${state.leftTab === 'preview' ? '' : 'hidden'}>
           <div class="picker-row picker-row-paper" id="preview-picker-row">
             <label>Note <select id="preview-note-picker" aria-label="Note to preview"></select></label>
@@ -2454,6 +2762,15 @@ async function renderReadingPane() {
     });
     const pdfAddBtn = $('#pdf-add-material-btn', pane);
     if (pdfAddBtn) pdfAddBtn.addEventListener('click', promptAddMaterial);
+    syncVideoPicker();
+    const videoPicker = $('#video-picker', pane);
+    if (videoPicker) {
+      videoPicker.addEventListener('change', (e) => {
+        if (e.target.value) ensureVideoLoaded(e.target.value);
+      });
+    }
+    const videoAddBtn = $('#video-add-youtube-btn', pane);
+    if (videoAddBtn) videoAddBtn.addEventListener('click', () => promptAddYoutube());
     syncPreviewNotePicker();
     $('#preview-note-picker', pane).addEventListener('change', (e) => {
       state.previewNoteName = e.target.value || null;
@@ -2523,7 +2840,9 @@ function syncDeckPicker() {
   const sel = $('#deck-picker', view);
   if (!sel) return;
   const current = state.deckMaterialId || defaultDeckId();
-  sel.innerHTML = (state.materials || []).map((m) => (
+  sel.innerHTML = (state.materials || [])
+    .filter((m) => String(m.kind || '').toLowerCase() !== 'video')
+    .map((m) => (
     `<option value="${esc(m.id)}"${m.hasFile ? '' : ' disabled'}${m.id === current ? ' selected' : ''}>${esc(m.label || m.id)}${m.hasFile ? '' : ' — download only'}</option>`
   )).join('');
 }
@@ -2574,16 +2893,247 @@ async function addMaterialFile(file) {
   }
 }
 
+/* ---------------- YouTube video materials ---------------- */
+
+// The project's YouTube video materials (kind 'video'), in project order.
+function videoMaterialsList() {
+  return (state.materials || []).filter((m) => String(m.kind || '').toLowerCase() === 'video');
+}
+
+function defaultVideoId() {
+  const first = videoMaterialsList()[0];
+  return first ? first.id : null;
+}
+
+/* Fill the Video tab picker; select the video currently shown. */
+function syncVideoPicker() {
+  const sel = $('#video-picker', view);
+  if (!sel) return;
+  const current = state.videoMaterialId || defaultVideoId();
+  sel.innerHTML = videoMaterialsList().map((m) => (
+    `<option value="${esc(m.id)}"${m.id === current ? ' selected' : ''}>${esc(m.label || m.id)}</option>`
+  )).join('');
+}
+
+/* The stored playback position in seconds for a video material, or 0. */
+function videoStoredSeconds(materialId) {
+  return videoPositionFor(state.readingPosition, materialId) ?? 0;
+}
+
+/* Record the current video's playback position — only once it has
+   actually played in this session (see state.videoHasPlayed): opening a
+   video at its stored position and leaving without pressing play must
+   not overwrite that position with 0. Cheap and idempotent — only
+   writes when the store actually changed. */
+function saveVideoPosition() {
+  if (!state.project || !state.videoPlayer || !state.videoMaterialId) return;
+  if (!state.videoHasPlayed) return;
+  let seconds = 0;
+  try { seconds = Math.floor(state.videoPlayer.getCurrentTime() || 0); } catch { return; }
+  const next = recordVideoPosition(state.readingPosition, {
+    sourceId: state.videoMaterialId,
+    seconds: seconds >= 1 ? seconds : null,
+  });
+  const prevJson = JSON.stringify(state.readingPosition);
+  state.readingPosition = next;
+  if (JSON.stringify(next) === prevJson) return;
+  try {
+    window.localStorage.setItem(readingPositionKey(), JSON.stringify(next));
+  } catch { /* Storage unavailable — the position simply does not persist. */ }
+}
+
+/* Drop a video's stored position so the next open starts from the
+   beginning (a finished video). */
+function clearVideoPosition(materialId) {
+  if (!materialId) return;
+  const next = recordVideoPosition(state.readingPosition, { sourceId: materialId, seconds: null });
+  const prevJson = JSON.stringify(state.readingPosition);
+  state.readingPosition = next;
+  if (JSON.stringify(next) === prevJson) return;
+  try {
+    window.localStorage.setItem(readingPositionKey(), JSON.stringify(next));
+  } catch { /* ignore */ }
+}
+
+/* YT player state changes: PLAYING starts the 5s position poll, PAUSED
+   stops it and saves once, ENDED stops it and clears the stored
+   position so the next open starts from the beginning. */
+function handleVideoStateChange(playerState) {
+  if (playerState === YT_PLAYER_STATES.PLAYING) {
+    state.videoHasPlayed = true;
+    if (!state.videoSaveTimer) {
+      state.videoSaveTimer = window.setInterval(saveVideoPosition, VIDEO_POSITION_SAVE_MS);
+    }
+    return;
+  }
+  if (state.videoSaveTimer) {
+    window.clearInterval(state.videoSaveTimer);
+    state.videoSaveTimer = null;
+  }
+  if (playerState === YT_PLAYER_STATES.PAUSED) saveVideoPosition();
+  if (playerState === YT_PLAYER_STATES.ENDED) {
+    clearVideoPosition(state.videoMaterialId);
+    // The video is done — a later bank (e.g. switching videos) must not
+    // re-save the end time it just cleared.
+    state.videoHasPlayed = false;
+  }
+}
+
+/* Show a video material in the Video tab: reuse the session player when
+   it already shows this video, else load it (resuming from its stored
+   position). A load in flight for the same video is awaited, not
+   restarted. When the IFrame API cannot load, the video still plays via
+   a plain embed iframe starting at the stored position — only position
+   saving needs the API. */
+async function ensureVideoLoaded(materialId) {
+  if (!materialId) return;
+  const mat = videoMaterialsList().find((m) => String(m.id) === String(materialId));
+  // The player is keyed by YouTube video id, the caller by material id —
+  // compare the two through the material, or the player is reloaded on
+  // every return to the Video tab (restarting it from the stored
+  // position and dropping unsaved progress).
+  if (state.videoPlayer && mat && state.videoPlayerVideoId === mat.videoId) {
+    syncVideoPicker();
+    return;
+  }
+  if (state.videoLoadPromise && state.videoLoadPromise.materialId === materialId) {
+    await state.videoLoadPromise.promise;
+    return;
+  }
+  state.videoLoadPromise = { materialId, promise: loadVideo(materialId) };
+  try {
+    await state.videoLoadPromise.promise;
+  } finally {
+    if (state.videoLoadPromise?.materialId === materialId) state.videoLoadPromise = null;
+  }
+}
+
+async function loadVideo(materialId) {
+  const wrap = $('#video-wrap', view);
+  if (!wrap || !materialId) return;
+  const mat = videoMaterialsList().find((m) => String(m.id) === String(materialId));
+  if (!mat || !mat.videoId) return;
+  // Switching videos: bank the old video's position first (it only
+  // writes when that video actually played).
+  saveVideoPosition();
+  state.videoMaterialId = materialId;
+  state.videoHasPlayed = false;
+  markPositionEstablished(materialId);
+  syncVideoPicker();
+  // Persist the switch now (tab + video only — the seconds are saved by
+  // saveVideoPosition): without this the store still names the old video
+  // until the next pause/poll/unload, so a crash would reopen the wrong
+  // video. Suppressed while a restore is in flight.
+  saveReadingPosition();
+  const startSeconds = videoStoredSeconds(materialId);
+  if (state.videoPlayer) {
+    state.videoPlayer.load(mat.videoId, startSeconds);
+    state.videoPlayerVideoId = mat.videoId;
+    return;
+  }
+  wrap.innerHTML = '<p class="reading-note">Loading video…</p>';
+  let yt;
+  try {
+    yt = await ensureYoutubeApi();
+  } catch {
+    yt = null;
+  }
+  // The tab may have changed (or the reader closed) while the API loaded.
+  if (state.videoMaterialId !== materialId || !document.contains(wrap)) return;
+  if (!yt) {
+    const src = youtubeEmbedUrlWithStart(mat.videoId, startSeconds);
+    wrap.innerHTML = `<iframe src="${esc(src)}" title="${esc(mat.label || 'YouTube video')}"
+      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+      allowfullscreen></iframe>`;
+    return;
+  }
+  wrap.innerHTML = '<div id="video-player"></div>';
+  const el = $('#video-player', wrap);
+  if (!el) return;
+  state.videoPlayer = createVideoPlayer({
+    element: el,
+    yt,
+    videoId: mat.videoId,
+    startSeconds,
+    onStateChange: handleVideoStateChange,
+  });
+  state.videoPlayerVideoId = mat.videoId;
+}
+
+/* Add a YouTube video as a material: prompt for the URL, then for a
+   title (prefilled with the video's real title from YouTube's oEmbed
+   endpoint when it answers within 3s, else "YouTube video"). The server
+   validates the URL and extracts the video id; a non-YouTube URL is
+   rejected there and the error is shown in the status line. */
+async function promptAddYoutube({ manage = false } = {}) {
+  const url = window.prompt('YouTube video URL');
+  if (url == null) return;
+  const trimmed = String(url).trim();
+  if (!trimmed) return;
+  const notYoutube = () => {
+    const msg = 'That is not a YouTube URL.';
+    if (manage) { const el = $('#manage-material-status', view); if (el) el.textContent = msg; }
+    else setSaveStatus(msg, 'error');
+  };
+  if (!/youtu\.?be/i.test(trimmed)) { notYoutube(); return; }
+  let title = 'YouTube video';
+  try {
+    const ctrl = new AbortController();
+    const timer = window.setTimeout(() => ctrl.abort(), 3000);
+    const res = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(trimmed)}&format=json`, { signal: ctrl.signal });
+    window.clearTimeout(timer);
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      if (data && typeof data.title === 'string' && data.title.trim()) title = data.title.trim();
+    }
+  } catch { /* offline / blocked — keep the default title */ }
+  const label = window.prompt('Title', title);
+  if (label == null) return;
+  const finalLabel = String(label).trim() || title;
+  if (manage) await manageAddYoutube(trimmed, finalLabel);
+  else await addYoutubeMaterial(trimmed, finalLabel);
+}
+
+async function manageAddYoutube(url, label) {
+  try {
+    const created = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/materials`, 'POST', { url, label });
+    await renderManagePage(state.project.slug);
+    setManageStatus(`Added ${created?.label || label}.`);
+  } catch (err) {
+    const el = $('#manage-material-status', view);
+    if (el) el.textContent = err.message;
+  }
+}
+
+async function addYoutubeMaterial(url, label) {
+  try {
+    const created = await apiJson(`/api/projects/${encodeURIComponent(state.project.slug)}/materials`, 'POST', { url, label });
+    const materials = await apiGet(`/api/projects/${encodeURIComponent(state.project.slug)}/materials`);
+    state.materials = Array.isArray(materials) ? materials : [];
+    syncDeckPicker();
+    syncPdfPicker();
+    syncVideoPicker();
+    setSaveStatus(`Added “${created?.label || label}” — open it from the picker.`);
+  } catch (err) {
+    setSaveStatus(err.message, 'error');
+  }
+}
+
 /* Switch the left (reading) tab. The deck loads lazily on first Slides
    open; the preview renders on open. The tab also drives activeSourceId
    (pdf/preview -> the book, slides -> the deck) so the chapter panel's
    source note and the AI context line follow it. */
 function setLeftTab(tab) {
-  if (!['pdf', 'slides', 'preview'].includes(tab)) return;
+  if (!['pdf', 'slides', 'preview', 'video'].includes(tab)) return;
+  // Leaving the Video tab: bank the video's position first (the save
+  // below records the NEW tab, so it would never see the old video).
+  if (state.leftTab === 'video' && tab !== 'video') saveVideoPosition();
   state.leftTab = tab;
   state.activeSourceId = tab === 'slides'
     ? state.deckMaterialId
-    : (tab === 'pdf' && state.pdfSourceId && state.pdfSourceId !== PAGE_ANCHOR_SOURCE_BOOK ? state.pdfSourceId : null);
+    : (tab === 'video'
+      ? state.videoMaterialId
+      : (tab === 'pdf' && state.pdfSourceId && state.pdfSourceId !== PAGE_ANCHOR_SOURCE_BOOK ? state.pdfSourceId : null));
   applyLeftTab();
   renderChapterPanel();
   updateAiContext();
@@ -2596,7 +3146,7 @@ function applyLeftTab() {
   $$('#reading-tabs [data-left-tab]', view).forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.leftTab === state.leftTab);
   });
-  const panels = { pdf: '#panel-pdf', slides: '#panel-slides', preview: '#panel-preview' };
+  const panels = { pdf: '#panel-pdf', slides: '#panel-slides', preview: '#panel-preview', video: '#panel-video' };
   Object.entries(panels).forEach(([tab, sel]) => {
     const el = $(sel, view);
     if (el) el.hidden = tab !== state.leftTab;
@@ -2623,6 +3173,9 @@ function applyLeftTab() {
   if (state.leftTab === 'preview') {
     syncPreviewNotePicker();
     renderLeftPreview({ follow: true });
+  }
+  if (state.leftTab === 'video') {
+    ensureVideoLoaded(state.videoMaterialId || defaultVideoId());
   }
   updateZoomLabels();
 }
@@ -3129,6 +3682,9 @@ function closeAnnotEditor() {
    (video / slides / ppt kinds) or no chapter is active. */
 function currentReadingPage() {
   if (String(state.project?.kind || '').toLowerCase() !== 'pdf') return null;
+  // The Video tab has no page — its position is seconds in the store,
+  // saved by saveVideoPosition, not here.
+  if (state.leftTab === 'video') return null;
   if (state.leftTab === 'slides') {
     if (!state.deckMaterialId) return null;
     return { sourceId: state.deckMaterialId, page: currentDeckPage() };

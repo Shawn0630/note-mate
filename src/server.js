@@ -10,11 +10,15 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { slugify, resolveProjectPath, parseNotebook } from './util.js';
+import { slugify, resolveProjectPath, parseNotebook, extractYoutubeVideoId } from './util.js';
 import { extractPdfText } from './pdftext.js';
 import { extractPdfOutline } from './pdfOutline.js';
 import { proposeProjectData, LLM_NOT_CONFIGURED, listModels, isAllowedModel } from './llm.js';
 import { validateProposal } from './aiImport.js';
+import {
+  proposeMaterials, validateMaterialsProposal, normalizeMaterialsProposal,
+  dedupeMaterials,
+} from './aiMaterials.js';
 import {
   generateAiNote, resolveChapterRange, resolvePageRange, extractChapterSection,
   MAX_AI_NOTE_PROMPT_CHARS, MAX_AI_NOTE_HISTORY_MESSAGES,
@@ -366,6 +370,13 @@ async function listMaterials(slug, project) {
       // re-converts from the PPTX; a Word doc converts on first read).
       hasFile: await materialReadable(slug, m),
       ...(m.sourceUrl ? { sourceUrl: m.sourceUrl } : {}),
+      // A YouTube material has no file (hasFile is false) — the reader
+      // embeds it from this id, and the Manage page treats kind 'video'
+      // as openable regardless of hasFile.
+      ...(String(m.kind || '').toLowerCase() === 'video' && m.videoId ? { videoId: m.videoId } : {}),
+      // A plain web link has no file either — the Manage page opens it in
+      // a new tab from this URL; the reader has no tab for it.
+      ...(String(m.kind || '').toLowerCase() === 'link' && m.url ? { url: m.url } : {}),
     });
   }
   return out;
@@ -666,14 +677,63 @@ app.get('/api/projects/:slug/materials/:id/file', async (req, res, next) => {
   }
 });
 
-// Add a material to a project: a PDF, Word document or PowerPoint file.
+// Add a material to a project: a PDF, Word document or PowerPoint file —
+// or, with a JSON body {url, label} and no file, a YouTube video link.
 // Word/PowerPoint convert lazily to a cached PDF beside the source (same
 // scheme as the seeded decks: file = converted PDF, sourceFile =
 // original), so the new material reads, anchors and jumps like any PDF.
+// A YouTube material stores {id, label, kind: 'video', url, videoId} and
+// has no file; the reader embeds it and remembers its position per video.
 // Returns 201 with the material entry (same shape as GET /materials).
 app.post('/api/projects/:slug/materials', upload.single('file'), async (req, res, next) => {
   try {
     const project = await readProject(req.params.slug);
+    const urlBody = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+    if (urlBody && !req.file) {
+      const videoId = extractYoutubeVideoId(urlBody);
+      if (videoId) {
+        const label = (req.body?.label || '').trim() || 'YouTube video';
+        const existing = new Set((project.materials ?? []).map((m) => m.id));
+        const base = slugify(label) || 'video';
+        let id = base;
+        for (let n = 2; existing.has(id); n++) id = `${base}-${n}`;
+        const entry = {
+          id,
+          label,
+          kind: 'video',
+          url: `https://www.youtube.com/watch?v=${videoId}`,
+          videoId,
+        };
+        project.materials = [...(project.materials ?? []), entry];
+        await writeProject(req.params.slug, project);
+        const created = (await listMaterials(req.params.slug, project)).find((m) => m.id === id);
+        return res.status(201).json(created);
+      }
+      // A plain web link: only when the caller says so (kind 'link') —
+      // a bare non-YouTube URL is still rejected, as before.
+      if (String(req.body?.kind || '').toLowerCase() === 'link') {
+        let parsed;
+        try {
+          parsed = new URL(urlBody);
+        } catch {
+          return res.status(400).json({ error: 'link URL must be a valid http(s) URL' });
+        }
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          return res.status(400).json({ error: 'link URL must be a valid http(s) URL' });
+        }
+        const label = (req.body?.label || '').trim() || 'Web link';
+        const existing = new Set((project.materials ?? []).map((m) => m.id));
+        const base = slugify(label) || 'link';
+        let id = base;
+        for (let n = 2; existing.has(id); n++) id = `${base}-${n}`;
+        const entry = { id, label, kind: 'link', url: urlBody };
+        project.materials = [...(project.materials ?? []), entry];
+        await writeProject(req.params.slug, project);
+        const created = (await listMaterials(req.params.slug, project)).find((m) => m.id === id);
+        return res.status(201).json(created);
+      }
+      return res.status(400).json({ error: 'only YouTube video URLs can be added here' });
+    }
     if (!req.file) return res.status(400).json({ error: 'file is required' });
     const ext = path.extname(req.file.originalname || '').toLowerCase();
     const isPdf = ext === '.pdf';
@@ -703,6 +763,93 @@ app.post('/api/projects/:slug/materials', upload.single('file'), async (req, res
     await writeProject(req.params.slug, project);
     const created = (await listMaterials(req.params.slug, project)).find((m) => m.id === id);
     res.status(201).json(created);
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Fill with AI for Materials — the Manage page's "✨ Fill with AI".
+// A conversation proposes URL-based materials (YouTube videos + plain web
+// links); propose writes nothing, apply validates strictly and dedupes
+// against existing materials by URL. Logged as feature 'ai-material'.
+// ---------------------------------------------------------------------------
+
+app.post('/api/projects/:slug/materials/ai/propose', async (req, res, next) => {
+  try {
+    const { messages } = req.body ?? {};
+    let cleanMessages;
+    try {
+      cleanMessages = parseAiHistory(messages);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (!cleanMessages.length) {
+      return res.status(400).json({ error: 'messages must not be empty' });
+    }
+    if (cleanMessages[cleanMessages.length - 1].role !== 'user') {
+      return res.status(400).json({ error: 'the last message must be from the user' });
+    }
+    const project = await readProject(req.params.slug);
+    let rawProposal;
+    try {
+      rawProposal = await proposeMaterials({
+        projectTitle: project.title,
+        existing: project.materials ?? [],
+        messages: cleanMessages,
+      });
+    } catch (err) {
+      if (err.code === LLM_NOT_CONFIGURED) {
+        return res.status(503).json({ error: 'LLM not configured', hint: err.hint });
+      }
+      if (err.code === 'LLM_BAD_RESPONSE') {
+        return res.status(err.status || 400).json({ error: err.message, rawText: err.rawText });
+      }
+      throw err;
+    }
+    const { materials, dropped, note } = normalizeMaterialsProposal(rawProposal);
+    const { added, skipped } = dedupeMaterials(project.materials ?? [], materials);
+    res.json({ materials: added, dropped, skipped, note });
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
+    next(err);
+  }
+});
+
+app.post('/api/projects/:slug/materials/ai/apply', async (req, res, next) => {
+  try {
+    const { materials } = req.body ?? {};
+    let proposal;
+    try {
+      proposal = validateMaterialsProposal({ materials });
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    const project = await readProject(req.params.slug);
+    const { added, skipped } = dedupeMaterials(project.materials ?? [], proposal.materials);
+    const existing = new Set((project.materials ?? []).map((m) => m.id));
+    const created = [];
+    for (const entry of added) {
+      const base = slugify(entry.title) || (entry.kind === 'video' ? 'video' : 'link');
+      let id = base;
+      for (let n = 2; existing.has(id); n++) id = `${base}-${n}`;
+      existing.add(id);
+      const stored = entry.kind === 'video'
+        ? {
+          id, label: entry.title, kind: 'video', url: entry.url,
+          videoId: extractYoutubeVideoId(entry.url),
+        }
+        : { id, label: entry.title, kind: 'link', url: entry.url };
+      project.materials = [...(project.materials ?? []), stored];
+      created.push(stored);
+    }
+    if (created.length) await writeProject(req.params.slug, project);
+    const listed = await listMaterials(req.params.slug, project);
+    res.status(201).json({
+      added: created.map((c) => listed.find((m) => m.id === c.id) || c),
+      skipped,
+    });
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).json({ error: 'project not found' });
     next(err);

@@ -1,26 +1,30 @@
 /* Reading position: where the reader was, per project AND per source.
    Pure functions — no DOM — so they are unit-testable in node.
    The store is one localStorage entry per project slug:
-     { activeTab, activeSource, positions }
-   - activeTab: the left tab he was on ('pdf' | 'slides' | 'preview').
+     { activeTab, activeSource, positions, videoPositions }
+   - activeTab: the left tab he was on ('pdf' | 'slides' | 'preview' | 'video').
    - activeSource: the source of that tab ('book' or a material id).
    - positions: { [sourceId]: page } — the last page/slide seen for EACH
      source. The book remembers its own page, each extra PDF remembers
      its own page, each slides deck remembers its own slide, so switching
      tabs/sources returns to THAT source's own page, and a refresh or
      reopen restores the last-active source at its page.
+   - videoPositions: { [materialId]: seconds } — the playback position in
+     seconds for EACH YouTube video material, independent per video.
+     A video with no entry starts at 0; finishing a video clears its
+     entry, so the next open starts from the beginning.
    Pages are 1-based. A stored page is only trusted when it is in range
    for the document actually loaded (checked by the caller, which knows
    numPages); out-of-range / unknown-source stores fall back to page 1. */
 export const READING_POSITION_KEY_PREFIX = 'nm-reading-position:';
-export const READING_POSITION_TABS = ['pdf', 'slides', 'preview'];
+export const READING_POSITION_TABS = ['pdf', 'slides', 'preview', 'video'];
 
 export function readingPositionKey(slug) {
   return `${READING_POSITION_KEY_PREFIX}${slug}`;
 }
 
 export function emptyReadingPosition() {
-  return { activeTab: 'pdf', activeSource: 'book', positions: {} };
+  return { activeTab: 'pdf', activeSource: 'book', positions: {}, videoPositions: {} };
 }
 
 function cleanPage(page) {
@@ -58,7 +62,24 @@ export function parseReadingPosition(raw) {
       if (cleanId && cleanPg != null) positions[cleanId] = cleanPg;
     }
   }
-  return { activeTab, activeSource, positions };
+  const videoPositions = {};
+  const rawVideoPositions = obj.videoPositions;
+  if (rawVideoPositions && typeof rawVideoPositions === 'object' && !Array.isArray(rawVideoPositions)) {
+    for (const [sourceId, seconds] of Object.entries(rawVideoPositions)) {
+      const cleanId = cleanSourceId(sourceId);
+      const cleanSec = cleanSeconds(seconds);
+      if (cleanId && cleanSec != null) videoPositions[cleanId] = cleanSec;
+    }
+  }
+  return { activeTab, activeSource, positions, videoPositions };
+}
+
+/* A video position is whole seconds, at least 1 — 0 means "at the start",
+   which needs no entry. Anything else (negative, fractional, non-numeric)
+   is dropped, like a bad page. */
+function cleanSeconds(seconds) {
+  const n = Number(seconds);
+  return Number.isInteger(n) && n >= 1 ? n : null;
 }
 
 /* Record a view: the source's page updates, and it becomes the active
@@ -77,6 +98,7 @@ export function recordReadingPosition(store, { sourceId, page, tab } = {}) {
   const cleanPg = cleanPage(page);
   if (cleanId && cleanPg != null) {
     return {
+      ...base,
       activeTab: cleanTab,
       activeSource: cleanId,
       positions: { ...base.positions, [cleanId]: cleanPg },
@@ -108,4 +130,30 @@ export function storedPageOrDefault(store, sourceId, numPages) {
   const page = positionFor(store, sourceId);
   if (page == null || page < 1 || page > total) return 1;
   return page;
+}
+
+/* Record a video's playback position in whole seconds. Returns a NEW
+   store; the input is untouched. seconds >= 1 stores it; null / 0 / an
+   invalid value CLEARS the entry — the video starts from the beginning
+   next time (used when a video finishes, or when it is back at the
+   start). Positions are per video, independent of the page positions. */
+export function recordVideoPosition(store, { sourceId, seconds } = {}) {
+  const base = parseReadingPosition(store);
+  const cleanId = cleanSourceId(sourceId);
+  if (!cleanId) return base;
+  const cleanSec = cleanSeconds(seconds);
+  const videoPositions = { ...base.videoPositions };
+  if (cleanSec == null) delete videoPositions[cleanId];
+  else videoPositions[cleanId] = cleanSec;
+  return { ...base, videoPositions };
+}
+
+/* The stored playback position in seconds for a video, or null when
+   nothing is stored for it (starts from the beginning). */
+export function videoPositionFor(store, sourceId) {
+  const base = parseReadingPosition(store);
+  const cleanId = cleanSourceId(sourceId);
+  if (!cleanId) return null;
+  const seconds = base.videoPositions[cleanId];
+  return seconds != null ? seconds : null;
 }
