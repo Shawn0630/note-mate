@@ -2306,8 +2306,6 @@ function renderReaderShell() {
         <a class="back-link" href="#/">‹ Shelf</a>
         <button type="button" id="chapter-toggle" aria-pressed="${state.panels.nav ? 'true' : 'false'}"
                 title="Show or hide the chapter panel">Chapters</button>
-        <button type="button" id="files-toggle" aria-pressed="${state.panels.files ? 'true' : 'false'}"
-                title="Show or hide the files panel">Files</button>
         <h1>${esc(p.title || 'Untitled')}</h1>
         <button type="button" id="manage-top" title="Manage this project — sources, notes, export">Manage</button>
         <button type="button" id="layout-menu-btn" title="Layout — presets and panels">▦ Layout</button>
@@ -2318,6 +2316,8 @@ function renderReaderShell() {
         <button type="button" id="ai-toggle-top" class="${state.panels.ai ? 'active' : ''}"
                 title="Ask the AI — opens the AI panel">✨ Ask AI</button>
         <button type="button" id="admin-top" title="Admin — AI call log, data export/import, sync">Admin</button>
+        <button type="button" id="files-toggle" aria-pressed="${state.panels.files ? 'true' : 'false'}"
+                title="Show or hide the files panel">Files</button>
         <button type="button" id="theme-toggle-top" class="theme-toggle"
                 title="Switch to dark theme" aria-label="Switch to dark theme">🌙</button>
       </header>
