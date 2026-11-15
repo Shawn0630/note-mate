@@ -2685,6 +2685,18 @@ function applyReaderLayout({ save = true } = {}) {
   show('#notebook-pane', state.panels.notebook);
   show('#ai-column', state.panels.ai);
   show('#files-aside', state.panels.files);
+  // The Files panel's grid placement must not depend on the stylesheet:
+  // a browser holding a cached pre-e6d2f04 styles.css has no
+  // `.reader .files-aside { grid-column: 9 }` rule, so the aside
+  // auto-placed into the 0px nav track — the toggle flipped state
+  // (aria-pressed, 260px track) but the panel stayed invisible and
+  // the file list with it. Inline placement keeps it in column 9
+  // whatever CSS is cached; the other panes keep their stylesheet
+  // rules, which predate the 9-column grid.
+  const filesAside = $('#files-aside', view);
+  if (filesAside) { filesAside.style.gridColumn = '9'; filesAside.style.gridRow = '2'; }
+  const filesDivider = document.getElementById('divider-files');
+  if (filesDivider) { filesDivider.style.gridColumn = '8'; filesDivider.style.gridRow = '2'; }
   // Cell editors measure 0 while hidden; re-fit them the moment the
   // working pane comes back into view (preset / panel toggle).
   if (state.panels.notebook && notebookWasHidden) fitCellEditors();
