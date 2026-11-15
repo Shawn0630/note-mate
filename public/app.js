@@ -2291,7 +2291,10 @@ function renderReaderShell() {
   // the switcher (they have no left tabs).
   const bookLabel = isPdf
     ? 'Book (PDF)' : `Main source (${kindLabel(p.kind)})`;
-  const switcher = !isPdf && state.materials.length
+  // The switcher only renders when at least one material is actually
+  // readable: with every option "download only" the dropdown is a dead
+  // control (e.g. a video-only project) and is hidden instead of shown.
+  const switcher = !isPdf && state.materials.some((m) => m.hasFile)
     ? `<select id="source-switcher" class="source-switcher" aria-label="Reading source"
          title="Switch reading source">
          <option value="">${esc(bookLabel)}</option>
