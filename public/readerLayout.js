@@ -1,8 +1,8 @@
 // Reader layout math — pure, no DOM. Imported by public/app.js and
 // unit-tested in tests/readerLayout.test.js.
 //
-// The reader is a 7-column grid: nav | divider | reading | divider |
-// notebook | divider | AI. Panes are shown/hidden per layout preset (or
+// The reader is a 9-column grid: nav | divider | reading | divider |
+// notebook | divider | AI | divider | Files. Panes are shown/hidden per layout preset (or
 // individually via the Layout menu's Panels checklist); widths are
 // per-project, persisted in localStorage, and survive mode switches.
 // Reading/notebook share the middle as fractions of their combined width
@@ -24,11 +24,13 @@ export const PANE_MIN = {
   reading: 300,
   notebook: 300,
   ai: 280,
+  files: 200,
 };
 
 export const PANE_MAX = {
   nav: 480,
   ai: 560,
+  files: 480,
 };
 
 export const PANE_DEFAULTS = {
@@ -36,15 +38,18 @@ export const PANE_DEFAULTS = {
   readingFr: 0.5,
   notebookFr: 0.5,
   ai: 340,
+  files: 260,
 };
 
 /** The four layout presets: which of the four panes each one shows.
-   Reading is the reading pane alone, full width. */
+   Reading is the reading pane alone, full width. The Files panel is
+   in none of them — it is hidden by default and opened on demand,
+   like the Chapters panel is opened by its own toggle. */
 export const LAYOUT_PRESETS = {
-  reading: { nav: false, reading: true, notebook: false, ai: false },
-  navigation: { nav: true, reading: true, notebook: false, ai: false },
-  notetaking: { nav: false, reading: true, notebook: true, ai: false },
-  ai: { nav: false, reading: true, notebook: true, ai: true },
+  reading: { nav: false, reading: true, notebook: false, ai: false, files: false },
+  navigation: { nav: true, reading: true, notebook: false, ai: false, files: false },
+  notetaking: { nav: false, reading: true, notebook: true, ai: false, files: false },
+  ai: { nav: false, reading: true, notebook: true, ai: true, files: false },
 };
 
 export const LAYOUT_PRESET_NAMES = ['reading', 'navigation', 'notetaking', 'ai'];
@@ -66,6 +71,7 @@ export const PANEL_TITLES = {
   reading: 'Reading pane',
   notebook: 'Working pane',
   ai: 'AI panel',
+  files: 'Files panel',
 };
 
 /** Default panels for a fresh project: Notetaking (the 50/50 split). */
@@ -73,13 +79,15 @@ export function defaultPanels() {
   return { ...LAYOUT_PRESETS.notetaking };
 }
 
-/** Panels object → preset name when it matches one exactly, else null. */
+/** Panels object → preset name when it matches one exactly, else null.
+   The Files panel counts: a preset match with Files open is 'custom'. */
 export function matchPreset(panels) {
   if (!panels) return null;
   for (const name of LAYOUT_PRESET_NAMES) {
     const preset = LAYOUT_PRESETS[name];
     if (preset.nav === !!panels.nav && preset.reading === !!panels.reading
-      && preset.notebook === !!panels.notebook && preset.ai === !!panels.ai) {
+      && preset.notebook === !!panels.notebook && preset.ai === !!panels.ai
+      && preset.files === !!panels.files) {
       return name;
     }
   }
@@ -92,6 +100,10 @@ export function clampNavWidth(px) {
 
 export function clampAiWidth(px) {
   return Math.min(PANE_MAX.ai, Math.max(PANE_MIN.ai, Math.round(px)));
+}
+
+export function clampFilesWidth(px) {
+  return Math.min(PANE_MAX.files, Math.max(PANE_MIN.files, Math.round(px)));
 }
 
 /**
@@ -116,12 +128,14 @@ export function splitReadingNotebook(readingPx, totalPx) {
 }
 
 /**
- * The reader's 7-column grid template for the given panels + widths.
- * Hidden panes and their adjacent dividers collapse to 0.
+ * The reader's 9-column grid template for the given panels + widths.
+ * Hidden panes and their adjacent dividers collapse to 0. The Files
+ * panel is the rightmost column, after AI — its divider sits between
+ * AI and Files, or between the working pane and Files when AI is off.
  */
 export function gridTemplate(panels, widths) {
   const w = { ...PANE_DEFAULTS, ...(widths || {}) };
-  const p = { nav: false, reading: true, notebook: true, ai: false, ...(panels || {}) };
+  const p = { nav: false, reading: true, notebook: true, ai: false, files: false, ...(panels || {}) };
   const nav = p.nav ? `${clampNavWidth(w.nav)}px` : '0px';
   const d1 = p.nav && p.reading ? `${DIVIDER_PX}px` : '0px';
   // fr tracks only fill the container when their factors sum to >= 1, so a
@@ -134,7 +148,9 @@ export function gridTemplate(panels, widths) {
   const notebook = p.notebook ? `minmax(0, ${notebookFr}fr)` : '0px';
   const d3 = p.notebook && p.ai ? `${DIVIDER_PX}px` : '0px';
   const ai = p.ai ? `${clampAiWidth(w.ai)}px` : '0px';
-  return `${nav} ${d1} ${reading} ${d2} ${notebook} ${d3} ${ai}`;
+  const d4 = p.files && (p.ai || p.notebook) ? `${DIVIDER_PX}px` : '0px';
+  const files = p.files ? `${clampFilesWidth(w.files)}px` : '0px';
+  return `${nav} ${d1} ${reading} ${d2} ${notebook} ${d3} ${ai} ${d4} ${files}`;
 }
 
 /** Sanitize a stored widths object (bad values fall back to defaults). */
@@ -143,6 +159,7 @@ export function sanitizeWidths(raw) {
   if (!raw || typeof raw !== 'object') return out;
   if (Number.isFinite(raw.nav)) out.nav = clampNavWidth(raw.nav);
   if (Number.isFinite(raw.ai)) out.ai = clampAiWidth(raw.ai);
+  if (Number.isFinite(raw.files)) out.files = clampFilesWidth(raw.files);
   const rf = Number(raw.readingFr);
   const nf = Number(raw.notebookFr);
   if (Number.isFinite(rf) && Number.isFinite(nf) && rf > 0 && nf > 0) {
@@ -160,6 +177,7 @@ export function sanitizePanels(raw) {
     reading: raw.reading !== false,
     notebook: raw.notebook !== false,
     ai: raw.ai === true,
+    files: raw.files === true,
   };
 }
 

@@ -30,7 +30,7 @@
 */
 import * as pdfjsLib from './vendor/pdfjs/pdf.mjs';
 import {
-  clampNavWidth, clampAiWidth, splitReadingNotebook, gridTemplate,
+  clampNavWidth, clampAiWidth, clampFilesWidth, splitReadingNotebook, gridTemplate,
   sanitizeWidths, sanitizePanels, matchPreset, defaultPanels,
   migrateLayoutModeName, LAYOUT_PRESET_NAMES,
   clampZoom, zoomStep, zoomFromWheel, zoomFromGesture, zoomPercent,
@@ -65,7 +65,7 @@ import {
   replaceUndoEntry, appendUndoEntry, createEditBaselines,
 } from './nbUndo.js';
 import {
-  openTabsKey, restoreOpenTabs, serializeOpenTabs,
+  openTabsKey, restoreWorkTabs, serializeWorkTabs,
 } from './openTabs.js';
 import {
   hasTabbedPaneForKind, defaultLeftTab, resolveVideoId,
@@ -273,7 +273,7 @@ const state = {
   // per project in localStorage (see loadReaderLayout / saveReaderLayout);
   // the reading/notebook split is fractions of their combined width.
   layoutMode: 'notetaking',
-  panels: { nav: false, reading: true, notebook: true, ai: false },
+  panels: { nav: false, reading: true, notebook: true, ai: false, files: false },
   widths: { ...PANE_DEFAULTS },
   // Zoom is a multiplier on the width-fitting PDF scale (1 = fit width),
   // per source, per session (not persisted). 'slides' is the Google Slides
@@ -358,9 +358,8 @@ const state = {
   activeSection: null,  // {sectionId, name, path} when a section tab is active
   // Open tabs: owned notes currently on the tab bar. Hiding a tab only
   // removes its name here — the file stays on disk and re-opens from
-  // the Files directory. Persisted per project (see openTabs.js).
+  // the Files panel. Persisted per project (see openTabs.js).
   openNotes: new Set(),
-  showFiles: false,     // Files directory panel visible (forced on when no tab is open)
   saveTimer: null,
   // Left Preview tab: the note being previewed. Null = not picked yet —
   // defaults to the active markdown note, else the master notes.md.
@@ -451,7 +450,6 @@ function resetReaderState() {
   state.sectionTabs = [];
   state.activeSection = null;
   state.openNotes = new Set();
-  state.showFiles = false;
   state.coverGenerated = false;
   state.editorFocused = false;
   state.aiTab = 'note';
@@ -2145,6 +2143,14 @@ async function openProject(slug) {
   state.project = project;
   state.chapterMap = (project.chapterMap && typeof project.chapterMap === 'object')
     ? project.chapterMap : {};
+  // Sections come from project.json (GET /projects/:slug above) — the
+  // reader needs them for the Files panel and for restoring section
+  // tabs, the same list the Manage page reads. Tolerate old projects
+  // without sections[].
+  state.sections = Array.isArray(project.sections)
+    ? project.sections.filter((s) => s && typeof s.id === 'string' && typeof s.name === 'string'
+      && Array.isArray(s.notebooks))
+    : [];
 
   try {
     const notes = await apiGet(`/api/projects/${encodeURIComponent(slug)}/notes`);
@@ -2152,10 +2158,6 @@ async function openProject(slug) {
   } catch {
     state.notes = [];
   }
-
-  // Open tabs: restored from the last session (hiding a tab sticks);
-  // nothing stored yet → every editable note starts open, as before.
-  state.openNotes = restoreOpenTabs(readStoredOpenTabs(), state.notes);
 
   // v1.1: materials + labs. Both are optional — a 404 (older backend, or a
   // project without them) just leaves the switcher / Labs section hidden.
@@ -2181,6 +2183,19 @@ async function openProject(slug) {
   } catch {
     state.labs = [];
   }
+
+  // Open tabs: restored from the last session — owned notes, lab tabs,
+  // section tabs, and which tab was active (hiding a tab sticks);
+  // nothing stored yet → every editable note starts open, as before.
+  // Labs/sections validate against what was just fetched, so a stale
+  // stored tab never re-opens a deleted file.
+  const workTabs = restoreWorkTabs(readStoredOpenTabs(), {
+    notes: state.notes, labs: state.labs, sections: state.sections,
+  });
+  state.openNotes = workTabs.notes;
+  state.labTabs = workTabs.labs;
+  state.sectionTabs = workTabs.sections;
+
   await loadAnnotations();
 
   // Reading position: load the stored per-source positions before the
@@ -2201,6 +2216,22 @@ async function openProject(slug) {
     state.notesMdEditing = true;
     try { await loadNote('notes.md'); }
     catch { state.notesMdEditing = false; }
+  } else if (workTabs.active) {
+    // The tab he was on: re-open it through its loader (the tab is
+    // already registered from the restore above). Anything
+    // unresolvable falls through to the default note.
+    try {
+      if (workTabs.active.kind === 'lab') await loadLab(workTabs.active.chapter, workTabs.active.name);
+      else if (workTabs.active.kind === 'section') await loadSectionNotebook(workTabs.active.sectionId, workTabs.active.name);
+      else await loadNote(workTabs.active.name);
+    } catch { /* fall through to the default below */ }
+    if (!state.activeNoteName) {
+      const def = defaultEditorNote();
+      if (def) {
+        try { await loadNote(def.name); }
+        catch { /* notebook pane renders empty; tabs still work */ }
+      }
+    }
   } else {
     const def = defaultEditorNote();
     if (def) {
@@ -2275,6 +2306,8 @@ function renderReaderShell() {
         <a class="back-link" href="#/">‹ Shelf</a>
         <button type="button" id="chapter-toggle" aria-pressed="${state.panels.nav ? 'true' : 'false'}"
                 title="Show or hide the chapter panel">Chapters</button>
+        <button type="button" id="files-toggle" aria-pressed="${state.panels.files ? 'true' : 'false'}"
+                title="Show or hide the files panel">Files</button>
         <h1>${esc(p.title || 'Untitled')}</h1>
         <button type="button" id="manage-top" title="Manage this project — sources, notes, export">Manage</button>
         <button type="button" id="layout-menu-btn" title="Layout — presets and panels">▦ Layout</button>
@@ -2295,6 +2328,8 @@ function renderReaderShell() {
       <aside class="notebook-pane" id="notebook-pane" aria-label="Notebook"></aside>
       <div class="reader-divider" id="divider-ai" data-divider="ai" title="Drag to resize the AI panel" aria-hidden="true"></div>
       <aside class="ai-column" id="ai-column" aria-label="AI panel"></aside>
+      <div class="reader-divider" id="divider-files" data-divider="files" title="Drag to resize the files panel" aria-hidden="true"></div>
+      <aside class="files-aside" id="files-aside" aria-label="Files panel"></aside>
     </div>`;
 
   const switcherEl = $('#source-switcher', view);
@@ -2321,10 +2356,15 @@ function renderReaderShell() {
   $('#chapter-toggle', view).addEventListener('click', () => {
     updatePanels({ ...state.panels, nav: !state.panels.nav });
   });
+  $('#files-toggle', view).addEventListener('click', () => {
+    updatePanels({ ...state.panels, files: !state.panels.files });
+  });
   bindDivider($('#divider-nav', view), 'nav');
   bindDivider($('#divider-reading', view), 'reading');
   bindDivider($('#divider-ai', view), 'ai');
+  bindDivider($('#divider-files', view), 'files');
 
+  renderFilesPanel();
   renderNotebookPane();
   renderAiColumn();
   applyReaderLayout({ save: false });
@@ -2644,6 +2684,7 @@ function applyReaderLayout({ save = true } = {}) {
   const notebookWasHidden = $('#notebook-pane', view)?.style.display === 'none';
   show('#notebook-pane', state.panels.notebook);
   show('#ai-column', state.panels.ai);
+  show('#files-aside', state.panels.files);
   // Cell editors measure 0 while hidden; re-fit them the moment the
   // working pane comes back into view (preset / panel toggle).
   if (state.panels.notebook && notebookWasHidden) fitCellEditors();
@@ -2651,6 +2692,8 @@ function applyReaderLayout({ save = true } = {}) {
     'divider-nav': state.panels.nav && state.panels.reading,
     'divider-reading': state.panels.reading && state.panels.notebook,
     'divider-ai': state.panels.notebook && state.panels.ai,
+    // Files sits after AI (or after the working pane when AI is hidden).
+    'divider-files': state.panels.files && (state.panels.ai || state.panels.notebook),
   };
   Object.entries(dividerVisible).forEach(([id, visible]) => {
     const el = document.getElementById(id);
@@ -2658,6 +2701,8 @@ function applyReaderLayout({ save = true } = {}) {
   });
   const chBtn = $('#chapter-toggle', view);
   if (chBtn) chBtn.setAttribute('aria-pressed', state.panels.nav ? 'true' : 'false');
+  const filesBtn = $('#files-toggle', view);
+  if (filesBtn) filesBtn.setAttribute('aria-pressed', state.panels.files ? 'true' : 'false');
   const aiTop = $('#ai-toggle-top', view);
   if (aiTop) aiTop.classList.toggle('active', state.panels.ai);
   if (state.pdfDoc) measurePdfPages();
@@ -2717,6 +2762,8 @@ function bindDivider(div, key) {
         state.widths.nav = clampNavWidth(start.nav + dx);
       } else if (key === 'ai') {
         state.widths.ai = clampAiWidth(start.ai - dx);
+      } else if (key === 'files') {
+        state.widths.files = clampFilesWidth(start.files - dx);
       } else {
         const s = splitReadingNotebook(startReadingPx + dx, total);
         state.widths.readingFr = s.readingFr;
@@ -2800,7 +2847,7 @@ function openLayoutMenu(anchorBtn) {
     ai: ['', '', 'ai'],
   };
   const names = { reading: 'Reading', navigation: 'Navigation', notetaking: 'Notetaking', ai: 'AI' };
-  const panelKeys = ['nav', 'reading', 'notebook', 'ai'];
+  const panelKeys = ['nav', 'reading', 'notebook', 'ai', 'files'];
   const render = () => {
     el.innerHTML = `
       <div class="layout-grid">
@@ -2817,7 +2864,7 @@ function openLayoutMenu(anchorBtn) {
         ${panelKeys.map((key) => `
           <label class="layout-panel-row">
             <input type="checkbox" data-panel="${key}" ${state.panels[key] ? 'checked' : ''}>
-            <span>${{ nav: 'Chapters', reading: 'Reading pane', notebook: 'Working pane', ai: 'AI panel' }[key]}</span>
+            <span>${{ nav: 'Chapters', reading: 'Reading pane', notebook: 'Working pane', ai: 'AI panel', files: 'Files panel' }[key]}</span>
           </label>`).join('')}
       </div>`;
     $$('.layout-card', el).forEach((card) => {
@@ -4861,25 +4908,37 @@ function defaultEditorNote() {
 }
 
 /* Open-tabs persistence (see openTabs.js): one localStorage entry per
-   project. A failed write never blocks the UI. */
+   project, holding the owned notes plus the lab / section notebook tabs
+   and which tab was active — so a refresh brings back the working set
+   exactly as he left it. A failed write never blocks the UI. */
 function readStoredOpenTabs() {
   try { return window.localStorage.getItem(openTabsKey(state.project.slug)); } catch { return null; }
 }
 
-function persistOpenTabs() {
+/* The active working tab, in the store's shape — null when no tab is
+   active (notes.md never has a tab, so it is never the active tab). */
+function activeWorkTab() {
+  if (state.activeTabKind === 'lab' && state.activeLab) {
+    return { kind: 'lab', chapter: state.activeLab.chapter, name: state.activeLab.name };
+  }
+  if (state.activeTabKind === 'section' && state.activeSection) {
+    return { kind: 'section', sectionId: state.activeSection.sectionId, name: state.activeSection.name };
+  }
+  if (state.activeTabKind === 'note' && state.activeNoteName && state.activeNoteName !== 'notes.md') {
+    return { kind: 'note', name: state.activeNoteName };
+  }
+  return null;
+}
+
+function persistWorkTabs() {
   try {
-    window.localStorage.setItem(openTabsKey(state.project.slug), serializeOpenTabs(state.openNotes));
+    window.localStorage.setItem(openTabsKey(state.project.slug), serializeWorkTabs({
+      notes: state.openNotes,
+      labs: state.labTabs,
+      sections: state.sectionTabs,
+      active: activeWorkTab(),
+    }));
   } catch { /* ignore */ }
-}
-
-/* How many tabs are open (owned notes + labs + section notebooks) — the
-   Files directory shows by default when this is zero. */
-function openTabCount() {
-  return (state.openNotes?.size || 0) + (state.labTabs?.length || 0) + (state.sectionTabs?.length || 0);
-}
-
-function filesVisible() {
-  return state.showFiles || openTabCount() === 0;
 }
 
 /* No editable note is open: clear the editor state so the right pane
@@ -4932,6 +4991,8 @@ async function loadNote(name) {
   } else {
     state.headings = headingsFromMarkdown(content);
   }
+  // The active tab changed: persist it so a refresh re-opens this tab.
+  persistWorkTabs();
 }
 
 /* Continue execution_count from the highest count already stored in the
@@ -5055,7 +5116,7 @@ async function commitNoteRename(oldName, input) {
   if (state.openNotes.has(oldName)) {
     state.openNotes.delete(oldName);
     state.openNotes.add(name);
-    persistOpenTabs();
+    persistWorkTabs();
   }
   if (state.activeNoteName === oldName) state.activeNoteName = name;
   if (state.previewNoteName === oldName) state.previewNoteName = name;
@@ -5097,7 +5158,7 @@ async function deleteNote(name) {
   }
   state.notes = state.notes.filter((n) => n.name !== name);
   state.openNotes.delete(name);
-  persistOpenTabs();
+  persistWorkTabs();
   if (state.previewNoteName === name) state.previewNoteName = null;
   if (state.activeTabKind === 'note' && state.activeNoteName === name) {
     await activateFallbackTab();
@@ -5122,13 +5183,11 @@ function renderNotebookPane() {
   // in the + menu, and everything autosaves (see renderNotebookBody and
   // saveNotebook) — so nothing needs a Save button.
   paneRendering = true;
-  // The Files directory lives between the tab bar and the body when it
-  // is toggled on — but with no tab open the empty body shows it
-  // instead (one line, then the list), so it is never rendered twice.
-  const showFilesPanel = filesVisible() && openTabCount() > 0;
+  // The tab bar is on top, the editor/notebook directly below. The Files
+  // directory lives in its own rightmost panel now (top-bar Files
+  // toggle), never inside this pane.
   pane.innerHTML = `
     <div class="notebook-tabs" id="notebook-tabs"></div>
-    ${showFilesPanel ? '<div class="files-panel" id="files-panel"></div>' : ''}
     <div class="notebook-body" id="notebook-body"></div>`;
   paneRendering = false;
 
@@ -5252,30 +5311,8 @@ function renderNotebookPane() {
     });
     tabs.appendChild(tab);
   });
-  // The + button is just a +: it opens the chooser (new note, new
-  // notebook per language, labs, Note here) — AV TabContainer style.
-  const addBtn = document.createElement('button');
-  addBtn.type = 'button';
-  addBtn.className = 'note-tab-add';
-  addBtn.textContent = '+';
-  addBtn.title = 'Add — note, notebook, lab, or a note at the current page';
-  addBtn.addEventListener('click', (e) => { e.stopPropagation(); openAddMenu(addBtn); });
-  tabs.appendChild(addBtn);
-  // Files toggle: the directory (open / hide / delete) sits between the
-  // tab bar and the body while it is on; with no tab open it shows by
-  // default in the empty body instead.
-  const filesBtn = document.createElement('button');
-  filesBtn.type = 'button';
-  filesBtn.className = `note-tab-files${filesVisible() ? ' active' : ''}`;
-  filesBtn.textContent = 'Files';
-  filesBtn.title = 'Show or hide the file list';
-  filesBtn.setAttribute('aria-pressed', filesVisible() ? 'true' : 'false');
-  filesBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    state.showFiles = !state.showFiles;
-    renderNotebookPane();
-  });
-  tabs.appendChild(filesBtn);
+  // The + ADD menu lives in the Files panel header now (the rightmost
+  // panel, like Chapters on the left) — not in the tab bar.
   // Autosave status lives at the right end of the tab bar.
   const status = document.createElement('span');
   status.className = 'save-status';
@@ -5290,13 +5327,39 @@ function renderNotebookPane() {
     if (input) { sizeNoteTabInput(input); input.focus(); input.select(); }
   }
 
-  const filesPanel = $('#files-panel', pane);
-  if (filesPanel) renderFilesList(filesPanel);
-
   renderNotebookBody();
 }
 
 /* ---------------- Files directory ---------------- */
+
+/* The Files panel (rightmost, hidden by default — same mechanics as the
+   Chapters panel): its header carries the + ADD menu, its body is the
+   file tree. Rebuilt when the shell renders; the list itself is
+   re-filled by refreshFilesLists whenever the tree changes. */
+function renderFilesPanel() {
+  const aside = $('#files-aside', view);
+  if (!aside) return;
+  aside.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'files-head';
+  const title = document.createElement('h2');
+  title.textContent = 'Files';
+  head.appendChild(title);
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.id = 'files-add-btn';
+  addBtn.className = 'files-add-btn';
+  addBtn.textContent = '+';
+  addBtn.title = 'Add a note or notebook';
+  addBtn.addEventListener('click', (e) => openAddMenu(e.currentTarget));
+  head.appendChild(addBtn);
+  aside.appendChild(head);
+  const host = document.createElement('div');
+  host.className = 'files-panel';
+  host.id = 'files-panel';
+  aside.appendChild(host);
+  renderFilesList(host);
+}
 
 /* Language tag for a notebook row: the + menu's create entries use the
    same words (Python / Java / JavaScript). Unknown metadata falls back
@@ -5341,6 +5404,25 @@ function filesRow({ label, title, tag, active, deletable, name, onOpen }) {
   return row;
 }
 
+/* One section-notebook row: opens through the section API (the file
+   lives under notes/sections/<section-id>/). Seeded Labs entries are
+   NOT routed here — they keep the labs API rows in the Labs block.
+   Delete lives in Manage only. */
+function sectionNotebookRow(section, entry) {
+  const isActive = state.activeTabKind === 'section' && state.activeSection
+    && state.activeSection.sectionId === section.id && state.activeSection.name === entry.name;
+  const lang = typeof entry.language === 'string' ? entry.language.toLowerCase() : '';
+  return filesRow({
+    label: labDisplayName(entry.name),
+    title: `${section.name}/${entry.name}`,
+    tag: NB_LANG_TAG[lang] || null,
+    active: isActive,
+    deletable: false,
+    name: entry.name,
+    onOpen: () => openSectionNotebook(section.id, entry.name),
+  });
+}
+
 function renderFilesList(host) {
   host.innerHTML = '';
   const list = document.createElement('div');
@@ -5373,7 +5455,15 @@ function renderFilesList(host) {
       }));
     });
   }
-  if ((state.labs || []).length) {
+  // Labs: the seeded entries from the labs API (notes/labs/), plus the
+  // user-added entries in the Labs section, which live under
+  // notes/sections/labs/ and the labs API never sees. The Labs section
+  // itself is not rendered as a group of its own below — its seeded
+  // entries are already these rows.
+  const labsSection = (state.sections || []).find((s) => s.id === 'labs');
+  const labsAdded = (labsSection?.notebooks || [])
+    .filter((e) => String(e.path || '').startsWith('notes/sections/'));
+  if ((state.labs || []).length || labsAdded.length) {
     list.appendChild(filesSection('Labs'));
     state.labs.forEach((group) => {
       const files = Array.isArray(group.files) ? group.files : [];
@@ -5409,13 +5499,52 @@ function renderFilesList(host) {
         });
       }
     });
+    labsAdded.forEach((f) => list.appendChild(sectionNotebookRow(labsSection, f)));
   }
+
+  // Sections (course imports, e.g. the Karpathy project): one group per
+  // section, its notebooks under it — chapter-grouped collapsibly when
+  // entries carry a chapter (same shape as Manage), flat otherwise.
+  // The Labs section is excluded here (see the Labs block above).
+  (state.sections || []).filter((s) => s.id !== 'labs').forEach((section) => {
+    const entries = Array.isArray(section.notebooks) ? section.notebooks : [];
+    if (!entries.length) return;
+    list.appendChild(filesSection(section.name));
+    const byChapter = new Map();
+    const flat = [];
+    entries.forEach((e) => {
+      if (e.chapter) {
+        if (!byChapter.has(e.chapter)) byChapter.set(e.chapter, []);
+        byChapter.get(e.chapter).push(e);
+      } else flat.push(e);
+    });
+    [...byChapter.entries()].sort((a, b) => a[0].localeCompare(b[0])).forEach(([chapter, files]) => {
+      if (!files.length) return;
+      const open = !!state.labsOpenChapters[chapter];
+      const head = document.createElement('button');
+      head.type = 'button';
+      head.className = 'files-group-head';
+      const headLabel = document.createElement('span');
+      headLabel.textContent = `${open ? '▾' : '▸'} ${chapterDisplayName(chapter)}`;
+      const headCount = document.createElement('span');
+      headCount.className = 'files-count';
+      headCount.textContent = String(files.length);
+      head.append(headLabel, headCount);
+      head.addEventListener('click', () => {
+        state.labsOpenChapters[chapter] = !open;
+        refreshFilesLists();
+      });
+      list.appendChild(head);
+      if (open) files.forEach((f) => list.appendChild(sectionNotebookRow(section, f)));
+    });
+    flat.forEach((f) => list.appendChild(sectionNotebookRow(section, f)));
+  });
   host.appendChild(list);
 }
 
-/* Re-fill every directory list in the DOM (the panel slot, or the empty
-   body) without rebuilding the tab bar or the editor — used by the lab
-   group toggle, so expanding a chapter never drops editor focus. */
+/* Re-fill every directory list in the DOM (the Files panel) without
+   rebuilding the tab bar or the editor — used by the lab group toggle,
+   so expanding a chapter never drops editor focus. */
 function refreshFilesLists() {
   $$('.files-panel').forEach((host) => renderFilesList(host));
 }
@@ -5427,12 +5556,12 @@ function refreshFilesLists() {
 async function openNoteFromDirectory(name) {
   if (state.activeTabKind === 'note' && state.activeNoteName === name) return;
   state.openNotes.add(name);
-  persistOpenTabs();
+  persistWorkTabs();
   try {
     await loadNote(name);
   } catch (err) {
     state.openNotes.delete(name);
-    persistOpenTabs();
+    persistWorkTabs();
     window.alert(`Could not open ${name}: ${err.message}`);
     return;
   }
@@ -5590,6 +5719,7 @@ async function loadLab(chapter, name) {
   if (!Array.isArray(state.activeNotebook.cells)) state.activeNotebook.cells = [];
   state.headings = headingsFromNotebook(state.activeNotebook);
   resetExecCounter();
+  persistWorkTabs(); // the active tab changed
 }
 
 /* Flush the active editor's pending work before its tab closes: a
@@ -5638,6 +5768,7 @@ async function activateFallbackTab() {
     try { await loadSectionNotebook(sec.sectionId, sec.name); return; } catch { /* fall through */ }
   }
   clearActiveNote();
+  persistWorkTabs(); // no tab left: active is now null, and that must stick
 }
 
 /* Close (hide) an owned note's tab: the file stays on disk and re-opens
@@ -5648,7 +5779,7 @@ async function closeNoteTab(name) {
   if (wasActive) await flushActiveNoteEdits();
   if (name === 'notes.md') state.notesMdEditing = false; // the Edit session ends with the tab
   state.openNotes.delete(name);
-  persistOpenTabs();
+  persistWorkTabs();
   if (!wasActive) { renderNotebookPane(); return; }
   await activateFallbackTab();
   renderNotebookPane();
@@ -5660,6 +5791,7 @@ async function closeNoteTab(name) {
 async function closeLabTab(lab) {
   state.labTabs = state.labTabs.filter(
     (t) => !(t.chapter === lab.chapter && t.name === lab.name));
+  persistWorkTabs(); // the tab set changed
   const wasActive = state.activeTabKind === 'lab' && state.activeLab
     && state.activeLab.chapter === lab.chapter && state.activeLab.name === lab.name;
   if (!wasActive) { renderNotebookPane(); return; }
@@ -5709,6 +5841,7 @@ async function loadSectionNotebook(sectionId, name) {
   if (!Array.isArray(state.activeNotebook.cells)) state.activeNotebook.cells = [];
   state.headings = headingsFromNotebook(state.activeNotebook);
   resetExecCounter();
+  persistWorkTabs(); // the active tab changed
 }
 
 /* Close a section tab: only hides it — the notebook stays on disk and
@@ -5716,6 +5849,7 @@ async function loadSectionNotebook(sectionId, name) {
 async function closeSectionTab(sectionTab) {
   state.sectionTabs = state.sectionTabs.filter(
     (t) => !(t.sectionId === sectionTab.sectionId && t.name === sectionTab.name));
+  persistWorkTabs(); // the tab set changed
   const wasActive = state.activeTabKind === 'section' && state.activeSection
     && state.activeSection.sectionId === sectionTab.sectionId && state.activeSection.name === sectionTab.name;
   if (!wasActive) { renderNotebookPane(); return; }
@@ -5768,7 +5902,7 @@ async function addNoteAtCurrentPage() {
     }
     state.notes.push({ name: clean, kind: 'md' });
     state.openNotes.add(clean);
-    persistOpenTabs();
+    persistWorkTabs();
   }
   let added = true;
   try {
@@ -6371,13 +6505,8 @@ function renderNotebookBody() {
   body.classList.remove('has-quick-actions'); // re-added below for md notes
   if (state.activeTabKind === 'note' && !state.activeNoteName) {
     // No editable note is open (notes.md opens here only via Manage →
-    // Edit): one line, then the Files directory — the way back in. (With
-    // a tab open the directory lives in its panel above the body instead,
-    // so the list
-    // is never rendered twice.)
-    body.innerHTML = `<div class="notebook-empty">No note open — pick a file below, or press + to create one.</div>${openTabCount() === 0 ? '<div class="files-panel" id="files-panel"></div>' : ''}`;
-    const filesPanel = $('#files-panel', body);
-    if (filesPanel) renderFilesList(filesPanel);
+    // Edit): one line pointing at the Files panel — the way back in.
+    body.innerHTML = `<div class="notebook-empty">No note open — open Files to pick one.</div>`;
     return;
   }
   if (state.activeNoteKind === 'ipynb') {
@@ -6670,7 +6799,7 @@ async function createMdNote() {
   const clean = name.trim().endsWith('.md') ? name.trim() : `${name.trim()}.md`;
   if (state.notes.some((n) => n.name === clean)) {
     state.openNotes.add(clean);
-    persistOpenTabs();
+    persistWorkTabs();
     await loadNote(clean);
     renderNotebookPane();
     renderChapterPanel();
@@ -6681,7 +6810,7 @@ async function createMdNote() {
       'PUT', { content: `# ${clean.replace(/\.md$/, '')}\n` });
     state.notes.push({ name: clean, kind: 'md' });
     state.openNotes.add(clean);
-    persistOpenTabs();
+    persistWorkTabs();
     await loadNote(clean);
     renderNotebookPane();
     renderChapterPanel();
@@ -6705,7 +6834,7 @@ async function createIpynbNote(lang = 'python') {
   const clean = name.trim().endsWith('.ipynb') ? name.trim() : `${name.trim()}.ipynb`;
   if (state.notes.some((n) => n.name === clean)) {
     state.openNotes.add(clean);
-    persistOpenTabs();
+    persistWorkTabs();
     await loadNote(clean);
     renderNotebookPane();
     renderChapterPanel();
@@ -6724,7 +6853,7 @@ async function createIpynbNote(lang = 'python') {
       'PUT', { content: JSON.stringify(nb, null, 2) });
     state.notes.push({ name: clean, kind: 'ipynb' });
     state.openNotes.add(clean);
-    persistOpenTabs();
+    persistWorkTabs();
     await loadNote(clean);
     renderNotebookPane();
     renderChapterPanel();

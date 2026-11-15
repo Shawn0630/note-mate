@@ -372,13 +372,14 @@ h1, h2, h3, .serif { font-family: Georgia, "Times New Roman", serif; }
 
 /* ---------- Reader layout ---------- */
 
-/* Seven columns: nav | divider | reading | divider | notebook | divider |
-   AI. Column widths are set inline by applyReaderLayout (a hidden pane or
-   divider is 0); the CSS only pins each pane to its column. AV scale: the
-   reader chrome is 13px so the reading / note space gets the room. */
+/* Nine columns: nav | divider | reading | divider | notebook | divider |
+   AI | divider | files. Column widths are set inline by
+   applyReaderLayout (a hidden pane or divider is 0); the CSS only pins
+   each pane to its column. AV scale: the reader chrome is 13px so the
+   reading / note space gets the room. */
 .reader {
   display: grid;
-  grid-template-columns: 248px 7px minmax(0, 1fr) 7px minmax(0, 1fr) 7px 0;
+  grid-template-columns: 248px 7px minmax(0, 1fr) 7px minmax(0, 1fr) 7px 0 7px 0;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 0;
   height: calc(100vh - 118px);
@@ -397,9 +398,11 @@ h1, h2, h3, .serif { font-family: Georgia, "Times New Roman", serif; }
 .reader .reading-pane { grid-column: 3; grid-row: 2; }
 .reader .notebook-pane { grid-column: 5; grid-row: 2; }
 .reader .ai-column { grid-column: 7; grid-row: 2; }
+.reader .files-aside { grid-column: 9; grid-row: 2; }
 #divider-nav { grid-column: 2; grid-row: 2; }
 #divider-reading { grid-column: 4; grid-row: 2; }
 #divider-ai { grid-column: 6; grid-row: 2; }
+#divider-files { grid-column: 8; grid-row: 2; }
 
 /* Draggable dividers (AV Divider look: 7px gutter, a 1px visible line,
    col-resize, a hover/drag accent). Small and unobtrusive — they never eat
@@ -468,6 +471,45 @@ body.reader-open .reader {
 .topbar-split { display: inline-flex; }
 .topbar-split button:first-child { border-radius: 7px 0 0 7px; }
 .topbar-split .topbar-chevron { border-radius: 0 7px 7px 0; padding: 4px 6px; }
+
+/* ---------- Files panel (rightmost, mirrors the chapter panel) ---------- */
+
+.files-aside {
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--line);
+  background: var(--paper-dim);
+  overflow: hidden;
+  min-width: 0;
+}
+.files-aside h2 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--ink-faint);
+  margin: 0;
+}
+/* Files header row: title left, + ADD menu right. */
+.files-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 12px 10px 16px;
+  flex: none;
+}
+.files-add-btn {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 16px;
+  line-height: 1;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.files-add-btn:hover { background: rgba(138, 90, 43, .1); border-radius: 6px; }
 
 /* ---------- Chapter panel ---------- */
 
@@ -692,51 +734,16 @@ input[type="text"].note-tab-input {
   font-weight: 700;
   margin-bottom: -1px;
 }
-.note-tab-add {
-  border: none;
-  background: transparent;
-  color: var(--accent);
-  font-weight: 700;
-  font-size: 16px;
-  line-height: 1;
-  padding: 5px 8px;
-  white-space: nowrap;
-}
-/* Files toggle in the tab bar: the directory (open / hide / delete). */
-.note-tab-files {
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--ink-soft);
-  font-size: 13px;
-  font-weight: 600;
-  padding: 4px 10px;
-  border-radius: 8px 8px 0 0;
-  white-space: nowrap;
-  cursor: pointer;
-}
-.note-tab-files.active {
-  background: var(--paper);
-  border-color: var(--line);
-  border-bottom: none;
-  color: var(--ink);
-  margin-bottom: -1px;
-}
 
-/* Files directory: grouped list between the tab bar and the body (or in
-   the empty body when no tab is open). Same visual language as the
-   + menu's sections and rows — labels only, no prose. */
+/* Files directory: grouped list inside the rightmost Files panel. Same
+   visual language as the + menu's sections and rows — labels only, no
+   prose. */
 .files-panel {
-  flex: none;
-  max-height: 42%;
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
-  border-bottom: 1px solid var(--line);
   background: var(--paper);
   padding: 2px 4px 8px;
-}
-.notebook-body .files-panel {
-  max-height: none;
-  border-bottom: none;
-  overflow-y: visible;
 }
 .files-section {
   font-size: 11px;

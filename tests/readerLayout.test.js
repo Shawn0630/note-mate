@@ -1,20 +1,23 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  clampNavWidth, clampAiWidth, splitReadingNotebook, gridTemplate,
+  clampNavWidth, clampAiWidth, clampFilesWidth, splitReadingNotebook, gridTemplate,
   sanitizeWidths, sanitizePanels, matchPreset, defaultPanels,
   migrateLayoutModeName,
   clampZoom, zoomStep, zoomFromWheel, zoomFromGesture, zoomPercent,
   fitScale, firstFreeName, PANE_DEFAULTS,
 } from '../public/readerLayout.js';
 
-test('clamps: nav 180–480, ai 280–560', () => {
+test('clamps: nav 180–480, ai 280–560, files 200–480', () => {
   assert.equal(clampNavWidth(100), 180);
   assert.equal(clampNavWidth(248), 248);
   assert.equal(clampNavWidth(900), 480);
   assert.equal(clampAiWidth(100), 280);
   assert.equal(clampAiWidth(340), 340);
   assert.equal(clampAiWidth(900), 560);
+  assert.equal(clampFilesWidth(100), 200);
+  assert.equal(clampFilesWidth(260), 260);
+  assert.equal(clampFilesWidth(900), 480);
 });
 
 test('splitReadingNotebook: drag clamps each side to its minimum', () => {
@@ -34,41 +37,53 @@ test('splitReadingNotebook: drag clamps each side to its minimum', () => {
   assert.deepEqual(s, { readingFr: 0.5, notebookFr: 0.5 });
 });
 
-test('gridTemplate: 7 columns, hidden panes and dividers collapse to 0', () => {
+test('gridTemplate: 9 columns, hidden panes and dividers collapse to 0', () => {
   const notetaking = gridTemplate(
     { nav: false, reading: true, notebook: true, ai: false },
     { ...PANE_DEFAULTS },
   );
-  assert.equal(notetaking, '0px 0px minmax(0, 0.5fr) 7px minmax(0, 0.5fr) 0px 0px');
+  assert.equal(notetaking, '0px 0px minmax(0, 0.5fr) 7px minmax(0, 0.5fr) 0px 0px 0px 0px');
   // Reading: the single reading track takes the full width (1fr — a lone
   // 0.5fr track would only take half the container, see gridTemplate).
   const reading = gridTemplate(
     { nav: false, reading: true, notebook: false, ai: false },
     { ...PANE_DEFAULTS },
   );
-  assert.equal(reading, '0px 0px minmax(0, 1fr) 0px 0px 0px 0px');
+  assert.equal(reading, '0px 0px minmax(0, 1fr) 0px 0px 0px 0px 0px 0px');
   // Navigation: nav + reading alone also gives reading the full remainder.
   const navigation = gridTemplate(
     { nav: true, reading: true, notebook: false, ai: false },
     { ...PANE_DEFAULTS },
   );
-  assert.equal(navigation, '248px 7px minmax(0, 1fr) 0px 0px 0px 0px');
+  assert.equal(navigation, '248px 7px minmax(0, 1fr) 0px 0px 0px 0px 0px 0px');
   const ai = gridTemplate(
     { nav: false, reading: true, notebook: true, ai: true },
     { nav: 248, readingFr: 0.6, notebookFr: 0.4, ai: 340 },
   );
-  assert.equal(ai, '0px 0px minmax(0, 0.6fr) 7px minmax(0, 0.4fr) 7px 340px');
+  assert.equal(ai, '0px 0px minmax(0, 0.6fr) 7px minmax(0, 0.4fr) 7px 340px 0px 0px');
   const nav = gridTemplate(
     { nav: true, reading: true, notebook: false, ai: false },
     { nav: 200, readingFr: 0.5, notebookFr: 0.5, ai: 340 },
   );
-  assert.equal(nav, '200px 7px minmax(0, 1fr) 0px 0px 0px 0px');
+  assert.equal(nav, '200px 7px minmax(0, 1fr) 0px 0px 0px 0px 0px 0px');
   // Reading hidden but notebook shown: no divider between nav and notebook.
   const noRead = gridTemplate(
     { nav: true, reading: false, notebook: true, ai: false },
     { ...PANE_DEFAULTS },
   );
-  assert.equal(noRead, '248px 0px 0px 0px minmax(0, 1fr) 0px 0px');
+  assert.equal(noRead, '248px 0px 0px 0px minmax(0, 1fr) 0px 0px 0px 0px');
+  // Files open: the rightmost column, divider after the working pane
+  // (AI off) or after AI (AI on).
+  const filesNoAi = gridTemplate(
+    { nav: false, reading: true, notebook: true, ai: false, files: true },
+    { ...PANE_DEFAULTS },
+  );
+  assert.equal(filesNoAi, '0px 0px minmax(0, 0.5fr) 7px minmax(0, 0.5fr) 0px 0px 7px 260px');
+  const filesAi = gridTemplate(
+    { nav: false, reading: true, notebook: true, ai: true, files: true },
+    { nav: 248, readingFr: 0.6, notebookFr: 0.4, ai: 340, files: 300 },
+  );
+  assert.equal(filesAi, '0px 0px minmax(0, 0.6fr) 7px minmax(0, 0.4fr) 7px 340px 7px 300px');
 });
 
 test('matchPreset: exact matches only, else null', () => {
@@ -77,7 +92,10 @@ test('matchPreset: exact matches only, else null', () => {
   assert.equal(matchPreset({ nav: false, reading: true, notebook: true, ai: false }), 'notetaking');
   assert.equal(matchPreset({ nav: false, reading: true, notebook: true, ai: true }), 'ai');
   assert.equal(matchPreset({ nav: true, reading: true, notebook: true, ai: false }), null);
+  // Files open on an otherwise-notetaking layout is custom, not notetaking.
+  assert.equal(matchPreset({ nav: false, reading: true, notebook: true, ai: false, files: true }), null);
   assert.equal(matchPreset(defaultPanels()), 'notetaking');
+  assert.equal(defaultPanels().files, false);
 });
 
 test('migrateLayoutModeName: stored focus migrates to notetaking', () => {
@@ -94,13 +112,17 @@ test('migrateLayoutModeName: stored focus migrates to notetaking', () => {
 
 test('sanitizeWidths / sanitizePanels: bad stored values fall back', () => {
   assert.deepEqual(sanitizeWidths(null), PANE_DEFAULTS);
-  assert.deepEqual(sanitizeWidths({ nav: 5, ai: 9999, readingFr: 2, notebookFr: 2 }), {
-    nav: 180, ai: 560, readingFr: 0.5, notebookFr: 0.5,
+  assert.deepEqual(sanitizeWidths({ nav: 5, ai: 9999, files: 5, readingFr: 2, notebookFr: 2 }), {
+    nav: 180, ai: 560, files: 200, readingFr: 0.5, notebookFr: 0.5,
   });
   assert.deepEqual(sanitizePanels(null), defaultPanels());
   assert.deepEqual(
     sanitizePanels({ nav: true, reading: true, notebook: false, ai: true, bogus: 1 }),
-    { nav: true, reading: true, notebook: false, ai: true },
+    { nav: true, reading: true, notebook: false, ai: true, files: false },
+  );
+  assert.deepEqual(
+    sanitizePanels({ nav: false, reading: true, notebook: true, ai: false, files: true }),
+    { nav: false, reading: true, notebook: true, ai: false, files: true },
   );
 });
 
