@@ -588,10 +588,28 @@ body.reader-open .reader {
 }
 .video-wrap { flex: 1; display: flex; align-items: center; justify-content: center; background: #000; min-height: 0; }
 .video-wrap iframe, .slides-wrap iframe {
-  width: 100%;
-  height: 100%;
   border: 0;
   background: #fff;
+}
+.slides-wrap iframe {
+  width: 100%;
+  height: 100%;
+}
+/* The iframe the YT API creates inside #video-player fills the 16:9 box.
+   display:block kills the inline baseline gap that would otherwise make
+   the div ~6px taller than the iframe. */
+.video-wrap #video-player iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+/* Fallback embed (no YT API): the iframe is a direct child of the wrap,
+   so it gets the same 16:9 box instead of stretching to pane height. */
+.video-wrap > iframe {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  height: auto;
+  max-height: 100%;
 }
 .slides-wrap { flex: 1; min-height: 0; display: flex; overflow: auto; touch-action: pan-x pan-y; }
 .ppt-card {
@@ -1118,10 +1136,11 @@ input[type="text"].note-tab-input {
   flex: none;
 }
 .deck-picker-row select, .video-picker-row select { font-size: 13px; padding: 4px 6px; background: var(--paper); }
-/* The YT player div fills the video wrap (align-self stretches it past
-   the wrap's centered alignment) so the API reads a real size at
-   creation; the iframe itself is 100% via the .video-wrap iframe rule. */
-.video-wrap #video-player { flex: 1 1 auto; align-self: stretch; width: 100%; min-height: 0; }
+/* The YT player box keeps 16:9 instead of stretching to the pane height:
+   the video fills it exactly and the YT title/controls hug the picture
+   instead of the tall container's edges. The wrap centers the box.
+   The div still has a real size at creation, so the API reads it fine. */
+.video-wrap #video-player { flex: none; width: 100%; aspect-ratio: 16 / 9; max-height: 100%; }
 .deck-page-indicator { color: #bbb; font-size: 12.5px; }
 /* The Markdown preview tab renders on paper, not on the dark reader bg. */
 #panel-preview .reading-scroll { background: var(--paper); }
