@@ -15,6 +15,14 @@ FROM node:22-bookworm-slim
 # Bookworm's python3 is externally managed (PEP 668), so a system-wide pip
 # install needs --break-system-packages (the executor runs plain `python3`,
 # so no venv). scipy comes from PyPI, not the torch index.
+# matplotlib comes from PyPI too, not apt: Debian's python3-matplotlib
+# is compiled against NumPy 1.x, and pip's torch pulls NumPy 2.x, under
+# which the apt matplotlib's C extensions refuse to import
+# (`_ARRAY_API not found`, `numpy.core.multiarray failed to import` —
+# hit 2026-11-23 on the micrograd notebook). The PyPI wheel is built
+# for NumPy 2 and, installed under /usr/local/lib/.../dist-packages,
+# shadows the apt one (local dist-packages precedes /usr/lib/... on
+# sys.path). The apt package stays installed but unused.
 # The torch install needs PyPI as an extra index: torch 2.15 needs
 # typing-extensions>=4.13, whose wheel the torch index serves with
 # inconsistent metadata, so pip falls back to building it from source —
@@ -33,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
          'torch==2.15.0+cpu' 'torchvision==0.29.2+cpu' \
          --index-url https://download.pytorch.org/whl/cpu \
          --extra-index-url https://pypi.org/simple \
-    && python3 -m pip install --no-cache-dir --break-system-packages scipy
+    && python3 -m pip install --no-cache-dir --break-system-packages scipy matplotlib
 
 WORKDIR /app
 
