@@ -1,6 +1,7 @@
 FROM node:22-bookworm-slim
 
-# Runtimes for /api/execute: python3 + matplotlib (plots), JDK 17 (javac/java).
+# Runtimes for /api/execute: python3 (matplotlib via pip, see below),
+# JDK 17 (javac/java).
 # Bookworm ships OpenJDK 17 only — openjdk-21 does not exist in bookworm
 # (it is a trixie package); 17 is enough for notebook Java cells.
 # LibreOffice (impress) converts PPTX slide decks to PDF for the reader —
@@ -15,14 +16,18 @@ FROM node:22-bookworm-slim
 # Bookworm's python3 is externally managed (PEP 668), so a system-wide pip
 # install needs --break-system-packages (the executor runs plain `python3`,
 # so no venv). scipy comes from PyPI, not the torch index.
-# matplotlib comes from PyPI too, not apt: Debian's python3-matplotlib
-# is compiled against NumPy 1.x, and pip's torch pulls NumPy 2.x, under
+# matplotlib comes from PyPI, NOT apt: Debian's python3-matplotlib is
+# compiled against NumPy 1.x, and pip's torch pulls NumPy 2.x, under
 # which the apt matplotlib's C extensions refuse to import
 # (`_ARRAY_API not found`, `numpy.core.multiarray failed to import` —
-# hit 2026-11-23 on the micrograd notebook). The PyPI wheel is built
-# for NumPy 2 and, installed under /usr/local/lib/.../dist-packages,
-# shadows the apt one (local dist-packages precedes /usr/lib/... on
-# sys.path). The apt package stays installed but unused.
+# hit 2026-11-23 on the micrograd notebook). The apt package must be
+# ABSENT, not just shadowed: pip skips a requirement it finds already
+# satisfied, so with python3-matplotlib installed `pip install
+# matplotlib` is a silent no-op and the broken apt build stays the
+# only matplotlib (the 7be47fa rebuild proved it — the container
+# rebuilt and recreated fine, the import still came from
+# /usr/lib/python3/dist-packages). The PyPI wheel is built for
+# NumPy 2 and is the only matplotlib in the image.
 # The torch install needs PyPI as an extra index: torch 2.15 needs
 # typing-extensions>=4.13, whose wheel the torch index serves with
 # inconsistent metadata, so pip falls back to building it from source —
@@ -33,7 +38,6 @@ FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 \
       python3-pip \
-      python3-matplotlib \
       openjdk-17-jdk-headless \
       libreoffice-impress \
     && rm -rf /var/lib/apt/lists/* \
