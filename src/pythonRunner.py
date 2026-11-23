@@ -10,6 +10,13 @@ One result per input cell, in order:
 Per-cell semantics (Jupyter-like):
 - stdout/stderr are captured per cell via redirected buffers.
 - A cell that raises stops the run: later cells are marked skipped.
+- Last-expression display (Jupyter-like): when a cell's last statement
+  is a bare expression, its value is captured. A value with a PNG
+  representation (`_repr_png_`, or a graphviz-style `.pipe(format='png')`)
+  is attached as an image; any other non-None value has its repr
+  appended to the cell's stdout (capped). A trailing `;` on the last
+  line suppresses the display, as in Jupyter. Display never fails a
+  cell: a display error falls back to the text repr.
 - matplotlib: plt.show() is patched (lazily, once pyplot is imported) to
   save every open figure as _nm_show_<cell>_<seq>.png and close it.
   After each cell, any still-open figures are harvested as
@@ -21,6 +28,7 @@ Per-cell semantics (Jupyter-like):
 - The runner prints nothing; all output goes to results.json.
 """
 
+import ast
 import base64
 import hashlib
 import io
@@ -31,6 +39,70 @@ import traceback
 
 MAX_IMAGES_PER_CELL = 20
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_REPR_CHARS = 10_000
+
+
+def display_png(value):
+    """PNG bytes for a displayable value, or None.
+
+    Prefers `_repr_png_`; otherwise a graphviz-style `.pipe(format='png')`
+    (a Digraph has no `_repr_png_`, only `_repr_svg_`, and its `pipe`
+    renders PNG via the `dot` binary). SVG/JPEG-only values return None —
+    the run-all frontend labels every image `image/png`, so only PNG is
+    produced here; those values fall back to their text repr. Never
+    raises: a display failure is the caller's problem to swallow.
+    """
+    try:
+        png = getattr(value, '_repr_png_', None)
+        if callable(png):
+            data = png()
+            if isinstance(data, tuple):
+                data = data[0]
+            if isinstance(data, (bytes, bytearray)) and bytes(data).startswith(b'\x89PNG'):
+                return bytes(data)
+    except Exception:
+        pass
+    try:
+        pipe = getattr(value, 'pipe', None)
+        if callable(pipe):
+            data = pipe(format='png')
+            if isinstance(data, (bytes, bytearray)) and bytes(data).startswith(b'\x89PNG'):
+                return bytes(data)
+    except Exception:
+        pass
+    return None
+
+
+def exec_cell(src, cell_label, ns):
+    """Execute one cell like Jupyter: run its statements, and when the
+    last statement is a bare expression, evaluate it and return its
+    value (None when there is no trailing expression, or when the last
+    line ends with `;`, which suppresses display). Falls back to a
+    plain exec when the source does not parse, so a SyntaxError
+    surfaces exactly as before. An error in the expression itself
+    propagates, like any other cell error."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        exec(compile(src, cell_label, 'exec'), ns)
+        return None
+    body = tree.body
+    if not body or not isinstance(body[-1], ast.Expr):
+        exec(compile(src, cell_label, 'exec'), ns)
+        return None
+    last = body[-1]
+    head = body[:-1]
+    if head:
+        module = ast.Module(body=head, type_ignores=[])
+        ast.fix_missing_locations(module)
+        exec(compile(module, cell_label, 'exec'), ns)
+    expr = ast.Expression(last.value)
+    ast.fix_missing_locations(expr)
+    value = eval(compile(expr, cell_label, 'eval'), ns)
+    stripped = [ln for ln in src.splitlines() if ln.strip()]
+    if stripped and stripped[-1].rstrip().endswith(';'):
+        return None
+    return value
 
 
 def png_files(workdir):
@@ -118,8 +190,9 @@ def main():
         old_out, old_err = sys.stdout, sys.stderr
         sys.stdout, sys.stderr = out_buf, err_buf
         exit_code = 0
+        display_value = None
         try:
-            exec(compile(src, f'<cell {i}>', 'exec'), ns)
+            display_value = exec_cell(src, f'<cell {i}>', ns)
         except SystemExit as e:
             exit_code = e.code if isinstance(e.code, int) else 1
             stopped = True
@@ -129,6 +202,25 @@ def main():
             stopped = True
         finally:
             sys.stdout, sys.stderr = old_out, old_err
+
+        # Last-expression display, only for a cell that ran cleanly.
+        # A display failure never fails the cell: it falls back to the
+        # text repr, and a repr failure is swallowed too.
+        display_png_bytes = None
+        if exit_code == 0 and display_value is not None:
+            try:
+                display_png_bytes = display_png(display_value)
+            except Exception:
+                display_png_bytes = None
+            if display_png_bytes is None:
+                try:
+                    text = repr(display_value)
+                except Exception:
+                    text = ''
+                if text:
+                    if len(text) > MAX_REPR_CHARS:
+                        text = text[:MAX_REPR_CHARS] + '\n… (truncated)'
+                    out_buf.write(text + '\n')
 
         after = png_files(workdir)
         if not (after - before):
@@ -156,6 +248,17 @@ def main():
             seen.add(digest)
             images.append({'data': base64.b64encode(data).decode('ascii'),
                            'mime': 'image/png'})
+        # The last-expression display image joins the same list, under
+        # the same dedupe and cap (a show()/harvest capture of the same
+        # figure wins, since it sorts first above).
+        if (display_png_bytes is not None
+                and len(display_png_bytes) <= MAX_IMAGE_BYTES
+                and len(images) < MAX_IMAGES_PER_CELL):
+            digest = hashlib.sha256(display_png_bytes).hexdigest()
+            if digest not in seen:
+                seen.add(digest)
+                images.append({'data': base64.b64encode(display_png_bytes).decode('ascii'),
+                               'mime': 'image/png'})
         results.append({'stdout': out_buf.getvalue(),
                         'stderr': err_buf.getvalue(),
                         'exitCode': exit_code,
