@@ -1,7 +1,10 @@
 FROM node:22-bookworm-slim
 
 # Runtimes for /api/execute: python3 (matplotlib via pip, see below),
-# JDK 17 (javac/java).
+# JDK 17 (javac/java). The `graphviz` apt package is the `dot` binary
+# the graphviz Python package shells out to (the micrograd notebook's
+# draw_dot needs it; the Python package itself comes from the runtime
+# installer, recorded in data/python-packages.json).
 # Bookworm ships OpenJDK 17 only — openjdk-21 does not exist in bookworm
 # (it is a trixie package); 17 is enough for notebook Java cells.
 # LibreOffice (impress) converts PPTX slide decks to PDF for the reader —
@@ -38,6 +41,7 @@ FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 \
       python3-pip \
+      graphviz \
       openjdk-17-jdk-headless \
       libreoffice-impress \
     && rm -rf /var/lib/apt/lists/* \
