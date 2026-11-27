@@ -6680,6 +6680,16 @@ function renderMdPreview(el, text) {
   $$('pre', el).forEach((pre) => {
     const code = $('code', pre);
     if (!code) return;
+    // Syntax-highlight the block (same vendored highlight.js as the code
+    // cells; any language hljs knows, not just the runnable three).
+    // highlightElement only rewrites innerHTML — textContent is
+    // untouched, so the Run button below still reads the raw source.
+    if (window.hljs) {
+      const hlLang = (code.className.match(/language-([\w-]+)/) || [])[1];
+      if (hlLang && window.hljs.getLanguage(hlLang.toLowerCase())) {
+        try { window.hljs.highlightElement(code); } catch { /* leave plain */ }
+      }
+    }
     const lang = (code.className.match(/language-([\w-]+)/) || [])[1];
     if (!lang || !RUNNABLE_LANGS.includes(lang.toLowerCase())) return;
     const bar = document.createElement('div');
@@ -6917,6 +6927,42 @@ function manualMinHeightFor(ta) {
   return cell ? (cellManualHeights.get(cell) || 0) : 0;
 }
 
+/* Syntax highlighting for code cells + markdown code blocks (highlight.js,
+   vendored in public/vendor/highlight — no CDN, no build step). The code
+   cell keeps its textarea as the editor: a highlighted <pre> sits behind
+   it (transparent text), so editing behaviour is unchanged. highlight.js
+   is a progressive enhancement — if the vendor script failed to load,
+   everything renders plain exactly as before. */
+function highlightCodeHtml(source, lang) {
+  if (!window.hljs || !source) return null;
+  const l = String(lang || '').toLowerCase();
+  if (!l || !window.hljs.getLanguage(l)) return null;
+  try { return window.hljs.highlight(source, { language: l }).value; }
+  catch { return null; } // unknown grammar / bad input: fall back to plain
+}
+
+/* Repaint the highlight overlay for a code-cell textarea, and keep it
+   aligned: same scroll position as the textarea, and the same wrap width
+   (a vertical scrollbar shrinks the textarea's content box — pad the
+   <pre> by the scrollbar width so long lines wrap at the same place).
+   A trailing newline gets one extra so the <pre> keeps the textarea's
+   final empty line. */
+function syncCodeHighlight(ta) {
+  const wrap = ta?.closest('.nb-code-wrap');
+  if (!wrap) return;
+  const pre = $('.nb-code-hl', wrap);
+  const code = pre && $('code', pre);
+  if (!pre || !code) return;
+  const html = highlightCodeHtml(ta.value, notebookLanguage());
+  code.innerHTML = html === null ? esc(ta.value) : html;
+  if (ta.value.endsWith('\n')) code.innerHTML += '\n';
+  pre.scrollTop = ta.scrollTop;
+  pre.scrollLeft = ta.scrollLeft;
+  // offsetWidth - clientWidth is the vertical scrollbar width (0 while
+  // auto-grow keeps the editor short of the 480px cap).
+  pre.style.paddingRight = `${14 + (ta.offsetWidth - ta.clientWidth)}px`;
+}
+
 function autoGrowCellEditor(ta) {
   if (!ta || !ta.isConnected || ta.offsetParent === null) return;
   ta.style.height = 'auto';
@@ -7115,7 +7161,7 @@ function renderIpynbBody(body) {
           <button type="button" class="rail-btn rail-btn-ai" data-cell-ai="${idx}" title="Ask Code AI about this cell">✨ AI</button>
           <button type="button" class="rail-btn" data-cell-export="${idx}" title="Export this cell to Markdown">Export</button>
           <button type="button" data-cell-del="${idx}">Delete</button></div>
-        <textarea class="nb-code-source" spellcheck="false"></textarea>
+        <div class="nb-code-wrap"><pre class="nb-code-hl" aria-hidden="true"><code></code></pre><textarea class="nb-code-source" spellcheck="false"></textarea></div>
         <div class="nb-cell-resize" data-cell-resize="${idx}" title="Drag to resize"><span aria-hidden="true">⋯</span></div>
         <div class="nb-cell-foot">
           <button type="button" class="run-btn" data-cell-run="${idx}">▶ Run</button>
@@ -7140,8 +7186,15 @@ function renderIpynbBody(body) {
       const ta = $('.nb-code-source', cellEl);
       ta.value = nbCellSource(cell);
       ta.dataset.cellIdx = String(idx);
+      syncCodeHighlight(ta); // paint the highlight overlay for the initial source
       attachCellResize($('.nb-cell-resize', cellEl), ta, cell);
-      ta.addEventListener('input', () => { setNbCellSource(cell, ta.value); autoGrowCellEditor(ta); syncNbUndoButton(); });
+      ta.addEventListener('input', () => { setNbCellSource(cell, ta.value); autoGrowCellEditor(ta); syncCodeHighlight(ta); syncNbUndoButton(); });
+      // The overlay <pre> scrolls with the textarea (it has overflow
+      // hidden, so only the scroll position is mirrored — no re-highlight).
+      ta.addEventListener('scroll', () => {
+        const pre = $('.nb-code-hl', ta.closest('.nb-code-wrap'));
+        if (pre) { pre.scrollTop = ta.scrollTop; pre.scrollLeft = ta.scrollLeft; }
+      });
       ta.addEventListener('blur', () => { commitNbEdit(cell); saveNotebook(); });
       ta.addEventListener('focus', () => { state.editorFocused = true; nbEditBaselines.begin(cell, nbCellSource(cell)); });
       ta.addEventListener('blur', () => { state.editorFocused = false; });

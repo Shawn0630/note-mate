@@ -1088,6 +1088,57 @@ input[type="text"].note-tab-input {
 .nb-cell-resize:hover { background: rgba(138, 90, 43, .12); }
 .nb-cell-resize:hover span { color: var(--ink-soft); }
 .nb-code-source:focus { outline: none; }
+/* Syntax highlighting overlay for code cells: the textarea stays the
+   editor (transparent text over a highlighted <pre> behind it), so
+   editing, selection, auto-grow and drag-resize behave exactly as
+   before — only the paint changes. The <pre> must share the textarea's
+   exact font metrics (family, size, line-height, padding, tab-size,
+   wrapping) or the highlight drifts out of alignment with the caret. */
+.nb-code-wrap { position: relative; }
+.nb-code-hl {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  overflow: hidden;
+  padding: 12px 14px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  tab-size: 8;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  background: #2b2620;
+  color: #f3ead7;
+  pointer-events: none;
+}
+.nb-code-hl code { font: inherit; }
+/* The editor is transparent so the highlight shows through; the caret
+   stays visible. display: block matters: a textarea is inline-block by
+   default, and the wrapper's line box would add ~6px of descender space
+   below it — the overlay <pre> (inset: 0) would then be taller than the
+   textarea and the highlight would drift. Selection is a translucent
+   wash (not opaque) so the highlighted text underneath stays readable
+   while selecting. */
+.nb-code-wrap .nb-code-source {
+  position: relative;
+  z-index: 1;
+  display: block;
+  background: transparent;
+  color: transparent;
+  caret-color: #f3ead7;
+}
+.nb-code-wrap .nb-code-source::selection { background: rgba(243, 234, 215, .28); color: transparent; }
+/* The vendored GitHub Dark theme paints .hljs with its own background
+   (#0d1117) and padding; the code surfaces already carry #2b2620, so
+   neutralise those two and keep only the token colours. */
+.nb-code-hl code.hljs,
+.md-preview pre code.hljs {
+  display: inline;
+  overflow-x: visible;
+  padding: 0;
+  background: transparent;
+  color: #f3ead7;
+}
 .nb-cell-foot { display: flex; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--line); }
 .nb-output {
   border-top: 1px solid var(--line);
